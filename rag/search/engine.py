@@ -113,12 +113,22 @@ class SearchEngine:
         else:
             fused = rrf_fuse(bm25, dense, k=rrf_k) if dense else bm25
 
-        fused = self._dedupe_by_source(fused, per_file)[:k]
+        deduped = self._dedupe_by_source(fused, per_file)
 
+        rerank_scores: dict[int, float] = {}
+        reranked = False
         if (not no_rerank) and self.cfg.get("rerank", False):
-            fused = self._rerank(query, fused,
-                                 model=self.cfg.get("rerank_model",
-                                                    "BAAI/bge-reranker-v2-m3"))
+            # Rerank a WIDER pool than k, then truncate: a cross-encoder is the
+            # most accurate signal available, so it must be able to promote a
+            # page that fusion ranked below k. Truncating to k first would make
+            # the reranker a no-op reordering of results already shown.
+            pool = max(k * 5, self.cfg.get("rerank_pool", 50))
+            deduped, rerank_scores = self._rerank(
+                query, deduped,
+                model=self.cfg.get("rerank_model", "BAAI/bge-reranker-v2-m3"),
+                top_n=pool)
+            reranked = True
+        fused = deduped[:k]
 
         bm25_scores = dict(bm25)
         dense_scores = dict(dense)
@@ -141,6 +151,11 @@ class SearchEngine:
                 "snippet_truncated": truncated,
                 "read_more": f"uv run python dumpdoc.py {row.source}",
             }
+            if reranked and doc_id in rerank_scores:
+                # reported alongside fused_score (never replacing it): the two are
+                # on different scales, and the rerank score is what actually
+                # determines the displayed order for reranked hits.
+                hit["rerank_score"] = round(rerank_scores[doc_id], 6)
             if explain:
                 hit["explain_scores"] = {
                     "bm25": round(bm25_scores.get(doc_id, 0.0), 4),
@@ -154,6 +169,8 @@ class SearchEngine:
             hits.append(hit)
 
         out: dict = {"query": query, "hits": hits}
+        if reranked:
+            out["reranked"] = True
         if explain:
             out["explain"] = self._explain_terms(terms)
         if not hits:
@@ -189,13 +206,21 @@ class SearchEngine:
         return out
 
     def _rerank(self, query: str, fused: list[tuple[int, float]], *,
-                model: str, top_n: int = 20):
+                model: str, top_n: int = 20) -> tuple[list[tuple[int, float]], dict[int, float]]:
+        """Reorder the head of *fused* by cross-encoder relevance.
+
+        Returns (reordered list, {doc_id: rerank_score}). The rerank score is
+        returned separately rather than substituted into ``fused_score``: the two
+        are on different scales and silently overwriting one with the other would
+        make the reported score unable to explain the reported order.
+        """
         from rag.search.rerank import rerank_pairs
-        pairs = [(query, self.rows[d].text) for d, _s in fused[:top_n]]
+        head = fused[:top_n]
+        pairs = [(query, self.rows[d].text) for d, _s in head]
         scores = rerank_pairs(pairs, model=model)
-        order = sorted(range(len(fused[:top_n])), key=lambda i: (-scores[i], i))
-        head = [fused[:top_n][i] for i in order]
-        return head + fused[top_n:]
+        order = sorted(range(len(head)), key=lambda i: (-scores[i], i))
+        reranked = [head[i] for i in order]
+        return reranked + fused[top_n:], {head[i][0]: scores[i] for i in order}
 
     # ------------------------------------------------------------------ mentions
 
