@@ -1,50 +1,50 @@
 [
   {
-    "query": "What is an example use case for the Spring Joint 2D?",
+    "query": "How do you import assets into a Unity project?",
     "gold": [
-      "Manual/2d-physics/joints/spring-joint-2d-fundamentals.html"
+      "Manual/AssetWorkflow.html"
     ]
   },
   {
-    "query": "How do I return a license if I've reached the activation limit?",
+    "query": "Can Unity import assets from external sources?",
     "gold": [
-      "Manual/ActivationFAQ.html"
+      "Manual/AssetTypes.html"
     ]
   },
   {
-    "query": "What does the Edge Radius property do on an Edge Collider 2D?",
+    "query": "How should parameters be defined in the plug-in file?",
     "gold": [
-      "Manual/2d-physics/collider/edge-collider-2d-reference.html"
+      "Manual/AudioNativeDSPPlugin.html"
     ]
   },
   {
-    "query": "What does a Rigidbody 2D component do?",
+    "query": "When is Code Coverage Support available for Linux builds?",
     "gold": [
-      "Manual/2d-physics/rigidbody/introduction-to-rigidbody-2d.html"
+      "Manual/Buildsettings-linux.html"
     ]
   },
   {
-    "query": "How do you enable Box Projection globally in the Built-In Render Pipeline?",
+    "query": "Does static batching use CPU at runtime?",
     "gold": [
-      "Manual/AdvancedRefProbe.html"
+      "Manual/DrawCallBatching-Enable.html"
     ]
   },
   {
-    "query": "What does the Distance Joint 2D component do?",
+    "query": "What is the default linear velocity of a physics body?",
     "gold": [
-      "Manual/2d-physics/joints/distance-joint-2d-reference.html"
+      "Manual/2d-physics-api/2d-physics-api-reference-body.html"
     ]
   },
   {
-    "query": "How many active XR Origins are allowed in a scene?",
+    "query": "Why would you set a unique volume for a specific clip?",
     "gold": [
-      "Manual/AROverview.html"
+      "Manual/AudioRandomContainer-UI.html"
     ]
   },
   {
-    "query": "How many layers can objects use by default in the Physics Core 2D API?",
+    "query": "Where can developers find scripting details for build profiles?",
     "gold": [
-      "Manual/2d-physics-api/2d-physics-api-collisions-enable.html"
+      "Manual/BuildSettings.html"
     ]
   }
 ]

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -32,6 +33,56 @@ from eval_lib import GOLD as GOLD_BASE
 from eval_lib import evaluate
 
 EXTENDED_GOLD_PATH = Path(__file__).resolve().parent / "eval_gold_extended.json"
+
+
+def generate_extended_gold(n_target: int = 16, seed: int = 13) -> list[dict]:
+    """+n_target gold queries drawn from corpus qa fields.
+
+    Each question was written by the corpus LLM about a specific chunk of a
+    specific page, so that page is the verified gold. Candidates are
+    deduped by question prefix, spread across Manual/ScriptReference, and
+    checked against the on-disk mirror.
+    """
+    from rag import ROOT, resolve_path
+    from rag.store import CorpusStore
+
+    banned = ("this chunk", "the chunk", "this section", "the provided",
+              "the documentation", "this page", "the page")
+    cands = []
+    store = CorpusStore(resolve_path("corpus"))
+    for rel, data in store.iterate_all():
+        for ch in data.get("chunks") or []:
+            for qa in ch.get("qa") or []:
+                q = (qa.get("q") or "").strip()
+                if not (24 < len(q) < 140 and q.endswith("?")):
+                    continue
+                if any(t in q.lower() for t in banned):
+                    continue
+                cands.append({"query": q, "gold": [rel]})
+
+    rng = random.Random(seed)
+    rng.shuffle(cands)
+    seen_pref: set[str] = set()
+    out: list[dict] = []
+    n_manual = 0
+    for c in cands:
+        pref = " ".join(c["query"].lower().split()[:5])
+        if pref in seen_pref:
+            continue
+        is_manual = c["gold"][0].startswith("Manual/")
+        if is_manual and n_manual >= max(1, n_target // 2):
+            continue
+        if not (ROOT / c["gold"][0]).exists():
+            continue
+        seen_pref.add(pref)
+        out.append(c)
+        n_manual += int(is_manual)
+        if len(out) >= n_target:
+            break
+    EXTENDED_GOLD_PATH.write_text(json.dumps(out, indent=2, ensure_ascii=False),
+                                  encoding="utf-8")
+    print(f"[gold] wrote {len(out)} queries to {EXTENDED_GOLD_PATH}")
+    return out
 
 
 def load_gold(name: str):
@@ -130,7 +181,13 @@ def main() -> int:
     ap.add_argument("--rerank", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--show-gold", action="store_true")
+    ap.add_argument("--generate-gold", action="store_true",
+                    help="regenerate eval_gold_extended.json from corpus qa fields, then exit")
     args = ap.parse_args()
+
+    if args.generate_gold:
+        generate_extended_gold()
+        return 0
 
     gold, gold_name = load_gold(args.gold_set)
     if args.show_gold:
