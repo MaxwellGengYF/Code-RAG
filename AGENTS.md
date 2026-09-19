@@ -1,198 +1,158 @@
-# Agent Usage: Unity Manual Hybrid Retrieve
+# Agent Usage: Unity Manual RAG (LLM-built corpus + hybrid retrieval)
 
-A BM25 (+ optional dense) retriever over Manual/ and ScriptReference/ (~44k HTML files,
-~83k chunks with boilerplate stripped).
+A two-command RAG system over `Manual/` + `ScriptReference/` (43,938 HTML pages,
+Unity 6.x era):
+
+- `compile` — LLM-generated corpus (semantic chunks + aux fields per page) →
+  BM25 + dense indexes. md5-incremental, checkpointed, resumable.
+- `search` — BM25 (word tokenizer + path terms) ∪ BGE-M3 dense, fused by RRF.
+
+Operational manual below; the legacy BM25-only retriever (`hybrid_retrieve.py`,
+chunks.pkl/index_word.pkl) is still available and documented at the end.
 
 ## Daily use
 
-The only required argument is `--query`:
+Build (first run takes ~1–2 days on this corpus; afterwards it is incremental):
 
-```bash
-cd D:\unity_manual
-uv run python hybrid_retrieve.py --query "Rigidbody.AddForce"
+```
+uv run python rag.py compile --provider D:/qwen_flash.json --no-thinking --workers 4
+uv run python rag.py compile --provider D:/qwen_flash.json --provider D:/k27.json \
+    --steps corpus --no-thinking --workers 6   # two providers = ~2x throughput
 ```
 
-Defaults come from `retriever_config.json`. Useful flags:
+Search:
 
-```bash
-uv run python hybrid_retrieve.py --query "Collider" --final-k 10 --text
-uv run python hybrid_retrieve.py --query "MaterialPropertyBlock" --explain   # show per-term df
-uv run python hybrid_retrieve.py --query-file q.txt --out hits.json          # batch, one index load
-uv run python hybrid_retrieve.py --mentions MaterialPropertyBlock --text     # enumerate all mentions
+```
+uv run python rag.py search --query "Rigidbody.AddForce"
+uv run python rag.py search --query-file q.txt --k 10          # batch (one load)
+uv run python rag.py search --mentions MaterialPropertyBlock   # literal enumeration
+uv run python rag.py search --query "..." --explain            # term df + RRF breakdown
+uv run python rag.py status                                    # freshness + counts
 ```
 
-## Two index back-ends
+`--explain` shows which query terms the index knows (with document frequencies)
+and, per hit, the BM25 score/rank, dense score/rank, and RRF contributions.
 
-| Tokenizer | Index file | Term model | Notes |
-| --- | --- | --- | --- |
-| `word` (default) | `index_word.pkl` | identifier-aware words + path/title field terms | Use this. |
-| `ngram` (legacy) | `index.pkl` | character 3-grams, `fuzziness=AUTO` | Kept for typo tolerance / comparison only. |
+Defaults come from `rag_config.json` (new keys: `corpus_dir`, `index_dir`,
+`embed_model`, `rrf_k`, `mode`, `dense_k`, `rerank`). `retriever_config.json`
+carries the same new keys plus the legacy ones.
 
-`--tokenizer ngram` automatically switches to `ngram_index_path` unless you pass
-`--index-path` explicitly.
+## How compile works (and why it is safe to interrupt)
 
-**Why the default changed.** The character-trigram model tokenizes
-`MaterialPropertyBlock` into 19 overlapping trigrams (`mat ate ter eri ria ial alp lpr pro
-rop ope per ert rty tyb ybl blo loc ock`). Over half are generic English trigrams present in
-almost every page, so BM25 loses all discriminative power and `min_should_match` stops meaning
-anything — `--query "MaterialPropertyBlock"` used to return `Random.html` and
-`BillboardAsset.html`. The `word` model emits `materialpropertyblock` (df 146 / 113k) plus its
-camelCase parts, and adds terms derived from the source filename, which matters because pages
-like `Renderer.SetPropertyBlock.html` never mention their own symbol in the body prose.
+1. **Scan + md5 diff** against `corpus/manifest.json` → added / changed /
+   removed / unchanged. Only added+changed pages hit the LLM.
+2. **Per-page gen_key** = sha1(prompt_version | model | extractor_version |
+   schema_version). A bump of any component (or a page moving to a different
+   provider shard) requeues that page. Per-page keys live in
+   `manifest.page_gen_keys`.
+3. **Generation** (tool-free, system+user prompt only): strict JSON → msgspec
+   validation (chunk text MUST be a verbatim excerpt of the page markdown,
+   checked whitespace/punctuation/quote-insensitively) → one repair retry with
+   the validation errors echoed → heuristic fallback (fixed-size chunker, empty
+   aux fields). Measured on samples: ~80–95% first-try valid, 100% usable.
+4. **Checkpointing**: every 25 pages the manifest is atomically rewritten,
+   merging prior entries. Kill the process any time; rerunning `compile`
+   continues exactly where it left off. `corpus/failures.jsonl` logs pages that
+   needed repair/fallback.
+5. **Multi-provider sharding**: with several `--provider` flags, pages are
+   assigned deterministically (`md5(rel) % n_providers`), each provider gets
+   `workers/n` concurrency. Adding a provider later rekeys every page once
+   (expected-key mismatch), then settles.
 
-## Batch queries: do not loop over `--query`
+## Index layout (all generated, all gitignored)
 
-Loading `index.pkl` costs ~14 s and 180 MB. Always batch instead:
+| Path | Content |
+| --- | --- |
+| `corpus/<rel>.rag.json` | per-page chunks + aux fields + html_md5 + gen_key |
+| `corpus/manifest.json` | md5 registry + gen keys (the incrementality memory) |
+| `corpus/failures.jsonl` | pages that needed repair/fallback, with errors |
+| `index/chunks.msgpack` | the single flat chunk table (chunk_uid keys both indexes) |
+| `index/bm25_word.pkl` | word-tokenizer BM25 over `to_index_text` + path terms ×3 |
+| `index/vectors.f32` | BGE-M3 embeddings of `to_embed_text` (clean text ONLY) |
+| `index/vector_meta.json` | dim/count/model/normalized |
+| `index/manifest.json` | n_chunks, corpus gen_key guard, input sha1s |
 
-```bash
-uv run python hybrid_retrieve.py --query-file queries.txt --out results.json
+Index text composition (the aux design):
+
+- **BM25** indexes `title + heading_path + text + summary + keywords + synonyms
+  + qa.q` — synthetic aux text boosts lexical recall; hits map back to the
+  clean chunk. Ablate with `eval_rag.py --sweep-aux`.
+- **Dense embeds `title + heading_path + text` only.** Aux fields are synthetic
+  and must not pollute the vector space — the old word+dense(hash) regression
+  (MRR 0.875 → 0.792) is the cautionary tale.
+- Fusion is **RRF** (`Σ 1/(60+rank)`), not linear score fusion: BM25 scores are
+  unbounded, cosine is bounded. The legacy linear-alpha path survives in
+  `rag/index/fuse.py` for ablations.
+
+The index build refuses to mix generations: when the corpus gen_key changes,
+`compile --steps index` demands a rebuild (it replaces all artefacts).
+
+## Measured retrieval quality
+
+The 24-query gold set and the old engine's numbers are in `eval_lib.py` /
+`eval_retrieval.py`; the new engine's harness is `eval_rag.py` (same gold set +
+an extended LLM-assisted set in `eval_gold_extended.json`, ablation flags,
+gate check). Results table: `eval_results.md`.
+
+Old engine, word tokenizer, fuzziness 0 (the baseline the new engine must meet
+or beat): **MRR 0.875 / hit@1 0.833 / hit@10 0.917** (24 queries, final-k=10).
+
+New engine numbers: see `eval_results.md` (regenerated by `eval_rag.py`).
+The switch of the default engine is gated on beating that row (or winning
+hit@10 with no MRR loss).
+
+Run the evals:
+
+```
+uv run python eval_retrieval.py          # old engine sweep (needs legacy artefacts)
+uv run python eval_rag.py --gold-set all --mode hybrid
+uv run python eval_rag.py --sweep-aux / --sweep-path-boost 0,1,3,5 / --sweep-rrf-k 20,60,120
 ```
 
-`queries.txt` is one query per line; blank lines and `#` comments are ignored.
+## Provider configs
 
-## Choosing between retrieval and enumeration
+`--provider` takes the kosong/kimi-cli provider JSON format (see
+`D:/qwen_flash.json`, `D:/k27.json`): `model`, `type`
+(`anthropic|kimi|openai_legacy|openai_responses`), `url` (→ base_url), `api_key`,
+`max_tokens`, `capabilities` (`thinking`…), `thinking_effort`, `env`; unknown
+keys are ignored with a warning. Vendored tool-free clients live in `rag/llm/`.
 
-BM25 cannot answer "which pages mention this symbol at all?" — a page that mentions a term once
-is ranked nearly the same as one that mentions it fifty times, and common terms dominate. Use
-`--mentions TERM`, which is a literal count grouped by file, ordered by occurrences:
+Hard-won gateway facts (measured 2026-09):
 
-```bash
-uv run python hybrid_retrieve.py --mentions prepareMaterialPropertyBlockCallback --text
-uv run python hybrid_retrieve.py --mentions MaterialPropertyBlock --mentions-context 120 --text
-```
+- **Always pass `--no-thinking` for corpus builds.** Anthropic-type gateways
+  apply server-side thinking when the thinking field is absent: 8k output
+  tokens and ~100 s/page instead of ~300 tokens / ~15 s. The clients now send
+  `thinking: {type: disabled}` explicitly when thinking is off.
+- **Per-provider concurrency > 4 triggers 429 throttling** on these gateways;
+  `workers 4` per provider is the sweet spot (429/5xx/timeouts retry with
+  exponential backoff, see `rag/llm/base.with_retry`).
+- Use `--dry-run` before any big run: page counts, token estimates
+  (ratio 1.0 without thinking, 3.0 with), optional cost via
+  `--price-in/--price-out` per 1M tokens.
 
-A productive research loop is: `--mentions` to enumerate the authoritative pages, then
-`--query` variants to rank them, then read the HTML directly.
+## Troubleshooting
 
-## Reading the source pages
+- `search` says artefacts not found → run `compile` (corpus step, then index).
+- Index "refusing to build / gen_key changed" → corpus was regenerated after
+  the index; rerun `compile --steps index` (it rebuilds everything from the
+  current corpus — BM25 minutes, dense hours on CPU).
+- Slow compile → check `corpus/failures.jsonl` for 429 storms; lower `--workers`.
+- Interrupted compile → just rerun the same command; the manifest diff resumes.
+- A page's corpus looks wrong → `compile --only Manual/foo.html --provider ...`
+  regenerates exactly one page.
+- Deleting corpus: `rm -rf corpus index` is safe; everything regenerates.
 
-Retrieval returns ~500-char snippets, which are not enough to write accurate API documentation.
-Read the underlying HTML with `dumpdoc.py`, which converts a doc page to markdown preserving
-signatures, parameter tables and full code samples:
+## Testing
 
-```bash
-uv run python dumpdoc.py -o out.md ScriptReference/MaterialPropertyBlock.html \
-    ScriptReference/Renderer.SetPropertyBlock.html Manual/DrawCallBatching-Properties.html
-```
+`uv run python -m pytest tests/` — 57 tests, all network-free (httpx
+MockTransport for the LLM wire format, scripted fake clients for corpus
+generation, tmpdir mirrors for the file manager, interrupt/resume simulation
+for the compile pipeline).
 
-## Measuring retrieval quality
+## Legacy retriever (kept until the eval gate passes)
 
-`eval_retrieval.py` scores configurations against a 24-query gold set derived from a real
-verified documentation task. Gold sets are intentionally strict, so the true accuracy of the
-remaining "misses" is higher than the numbers imply.
-
-```bash
-uv run python eval_retrieval.py                          # compare back-ends
-uv run python eval_retrieval.py --configs word --misses  # show non-rank-1 queries
-uv run python eval_retrieval.py --show-gold
-```
-
-Last measured (24 queries, `final-k=10`):
-
-| config | tokenizer | fuzziness | MRR | hit@1 | hit@10 |
-| --- | --- | --- | --- | --- | --- |
-| `legacy` | ngram | AUTO | 0.04 – 0.13 (**varies per run**) | 0.00 – 0.04 | 0.17 – 0.29 |
-| `nofuzz` | ngram | 0 | 0.521 | 0.417 | 0.625 |
-| `word-nopath` | word | 0 | 0.691 | 0.625 | 0.875 |
-| **`word` / `default`** | **word** | **0** | **0.875** | **0.833** | **0.917** |
-| `word+dense` | word + hash | 0 | 0.792 | 0.667 | 0.917 |
-
-Two separate defects in the legacy configuration, both worth knowing about:
-
-1. **Nondiscriminative terms** — the trigram problem described above.
-2. **Nondeterminism** — `fuzziness="AUTO"` expands each term through
-   `LevenshteinAutomaton.match`, which fills a `set` and then truncates it to
-   `max_expansions=50`. Python randomises string hashing per process, so set iteration order
-   differs between runs and *which* 50 expansions survive changes too. Repeatedly evaluating the
-   `legacy` config yields different MRR (observed 0.041 / 0.063 / 0.083 / 0.103 / 0.121 / 0.214).
-   Setting `fuzziness: 0` makes results bit-identical across runs (verified 3× at MRR 0.521) and
-   is part of why the default changed.
-
-If you change tokenization, chunking, or fusion weights, re-run this. Adding gold queries from
-each new research task keeps it honest.
-
-## Embedders
-
-`embedder` may be `none` (default), `ollama`, `st`, or `hash`.
-
-`none` is the default because the offline `hash` embedder is a character-signature model, not a
-semantic one, and was measured to **degrade** ranking on this corpus (MRR 0.875 → 0.792). It also
-no longer silently substitutes for an unavailable backend — `get_embedder` falls back to
-BM25-only and says so on stderr.
-
-To use real dense retrieval:
-
-1. `ollama pull nomic-embed-text`, start Ollama.
-2. Set `"embedder": "ollama", "alpha": 0.7` in `retriever_config.json` (or pass on the CLI).
-
-## Configuration
-
-```json
-{
-  "tokenizer": "word",
-  "path_boost": 3,
-  "fuzziness": 0,
-  "min_should_match": 0.6,
-  "per_file": 1,
-  "embedder": "none",
-  "ollama_model": "nomic-embed-text",
-  "bm25_k": 200,
-  "final_k": 8,
-  "alpha": 1.0,
-  "dirs": ["Manual", "ScriptReference"],
-  "index_path": "index_word.pkl",
-  "ngram_index_path": "index.pkl",
-  "chunks_path": "chunks.pkl"
-}
-```
-
-- `tokenizer`: `word` | `ngram`.
-- `path_boost`: how many times to repeat the filename/title field terms when indexing (0–5 are
-  equivalent above 3; `3` is the default).
-- `fuzziness`: keep `0` for the `word` index — edit-distance expansion of long identifiers is what
-  made the legacy index unusable, and it is also the source of the legacy back-end's run-to-run
-  nondeterminism (see the table above).
-- `min_should_match`: `0.6` measured best; `0.7`+ starts dropping valid hits, and with the `ngram`
-  index `0.9` returns **nothing**.
-- `per_file`: max chunks kept per source document, for result diversity. `1` raised distinct files
-  in the top-10 from 6.58 to 9.08 at no cost in hit rate. `0` disables.
-- `bm25_k`: candidates pulled from BM25 before fusion.
-
-CLI flags override config for a single run.
-
-## Rebuilding
-
-```bash
-cd D:\unity_manual
-uv run python hybrid_retrieve.py --build        # full corpus -> chunks.pkl + index_word.pkl
-```
-
-Takes a few minutes. To rebuild a single back-end without touching the other:
-
-```bash
-uv run python hybrid_retrieve.py --build --tokenizer ngram   # -> index.pkl
-uv run python build_word_index.py --path-boost 3             # word index only, reuses chunks.pkl
-```
-
-`--build --max-files N` is refused unless you also pass `--force`, because it would otherwise
-silently overwrite the full-corpus `chunks.pkl` with a partial one. For a quick smoke build,
-redirect both artefacts:
-
-```bash
-uv run python hybrid_retrieve.py --build --max-files 3000 \
-    --chunks-path /tmp/c_smoke.pkl --index-path /tmp/i_smoke.pkl --force
-```
-
-## Files
-
-- hybrid_retrieve.py — main retrieval script (build, query, --mentions, --explain)
-- doc_clean.py — shared HTML cleaning: content_root selector, page_title, strip_boiler/BOILER
-  (site chrome lives in plain divs inside #content-wrap, so decomposing semantic tags is
-  not enough; the footer/feedback lines are removed by pattern)
-- `unity_tokenizer.py` — identifier-aware `WordTokenizer`, `split_identifier`, `path_terms`
-- `build_word_index.py` — standalone word-index builder with `--path-boost` ablation support
-- `eval_retrieval.py` / `eval_lib.py` — gold-set retrieval evaluation harness
-- `dumpdoc.py` — HTML doc page → markdown (signatures, tables, code samples)
-- `retrieval.py` — copied BM25 library from `D:/KimiX/src/kimix/retrieval.py`
-- `retriever_config.json` — default settings
-- `index_word.pkl` / `index.pkl` / `chunks.pkl` — generated indices
+`hybrid_retrieve.py` now delegates to the RAG engine by default. The old engine
+(chunks.pkl + index_word.pkl, linear fusion, ollama/st/hash embedders) is
+preserved behind `--legacy` and still powers `eval_retrieval.py`. Files:
+`hybrid_retrieve.py`, `retrieval.py` (BM25 lib), `unity_tokenizer.py`,
+`doc_clean.py`, `dumpdoc.py`, `build_word_index.py`, `eval_lib.py`.

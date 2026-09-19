@@ -23,8 +23,22 @@ Total: ~46,200 files, ~1.03 GB.
 - `.crawler_state.json` is the crawler's resume state (which URLs are done/missing);
   it can be deleted if not needed.
 
-## How it was downloaded
+How it was downloaded
 
-`D:/unity_docs_downloader.py` — resumable, polite concurrent crawler (8 workers,
-random 0.15–0.35 s delay, retries). Seed list from `Manual/docdata/toc.js` and
-`ScriptReference/docdata/toc.js`; assets discovered by parsing HTML/CSS references.
+D:/unity_docs_downloader.py — resumable, polite concurrent crawler (8 workers,
+random 0.15–0.35 s delay, retries). Seed list from Manual/docdata/toc.js and
+ScriptReference/docdata/toc.js; assets discovered by parsing HTML/CSS references.
+
+RAG retrieval over the mirror
+
+The mirror is indexed by an LLM-built RAG system (two commands, see AGENTS.md):
+
+    uv run python rag.py compile --provider D:/qwen_flash.json   # corpus + indexes
+    uv run python rag.py search --query "Rigidbody.AddForce"     # ranked results
+
+`compile` sends each page (as dumpdoc-style markdown) through an LLM to produce
+semantic chunks plus retrieval aux fields (summary/keywords/synonyms/QA), then
+builds a word-tokenizer BM25 index (aux text included) and a BGE-M3 dense index
+(clean text only), fused by RRF at query time. Regeneration is md5-incremental:
+only added/changed pages re-hit the LLM, and a prompt/model/version bump
+rekeys every page. Generated artefacts live in corpus/ and index/ (gitignored).
