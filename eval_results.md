@@ -219,6 +219,20 @@ material`, aux=True ranked `SRPBatcher-Incompatible` first (19.29) while aux=Fal
 surfaced `Renderer.SetPropertyBlock` and `Renderer` — the pages that actually
 answer it.
 
+**Corpus quality note.** Across a 2,000-page random sample of the live build:
+72% of pages have aux on every chunk, 28% have none, and 0% are heuristic
+fallback. The aux-less pages concentrate in highly repetitive API reference
+families (`Unity.Mathematics.math.*`, `UIElements.*`, `Rendering.*`) where the
+model returns a valid verbatim chunk but leaves the synthetic fields empty. This
+is harmless *because aux is not indexed*: those pages still rank **first** for
+identifier queries (`Unity.Mathematics.math.radians` →
+`Unity.Mathematics.math-radians.html` at rank 1; `TODEGREES` → its own page at
+rank 1), since BM25 relies on path terms plus clean text. Had aux stayed indexed,
+these pages would have been systematically penalized against pages whose aux
+repeats the query terms — a third mechanism by which aux hurt, and one that
+favored verbose pages over terse-but-correct ones. Prompt rule 2 (never split a
+code fence) holds: 0 of 4,000 sampled chunks begin with a bare fence.
+
 **Aux is still generated and still stored.** It is not wasted: `qa` fields feed the
 extended gold set, `summary` is a good snippet source, and the fields remain
 available for a future reranker or for queries where they demonstrably help. The
