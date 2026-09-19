@@ -15,6 +15,7 @@ from typing import Any
 
 from rag import resolve_path
 from rag.cli.compile_cmd import (
+    ALL_DOWN_WAIT_BUDGET,
     CompileReport,
     ProviderShard,
     estimate_tokens,
@@ -166,6 +167,7 @@ async def run_corpus_step(
     report = await run_corpus_compile(
         shards, cfg, work=work, scanned=scanned, fm=fm,
         workers_per_provider=max(1, workers // len(shards)),
+        wait_budget_s=float(cfg.get("provider_wait_budget_s", ALL_DOWN_WAIT_BUDGET)),
     )
     # run_corpus_compile already checkpointed the true per-page gen_keys to disk
     # (including pages served by a failover provider). Read them back rather than
