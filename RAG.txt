@@ -1,0 +1,1552 @@
+# Windows 11 + GPU 构建 HTML 文档 RAG 系统（Python）方案
+
+针对你的场景（Windows 11、有 GPU、HTML 文档、服务 coding agent），以下是几种从简单到生产级的推荐方案。
+
+---
+
+## 📋 核心组件速览
+
+| 组件 | 推荐选择 | 说明 |
+|------|----------|------|
+| **LLM 推理** | Ollama（简单）/ vLLM（高性能） | vLLM 吞吐量比 Ollama 高 3-5 倍，适合 coding agent 高频调用 |
+| **嵌入模型** | sentence-transformers / BGE | 本地运行，无需 API |
+| **向量数据库** | Qdrant | 本地部署、速度快、支持混合搜索 |
+| **RAG 框架** | LlamaIndex / LangChain + LangGraph | LlamaIndex 更适合文档检索，LangGraph 适合 agent 工作流 |
+| **HTML 处理** | html-ingestor + BeautifulSoup | 保留语义结构，提取正文 |
+| **Coding 优化** | tree-sitter / AST chunking | 代码感知的分块策略 |
+
+---
+
+## 🥉 方案一：轻量级快速启动（Ollama + Qdrant + LlamaIndex）
+
+适合快速验证、文档量 < 1000 个 HTML 文件的场景。
+
+### 1. 环境准备
+
+```bash
+# 安装 Ollama（Windows 版会自动检测 GPU）
+# https://ollama.com/download/windows
+
+# 创建 Python 环境
+python -m venv venv
+venv\Scripts\activate
+
+pip install llama-index llama-index-vector-stores-qdrant qdrant-client
+pip install sentence-transformers beautifulsoup4 lxml html-ingestor
+```
+
+### 2. 拉取模型（利用 GPU）
+
+```bash
+# 嵌入模型
+ollama pull nomic-embed-text
+
+# Coding 专用 LLM（7B 适合 8GB+ VRAM，14B 适合 16GB+ VRAM）
+ollama pull qwen3-coder:7b
+# 或更大的
+ollama pull qwen3-coder:14b
+```
+
+### 3. HTML 文档处理 + 索引代码
+
+```python
+import os
+from pathlib import Path
+from bs4 import BeautifulSoup
+from llama_index.core import VectorStoreIndex, Document, Settings
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.llms.ollama import Ollama
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+import qdrant_client
+
+# ========== 1. HTML 文档清洗 ==========
+def clean_html_file(file_path: str) -> str:
+    """提取 HTML 正文，去除导航、广告等噪音"""
+    with open(file_path, 'r', encoding='utf-8') as f:
+        soup = BeautifulSoup(f.read(), 'lxml')
+    
+    # 移除脚本、样式、导航等无关元素
+    for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
+        tag.decompose()
+    
+    # 保留语义结构：标题、段落、列表、代码块
+    content_parts = []
+    for elem in soup.find_all(['h1', 'h2', 'h3', 'h4', 'p', 'pre', 'code', 'li']):
+        text = elem.get_text(strip=True)
+        if text:
+            # 保留标签类型作为语义标记
+            tag_name = elem.name
+            if tag_name in ['h1', 'h2', 'h3', 'h4']:
+                content_parts.append(f"\n## {text}\n")
+            elif tag_name == 'pre':
+                content_parts.append(f"\n```\n{text}\n```\n")
+            else:
+                content_parts.append(text)
+    
+    return '\n'.join(content_parts)
+
+# ========== 2. 加载所有 HTML 文档 ==========
+def load_html_docs(data_dir: str) -> list[Document]:
+    documents = []
+    for html_file in Path(data_dir).rglob("*.html"):
+        content = clean_html_file(str(html_file))
+        if len(content) > 50:  # 过滤空内容
+            doc = Document(
+                text=content,
+                metadata={
+                    "source": str(html_file),
+                    "filename": html_file.name,
+                    "type": "html"
+                }
+            )
+            documents.append(doc)
+    return documents
+
+# ========== 3. 配置 GPU 加速的模型 ==========
+Settings.embed_model = OllamaEmbedding(
+    model_name="nomic-embed-text",
+    base_url="http://localhost:11434"
+)
+
+Settings.llm = Ollama(
+    model="qwen3-coder:7b",
+    base_url="http://localhost:11434",
+    temperature=0.1  # coding 任务低温度更稳定
+)
+
+# ========== 4. 创建 Qdrant 向量库（本地） ==========
+client = qdrant_client.QdrantClient(path="./qdrant_storage")
+vector_store = QdrantVectorStore(client=client, collection_name="html_docs")
+
+# ========== 5. 构建索引 ==========
+docs = load_html_docs("./html_documents")
+index = VectorStoreIndex.from_documents(
+    docs,
+    vector_store=vector_store,
+    node_parser=SentenceSplitter(chunk_size=512, chunk_overlap=50)
+)
+
+# 保存索引
+index.storage_context.persist(persist_dir="./storage")
+
+print(f"✅ 已索引 {len(docs)} 个 HTML 文档")
+```
+
+### 4. 查询接口（供 Coding Agent 调用）
+
+```python
+from llama_index.core import StorageContext, load_index_from_storage
+
+# 加载已有索引
+storage_context = StorageContext.from_defaults(persist_dir="./storage")
+index = load_index_from_storage(storage_context)
+
+query_engine = index.as_query_engine(
+    similarity_top_k=5,  # 返回 top-5 相关片段
+    response_mode="compact"  # 紧凑模式节省 token
+)
+
+# 供 coding agent 调用的函数
+def search_html_docs(query: str) -> dict:
+    """RAG 检索接口"""
+    response = query_engine.query(query)
+    return {
+        "answer": str(response),
+        "sources": [node.node.metadata["source"] for node in response.source_nodes],
+        "contexts": [node.node.text for node in response.source_nodes]
+    }
+
+# 测试
+if __name__ == "__main__":
+    result = search_html_docs("如何在 HTML 中嵌入 WebSocket？")
+    print(result["answer"])
+    print("\n来源:", result["sources"])
+```
+
+### 5. 启动 Qdrant（Windows Docker 或本地模式）
+
+上面代码使用了 `path="./qdrant_storage"` 是本地文件模式，无需 Docker。如需 Docker：
+
+```bash
+docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
+```
+
+---
+
+## 🥈 方案二：高性能生产级（vLLM + Qdrant + LangChain + LangGraph）
+
+适合 coding agent 高频调用、需要并行处理、文档量大的场景。vLLM 比 Ollama 快 3-5 倍。
+
+### 1. 环境安装
+
+```bash
+pip install vllm langchain langchain-community langgraph qdrant-client
+pip install sentence-transformers beautifulsoup4
+```
+
+### 2. 启动 vLLM 服务（GPU 加速）
+
+```bash
+# 启动 OpenAI 兼容 API 服务
+# 7B 模型适合 RTX 3060 12GB+，14B 适合 RTX 4060/4070 16GB+
+python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen3-Coder-7B-Instruct \
+    --port 8000 \
+    --tensor-parallel-size 1 \
+    --max-model-len 8192
+```
+
+### 3. 完整 RAG Pipeline 代码
+
+```python
+import os
+from pathlib import Path
+from bs4 import BeautifulSoup
+from langchain_community.vectorstores import Qdrant
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import VLLMOpenAI
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
+
+# ========== 1. HTML 处理（保留代码块和标题结构） ==========
+def parse_html_for_rag(file_path: str) -> str:
+    with open(file_path, 'r', encoding='utf-8') as f:
+        soup = BeautifulSoup(f.read(), 'lxml')
+    
+    # 清理
+    for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe', 'noscript']):
+        tag.decompose()
+    
+    # 结构化提取
+    sections = []
+    current_section = []
+    
+    for elem in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'p', 'pre', 'code', 'ul', 'ol', 'li', 'table']):
+        text = elem.get_text(strip=True)
+        if not text:
+            continue
+        
+        if elem.name in ['h1', 'h2', 'h3']:
+            if current_section:
+                sections.append('\n'.join(current_section))
+            current_section = [f"{'#' * int(elem.name[1])} {text}"]
+        elif elem.name == 'pre':
+            code = elem.get_text()
+            current_section.append(f"\n```\n{code}\n```\n")
+        elif elem.name in ['ul', 'ol']:
+            # 保留列表结构
+            for li in elem.find_all('li'):
+                current_section.append(f"- {li.get_text(strip=True)}")
+        else:
+            current_section.append(text)
+    
+    if current_section:
+        sections.append('\n'.join(current_section))
+    
+    return '\n\n'.join(sections)
+
+# ========== 2. 加载文档 ==========
+def load_documents(data_dir: str):
+    docs = []
+    for file in Path(data_dir).rglob("*.html"):
+        content = parse_html_for_rag(str(file))
+        if len(content) > 100:
+            docs.append(Document(
+                page_content=content,
+                metadata={"source": str(file), "type": "html"}
+            ))
+    return docs
+
+# ========== 3. 初始化组件 ==========
+# 嵌入模型（本地 GPU 加速）
+embeddings = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-large-zh-v1.5",  # 或 bge-large-en-v1.5
+    model_kwargs={'device': 'cuda'},  # 使用 GPU
+    encode_kwargs={'normalize_embeddings': True}
+)
+
+# vLLM 客户端
+llm = VLLMOpenAI(
+    openai_api_key="not-needed",
+    openai_api_base="http://localhost:8000/v1",
+    model_name="Qwen3-Coder-7B-Instruct",
+    temperature=0.1,
+    max_tokens=2048
+)
+
+# ========== 4. 文档分块（Coding 优化） ==========
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=100,
+    separators=["\n## ", "\n### ", "\n```\n", "\n\n", "\n", " ", ""]
+)
+
+raw_docs = load_documents("./html_documents")
+chunks = text_splitter.split_documents(raw_docs)
+
+# ========== 5. Qdrant 向量库 ==========
+client = QdrantClient(path="./qdrant_db")
+
+# 创建 collection（首次运行）
+collection_name = "html_knowledge"
+try:
+    client.create_collection(
+        collection_name=collection_name,
+        vectors_config=VectorParams(size=1024, distance=Distance.COSINE)
+    )
+except:
+    pass  # 已存在
+
+vectorstore = Qdrant.from_documents(
+    chunks,
+    embeddings,
+    path="./qdrant_db",
+    collection_name=collection_name,
+    force_recreate=True
+)
+
+# ========== 6. 构建 RAG Chain ==========
+# Coding 专用 Prompt
+CODING_PROMPT = PromptTemplate(
+    template="""你是一个专业的编程助手。请基于以下 HTML 文档内容回答问题。
+如果文档中没有相关信息，请明确说明。
+
+文档内容：
+{context}
+
+问题：{question}
+
+请提供准确、可操作的答案，必要时包含代码示例。""",
+    input_variables=["context", "question"]
+)
+
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    chain_type="stuff",
+    retriever=vectorstore.as_retriever(search_kwargs={"k": 5}),
+    chain_type_kwargs={"prompt": CODING_PROMPT},
+    return_source_documents=True
+)
+
+# ========== 7. 查询接口 ==========
+def ask_coding_agent(question: str):
+    result = qa_chain.invoke({"query": question})
+    return {
+        "answer": result["result"],
+        "sources": [doc.metadata["source"] for doc in result["source_documents"]]
+    }
+
+# 测试
+if __name__ == "__main__":
+    print(ask_coding_agent("HTML5 Canvas 如何绘制渐变效果？"))
+```
+
+---
+
+## 🥇 方案三：Coding Agent 专用（Code-Aware RAG + GraphRAG）
+
+针对代码文档的特殊优化：AST 感知分块、代码图谱、混合检索（BM25 + Dense）。
+
+### 核心优化点
+
+| 优化 | 实现方式 | 效果 |
+|------|----------|------|
+| **AST-aware Chunking** | tree-sitter 解析代码块 | 按函数/类边界分块，不截断代码 |
+| **Hybrid Search** | BM25 + 向量检索 | 关键词匹配 + 语义匹配，召回率更高 |
+| **Code Graph** | 提取函数调用关系 | 回答"这个函数在哪里被调用"类问题 |
+| **Metadata Enrichment** | 提取 API 签名、参数 | 更精准的代码检索 |
+
+### 增强版代码：AST-Aware 处理
+
+```python
+from tree_sitter import Language, Parser
+import tree_sitter_languages
+
+# 为代码块添加 AST 结构信息
+def enrich_code_chunks(html_content: str, file_path: str) -> list[Document]:
+    """识别 HTML 中的代码块，按函数/类边界切分"""
+    soup = BeautifulSoup(html_content, 'lxml')
+    chunks = []
+    
+    # 处理文本段落
+    for elem in soup.find_all(['h1', 'h2', 'h3', 'p']):
+        text = elem.get_text(strip=True)
+        if text:
+            chunks.append(Document(
+                page_content=text,
+                metadata={"type": "text", "source": file_path}
+            ))
+    
+    # 处理代码块 - 按函数级别切分
+    for pre in soup.find_all('pre'):
+        code = pre.get_text()
+        # 简单启发式：按函数定义切分
+        # 实际可用 tree-sitter 做更精准的 AST 解析
+        func_pattern = r'(def\s+\w+\s*\([^)]*\):.*?(?=\ndef\s|\Z))'
+        import re
+        funcs = re.findall(func_pattern, code, re.DOTALL)
+        
+        for func in funcs:
+            chunks.append(Document(
+                page_content=f"```python\n{func}\n```",
+                metadata={
+                    "type": "code",
+                    "source": file_path,
+                    "function": func.split('(')[0].replace('def ', '').strip()
+                }
+            ))
+    
+    return chunks
+```
+
+### LangGraph Agent 工作流（高级）
+
+```python
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, List
+
+class RAGState(TypedDict):
+    question: str
+    context: List[str]
+    answer: str
+
+# 定义节点
+def retrieve(state: RAGState):
+    # 混合检索：BM25 + Dense
+    docs = vectorstore.similarity_search(state["question"], k=3)
+    return {"context": [d.page_content for d in docs]}
+
+def generate(state: RAGState):
+    context = "\n".join(state["context"])
+    prompt = f"基于以下文档回答问题：\n{context}\n\n问题：{state['question']}"
+    response = llm.invoke(prompt)
+    return {"answer": response}
+
+# 构建图
+workflow = StateGraph(RAGState)
+workflow.add_node("retrieve", retrieve)
+workflow.add_node("generate", generate)
+workflow.set_entry_point("retrieve")
+workflow.add_edge("retrieve", "generate")
+workflow.add_edge("generate", END)
+
+agent = workflow.compile()
+
+# 运行
+result = agent.invoke({"question": "HTML form 的验证属性有哪些？"})
+print(result["answer"])
+```
+
+---
+
+## 🔧 Windows 11 GPU 配置要点
+
+### 1. 确认 CUDA 可用
+
+```python
+import torch
+print(torch.cuda.is_available())  # 应为 True
+print(torch.cuda.get_device_name(0))  # 显示 GPU 型号
+```
+
+### 2. 安装 CUDA 版 PyTorch
+
+```bash
+# 根据你的 CUDA 版本选择
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+### 3. Ollama GPU 检测
+
+Ollama Windows 版会自动使用 GPU。验证：
+```bash
+ollama ps  # 查看模型是否运行在 GPU 上
+```
+
+### 4. vLLM GPU 参数优化
+
+```bash
+# 根据显存调整
+python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen3-Coder-7B-Instruct \
+    --gpu-memory-utilization 0.85 \  # 使用 85% 显存
+    --max-model-len 4096 \
+    --tensor-parallel-size 1
+```
+
+---
+
+## 📊 方案对比
+
+| 维度 | 方案一（Ollama） | 方案二（vLLM） | 方案三（GraphRAG） |
+|------|------------------|----------------|-------------------|
+| **复杂度** | ⭐ 低 | ⭐⭐ 中 | ⭐⭐⭐ 高 |
+| **吞吐量** | ~10 req/s | ~50 req/s | ~30 req/s |
+| **HTML 处理** | 基础清洗 | 结构化保留 | AST + 图谱 |
+| **GPU 利用** | 中等 | 高 | 高 |
+| **Coding 优化** | 基础 | 良好 | 优秀 |
+| **适用规模** | <1000 文档 | <10万 文档 | 大规模代码库 |
+
+---
+
+## 🚀 推荐路径
+
+1. **快速验证** → 先用方案一（Ollama + LlamaIndex），30 分钟跑通
+2. **性能瓶颈** → 升级到方案二（vLLM），吞吐量提升 3-5 倍
+3. **Coding Agent 深度集成** → 方案三（AST chunking + LangGraph），支持复杂代码查询
+
+需要我详细展开某个方案的完整项目结构或部署脚本吗？
+Kimi: 好的，既然目标是**纯 HTML 文档**（非代码），我重新为你展开方案一和方案二。核心变化：HTML 处理侧重**语义结构保留**（标题层级、段落、列表、表格），分块策略针对**文档内容**优化，不再涉及 AST/代码相关逻辑。
+
+---
+
+## 方案一：轻量级快速启动（Ollama + Qdrant + LlamaIndex）
+
+适合快速验证、文档量 < 1000 个 HTML 文件、追求极简部署的场景。
+
+### 1. 环境准备
+
+```bash
+# 安装 Ollama Windows 版（自动检测 GPU）
+# https://ollama.com/download/windows
+
+# 创建 Python 环境
+python -m venv venv
+venv\Scripts\activate
+
+# 核心依赖
+pip install llama-index llama-index-vector-stores-qdrant qdrant-client
+pip install beautifulsoup4 lxml html5lib
+```
+
+### 2. 拉取本地模型
+
+```bash
+# 嵌入模型（轻量、本地运行）
+ollama pull nomic-embed-text
+
+# 文档理解 LLM（根据显存选择）
+# 8GB VRAM: qwen3:7b 或 llama3.1:8b
+# 16GB VRAM: qwen3:14b 或 mistral-nemo:12b
+ollama pull qwen3:7b
+```
+
+### 3. HTML 语义处理模块
+
+纯文档场景下，HTML 处理的核心是**保留文档结构**（标题层级、段落、列表、表格），同时去除导航、广告等噪音。
+
+```python
+"""
+html_processor.py - HTML 文档语义提取
+针对纯文档场景，保留标题层级、段落、列表、表格结构
+"""
+from pathlib import Path
+from bs4 import BeautifulSoup, NavigableString
+from llama_index.core import Document
+import re
+
+
+class HTMLDocumentProcessor:
+    """HTML 文档处理器 - 纯文档场景"""
+    
+    # 噪音标签：导航、广告、页脚等
+    NOISE_TAGS = {
+        'script', 'style', 'nav', 'footer', 'header', 
+        'aside', 'iframe', 'noscript', 'advertisement',
+        'sidebar', 'menu', 'toolbar', 'social-share'
+    }
+    
+    # 内容标签：需要保留语义结构的标签
+    CONTENT_TAGS = [
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'p', 'div', 'article', 'section',
+        'ul', 'ol', 'li',
+        'table', 'tr', 'td', 'th',
+        'blockquote', 'pre'
+    ]
+    
+    def __init__(self, min_content_length: int = 100):
+        self.min_content_length = min_content_length
+    
+    def clean_html(self, html_content: str) -> BeautifulSoup:
+        """清理 HTML，移除噪音元素"""
+        soup = BeautifulSoup(html_content, 'html5lib')
+        
+        # 移除噪音标签
+        for tag_name in self.NOISE_TAGS:
+            for tag in soup.find_all(tag_name):
+                tag.decompose()
+            # 同时移除 class/id 包含噪音关键词的元素
+            for tag in soup.find_all(class_=re.compile(tag_name, re.I)):
+                tag.decompose()
+            for tag in soup.find_all(id=re.compile(tag_name, re.I)):
+                tag.decompose()
+        
+        return soup
+    
+    def extract_semantic_structure(self, soup: BeautifulSoup, source_path: str) -> str:
+        """
+        提取语义结构文本
+        保留标题层级标记、列表标记、表格结构
+        """
+        content_parts = []
+        
+        # 遍历主要内容区域
+        main_content = soup.find('main') or soup.find('article') or soup.find('div', class_=re.compile('content|main', re.I)) or soup.body
+        
+        if not main_content:
+            return ""
+        
+        for elem in main_content.find_all(self.CONTENT_TAGS):
+            text = self._extract_element_text(elem)
+            if not text or len(text.strip()) < 3:
+                continue
+            
+            tag_name = elem.name
+            
+            if tag_name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                level = int(tag_name[1])
+                prefix = '#' * level + ' '
+                content_parts.append(f"\n{prefix}{text.strip()}\n")
+            
+            elif tag_name == 'li':
+                # 判断父级是 ul 还是 ol
+                parent = elem.find_parent(['ul', 'ol'])
+                marker = '-' if parent and parent.name == 'ul' else f"{self._get_list_index(elem)}."
+                content_parts.append(f"{marker} {text.strip()}")
+            
+            elif tag_name in ['ul', 'ol']:
+                # 列表容器本身不输出，子 li 已处理
+                continue
+            
+            elif tag_name in ['td', 'th']:
+                # 表格单元格在 tr 中统一处理
+                continue
+            
+            elif tag_name == 'tr':
+                # 整行处理
+                cells = []
+                for cell in elem.find_all(['td', 'th']):
+                    cell_text = self._extract_element_text(cell)
+                    cells.append(cell_text.strip())
+                if cells:
+                    content_parts.append('| ' + ' | '.join(cells) + ' |')
+            
+            elif tag_name == 'table':
+                # 表格添加标记
+                content_parts.append('\n[表格开始]')
+                # tr 会在遍历中被处理
+                content_parts.append('[表格结束]\n')
+            
+            elif tag_name == 'blockquote':
+                content_parts.append(f'> {text.strip()}')
+            
+            elif tag_name == 'pre':
+                content_parts.append(f"\n```\n{text}\n```\n")
+            
+            else:
+                # p, div, section, article 等普通段落
+                content_parts.append(text.strip())
+        
+        return '\n\n'.join(content_parts)
+    
+    def _extract_element_text(self, elem) -> str:
+        """提取元素文本，保留内联格式"""
+        # 处理内联标签：strong, em, a 等
+        texts = []
+        for child in elem.descendants:
+            if isinstance(child, NavigableString):
+                texts.append(str(child))
+            elif child.name in ['br']:
+                texts.append('\n')
+            elif child.name in ['strong', 'b']:
+                texts.append(f'**{child.get_text()}**')
+            elif child.name in ['em', 'i']:
+                texts.append(f'*{child.get_text()}*')
+            elif child.name == 'a' and child.get('href'):
+                texts.append(f"{child.get_text()} ({child['href']})")
+        
+        return ''.join(texts).strip()
+    
+    def _get_list_index(self, li_elem) -> int:
+        """获取有序列表中的序号"""
+        parent = li_elem.find_parent('ol')
+        if parent:
+            return len(li_elem.find_previous_siblings('li')) + 1
+        return 1
+    
+    def process_file(self, file_path: str) -> Document | None:
+        """处理单个 HTML 文件"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+        except Exception as e:
+            print(f"读取失败 {file_path}: {e}")
+            return None
+        
+        soup = self.clean_html(html_content)
+        text = self.extract_semantic_structure(soup, file_path)
+        
+        # 过滤过短内容
+        if len(text.strip()) < self.min_content_length:
+            return None
+        
+        # 提取元数据
+        title = soup.find('title')
+        title_text = title.get_text(strip=True) if title else Path(file_path).stem
+        
+        # 提取描述
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        description = meta_desc['content'] if meta_desc and meta_desc.get('content') else ''
+        
+        return Document(
+            text=text,
+            metadata={
+                "source": file_path,
+                "filename": Path(file_path).name,
+                "title": title_text,
+                "description": description,
+                "type": "html_document",
+                "char_count": len(text)
+            }
+        )
+    
+    def process_directory(self, data_dir: str) -> list[Document]:
+        """批量处理目录"""
+        documents = []
+        html_files = list(Path(data_dir).rglob("*.html"))
+        
+        print(f"发现 {len(html_files)} 个 HTML 文件")
+        
+        for i, html_file in enumerate(html_files, 1):
+            if i % 50 == 0:
+                print(f"处理中... {i}/{len(html_files)}")
+            
+            doc = self.process_file(str(html_file))
+            if doc:
+                documents.append(doc)
+        
+        print(f"✅ 成功处理 {len(documents)}/{len(html_files)} 个文档")
+        return documents
+
+
+# 使用示例
+if __name__ == "__main__":
+    processor = HTMLDocumentProcessor(min_content_length=100)
+    docs = processor.process_directory("./html_documents")
+    print(f"\n示例文档内容（前 500 字符）:")
+    if docs:
+        print(docs[0].text[:500])
+```
+
+### 4. 索引与检索系统
+
+```python
+"""
+rag_engine.py - LlamaIndex + Ollama + Qdrant RAG 引擎
+"""
+import os
+from pathlib import Path
+from llama_index.core import VectorStoreIndex, Settings, StorageContext, load_index_from_storage
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.core.postprocessor import SimilarityPostprocessor
+from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.llms.ollama import Ollama
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+import qdrant_client
+
+from html_processor import HTMLDocumentProcessor
+
+
+class HTMLRAGSystem:
+    """HTML 文档 RAG 系统"""
+    
+    def __init__(self, 
+                 data_dir: str = "./html_documents",
+                 storage_dir: str = "./storage",
+                 qdrant_path: str = "./qdrant_storage",
+                 collection_name: str = "html_docs"):
+        
+        self.data_dir = data_dir
+        self.storage_dir = Path(storage_dir)
+        self.qdrant_path = qdrant_path
+        self.collection_name = collection_name
+        
+        # 确保存储目录存在
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 初始化模型
+        self._setup_models()
+        
+        # 初始化向量库
+        self._setup_vector_store()
+        
+        self.index = None
+        self.query_engine = None
+    
+    def _setup_models(self):
+        """配置本地 GPU 加速模型"""
+        # 嵌入模型
+        Settings.embed_model = OllamaEmbedding(
+            model_name="nomic-embed-text",
+            base_url="http://localhost:11434"
+        )
+        
+        # LLM（文档问答场景）
+        Settings.llm = Ollama(
+            model="qwen3:7b",
+            base_url="http://localhost:11434",
+            temperature=0.1,  # 文档问答低温度更稳定
+            request_timeout=120.0
+        )
+        
+        print("✅ 模型配置完成")
+    
+    def _setup_vector_store(self):
+        """配置 Qdrant 本地向量库"""
+        self.qdrant_client = qdrant_client.QdrantClient(path=self.qdrant_path)
+        self.vector_store = QdrantVectorStore(
+            client=self.qdrant_client,
+            collection_name=self.collection_name
+        )
+        print(f"✅ Qdrant 向量库已连接: {self.qdrant_path}")
+    
+    def build_index(self, force_rebuild: bool = False):
+        """构建或加载索引"""
+        index_file = self.storage_dir / "docstore.json"
+        
+        if index_file.exists() and not force_rebuild:
+            print("📂 加载已有索引...")
+            storage_context = StorageContext.from_defaults(
+                vector_store=self.vector_store,
+                persist_dir=str(self.storage_dir)
+            )
+            self.index = load_index_from_storage(storage_context)
+            print(f"✅ 已加载索引，包含 {len(self.index.docstore.docs)} 个节点")
+        else:
+            print("🔨 构建新索引...")
+            
+            # 处理 HTML 文档
+            processor = HTMLDocumentProcessor(min_content_length=100)
+            documents = processor.process_directory(self.data_dir)
+            
+            if not documents:
+                raise ValueError("没有找到有效的 HTML 文档")
+            
+            # 文档分块策略（针对文档内容优化）
+            # 按段落和标题边界分块，保持语义完整性
+            node_parser = SentenceSplitter(
+                chunk_size=512,
+                chunk_overlap=50,
+                separator="\n\n"  # 优先按段落分割
+            )
+            
+            # 创建索引
+            storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
+            self.index = VectorStoreIndex.from_documents(
+                documents,
+                storage_context=storage_context,
+                node_parser=node_parser,
+                show_progress=True
+            )
+            
+            # 持久化
+            self.index.storage_context.persist(persist_dir=str(self.storage_dir))
+            print(f"✅ 索引构建完成，已保存到 {self.storage_dir}")
+        
+        # 创建查询引擎
+        self._create_query_engine()
+    
+    def _create_query_engine(self):
+        """创建优化的查询引擎"""
+        # 配置检索器
+        retriever = VectorIndexRetriever(
+            index=self.index,
+            similarity_top_k=8,  # 检索 top-8 相关片段
+        )
+        
+        # 后处理：过滤低相似度结果
+        postprocessor = SimilarityPostprocessor(similarity_cutoff=0.7)
+        
+        self.query_engine = RetrieverQueryEngine.from_args(
+            retriever=retriever,
+            node_postprocessors=[postprocessor],
+            response_mode="compact",  # 紧凑模式，节省 token
+            verbose=True
+        )
+        print("✅ 查询引擎已就绪")
+    
+    def query(self, question: str) -> dict:
+        """查询接口 - 供 Coding Agent 调用"""
+        if not self.query_engine:
+            raise RuntimeError("索引未构建，请先调用 build_index()")
+        
+        response = self.query_engine.query(question)
+        
+        # 提取来源信息
+        sources = []
+        contexts = []
+        for node in response.source_nodes:
+            sources.append({
+                "file": node.node.metadata.get("filename", "unknown"),
+                "path": node.node.metadata.get("source", "unknown"),
+                "title": node.node.metadata.get("title", ""),
+                "score": round(float(node.score), 4) if node.score else None
+            })
+            contexts.append(node.node.text)
+        
+        return {
+            "answer": str(response),
+            "sources": sources,
+            "contexts": contexts,
+            "query": question
+        }
+    
+    def search_only(self, query: str, top_k: int = 5) -> list[dict]:
+        """仅检索，不生成答案（用于 Coding Agent 自行处理）"""
+        if not self.index:
+            raise RuntimeError("索引未构建")
+        
+        retriever = self.index.as_retriever(similarity_top_k=top_k)
+        nodes = retriever.retrieve(query)
+        
+        results = []
+        for node in nodes:
+            results.append({
+                "content": node.node.text,
+                "metadata": node.node.metadata,
+                "score": round(float(node.score), 4) if node.score else None
+            })
+        return results
+
+
+# 使用示例
+if __name__ == "__main__":
+    # 初始化系统
+    rag = HTMLRAGSystem(
+        data_dir="./html_documents",
+        storage_dir="./storage",
+        qdrant_path="./qdrant_storage"
+    )
+    
+    # 构建索引（首次运行）
+    rag.build_index(force_rebuild=False)
+    
+    # 测试查询
+    result = rag.query("HTML5 有哪些新的表单属性？")
+    print("\n" + "="*50)
+    print("答案:", result["answer"])
+    print("\n来源文档:")
+    for src in result["sources"]:
+        print(f"  - {src['title']} ({src['file']}) [相似度: {src['score']}]")
+```
+
+### 5. FastAPI 服务封装（供 Coding Agent 调用）
+
+```python
+"""
+api_server.py - FastAPI 服务
+"""
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+import uvicorn
+
+from rag_engine import HTMLRAGSystem
+
+
+app = FastAPI(title="HTML Document RAG API", version="1.0")
+rag_system: HTMLRAGSystem | None = None
+
+
+class QueryRequest(BaseModel):
+    question: str
+    top_k: Optional[int] = 5
+
+
+class QueryResponse(BaseModel):
+    answer: str
+    sources: List[dict]
+    contexts: List[str]
+
+
+@app.on_event("startup")
+async def startup():
+    global rag_system
+    rag_system = HTMLRAGSystem(
+        data_dir="./html_documents",
+        storage_dir="./storage",
+        qdrant_path="./qdrant_storage"
+    )
+    rag_system.build_index(force_rebuild=False)
+    print("🚀 RAG 服务已启动")
+
+
+@app.post("/query", response_model=QueryResponse)
+async def query_documents(request: QueryRequest):
+    if not rag_system:
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    try:
+        result = rag_system.query(request.question)
+        return QueryResponse(**result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/search")
+async def search_documents(request: QueryRequest):
+    """仅检索，返回相关片段"""
+    if not rag_system:
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    try:
+        results = rag_system.search_only(request.question, top_k=request.top_k)
+        return {"results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "index_loaded": rag_system is not None}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+---
+
+## 方案二：高性能生产级（vLLM + Qdrant + LangChain）
+
+适合文档量大、需要高并发、Coding Agent 高频调用的场景。vLLM 的吞吐量比 Ollama 高 3-5 倍。
+
+### 1. 环境安装
+
+```bash
+pip install vllm langchain langchain-community langchain-qdrant qdrant-client
+pip install sentence-transformers beautifulsoup4 lxml html5lib
+pip install fastapi uvicorn
+```
+
+### 2. 启动 vLLM 服务（Windows GPU 加速）
+
+```bash
+# 启动 OpenAI 兼容 API 服务
+# 根据显存选择模型：
+#   8GB  VRAM → Qwen3-7B-Instruct 或 Llama-3.1-8B
+#   16GB VRAM → Qwen3-14B-Instruct 或 Mistral-Nemo-12B
+#   24GB+ VRAM → Qwen3-32B-Instruct
+
+python -m vllm.entrypoints.openai.api_server ^
+    --model Qwen/Qwen3-7B-Instruct ^
+    --port 8000 ^
+    --tensor-parallel-size 1 ^
+    --max-model-len 8192 ^
+    --gpu-memory-utilization 0.85
+```
+
+### 3. HTML 语义处理（文档专用版）
+
+```python
+"""
+html_document_parser.py - 文档级 HTML 语义解析
+"""
+from pathlib import Path
+from bs4 import BeautifulSoup, NavigableString
+from langchain_core.documents import Document
+import re
+
+
+class HTMLDocumentParser:
+    """
+    文档级 HTML 解析器
+    保留文档语义：标题层级、段落、列表、表格、引用
+    """
+    
+    NOISE_SELECTORS = [
+        'script', 'style', 'nav', 'footer', 'header', 'aside',
+        'iframe', 'noscript', 'advertisement', 'sidebar',
+        '[class*="nav"]', '[class*="menu"]', '[class*="sidebar"]',
+        '[class*="advert"]', '[id*="nav"]', '[id*="menu"]'
+    ]
+    
+    def __init__(self, min_length: int = 100):
+        self.min_length = min_length
+    
+    def parse(self, html_content: str, source_path: str = "") -> Document:
+        """解析 HTML 为结构化文档"""
+        soup = BeautifulSoup(html_content, 'html5lib')
+        
+        # 移除噪音
+        for selector in self.NOISE_SELECTORS:
+            for elem in soup.select(selector):
+                elem.decompose()
+        
+        # 提取标题
+        title = self._extract_title(soup)
+        
+        # 提取正文结构
+        content = self._extract_content(soup)
+        
+        # 提取元数据
+        metadata = {
+            "source": source_path,
+            "filename": Path(source_path).name if source_path else "",
+            "title": title,
+            "url": self._extract_canonical_url(soup),
+            "description": self._extract_meta(soup, 'description'),
+            "keywords": self._extract_meta(soup, 'keywords'),
+            "author": self._extract_meta(soup, 'author'),
+            "char_count": len(content)
+        }
+        
+        return Document(page_content=content, metadata=metadata)
+    
+    def _extract_title(self, soup: BeautifulSoup) -> str:
+        """提取文档标题"""
+        # 优先 h1，其次 title 标签
+        h1 = soup.find('h1')
+        if h1:
+            return h1.get_text(strip=True)
+        
+        title_tag = soup.find('title')
+        if title_tag:
+            return title_tag.get_text(strip=True)
+        
+        return "Untitled"
+    
+    def _extract_content(self, soup: BeautifulSoup) -> str:
+        """提取结构化正文内容"""
+        # 定位主要内容区域
+        main = (
+            soup.find('main') or 
+            soup.find('article') or 
+            soup.find('div', class_=re.compile('content|main|article', re.I)) or
+            soup.find('div', role='main') or
+            soup.body
+        )
+        
+        if not main:
+            return ""
+        
+        sections = []
+        current_section = []
+        current_heading = None
+        
+        for elem in main.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'section']):
+            tag = elem.name
+            
+            if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                # 保存上一节
+                if current_section:
+                    sections.append({
+                        'heading': current_heading,
+                        'content': '\n'.join(current_section)
+                    })
+                
+                current_heading = {
+                    'level': int(tag[1]),
+                    'text': elem.get_text(strip=True)
+                }
+                current_section = []
+            
+            elif tag in ['p', 'div', 'section']:
+                text = self._clean_text(elem.get_text())
+                if len(text) > 20:  # 过滤过短段落
+                    current_section.append(text)
+        
+        # 保存最后一节
+        if current_section:
+            sections.append({
+                'heading': current_heading,
+                'content': '\n'.join(current_section)
+            })
+        
+        # 渲染为 Markdown 风格文本
+        return self._render_sections(sections)
+    
+    def _render_sections(self, sections: list) -> str:
+        """将结构化内容渲染为文本"""
+        parts = []
+        
+        for section in sections:
+            heading = section['heading']
+            content = section['content']
+            
+            if heading:
+                prefix = '#' * heading['level'] + ' '
+                parts.append(f"\n{prefix}{heading['text']}\n")
+            
+            if content:
+                parts.append(content)
+        
+        return '\n\n'.join(parts)
+    
+    def _clean_text(self, text: str) -> str:
+        """清理文本"""
+        # 合并空白
+        text = re.sub(r'\s+', ' ', text)
+        # 移除特殊字符
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+        return text.strip()
+    
+    def _extract_canonical_url(self, soup: BeautifulSoup) -> str:
+        """提取规范 URL"""
+        canonical = soup.find('link', rel='canonical')
+        return canonical['href'] if canonical and canonical.get('href') else ''
+    
+    def _extract_meta(self, soup: BeautifulSoup, name: str) -> str:
+        """提取 meta 标签内容"""
+        meta = soup.find('meta', attrs={'name': name}) or soup.find('meta', attrs={'property': f'og:{name}'})
+        return meta['content'] if meta and meta.get('content') else ''
+    
+    def parse_directory(self, data_dir: str) -> list[Document]:
+        """批量解析目录"""
+        docs = []
+        html_files = list(Path(data_dir).rglob("*.html"))
+        
+        print(f"📁 发现 {len(html_files)} 个 HTML 文件")
+        
+        for i, file_path in enumerate(html_files, 1):
+            if i % 100 == 0:
+                print(f"处理中... {i}/{len(html_files)}")
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    html = f.read()
+                
+                doc = self.parse(html, str(file_path))
+                if len(doc.page_content) >= self.min_length:
+                    docs.append(doc)
+            except Exception as e:
+                print(f"⚠️ 处理失败 {file_path}: {e}")
+        
+        print(f"✅ 成功解析 {len(docs)}/{len(html_files)} 个文档")
+        return docs
+```
+
+### 4. 完整 RAG Pipeline
+
+```python
+"""
+vllm_rag_pipeline.py - vLLM + Qdrant + LangChain RAG 管道
+"""
+import os
+from pathlib import Path
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import VLLMOpenAI
+from langchain_qdrant import QdrantVectorStore
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import LLMChainExtractor
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
+
+from html_document_parser import HTMLDocumentParser
+
+
+class VLLMRAGPipeline:
+    """vLLM 高性能 RAG 管道"""
+    
+    def __init__(self,
+                 data_dir: str = "./html_documents",
+                 qdrant_path: str = "./qdrant_db",
+                 collection_name: str = "html_knowledge",
+                 vllm_url: str = "http://localhost:8000/v1"):
+        
+        self.data_dir = data_dir
+        self.qdrant_path = qdrant_path
+        self.collection_name = collection_name
+        self.vllm_url = vllm_url
+        
+        # 初始化组件
+        self.embeddings = None
+        self.llm = None
+        self.vectorstore = None
+        self.qa_chain = None
+        
+        self._setup_embeddings()
+        self._setup_llm()
+        self._setup_qdrant()
+    
+    def _setup_embeddings(self):
+        """配置本地 GPU 嵌入模型"""
+        # BGE 系列在文档检索上表现优秀
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="BAAI/bge-large-en-v1.5",  # 1024 维
+            # 或中文场景: BAAI/bge-large-zh-v1.5
+            model_kwargs={'device': 'cuda'},
+            encode_kwargs={
+                'normalize_embeddings': True,
+                'batch_size': 32
+            }
+        )
+        print("✅ 嵌入模型已加载 (GPU)")
+    
+    def _setup_llm(self):
+        """配置 vLLM 客户端"""
+        self.llm = VLLMOpenAI(
+            openai_api_key="not-needed",
+            openai_api_base=self.vllm_url,
+            model_name="Qwen3-7B-Instruct",
+            temperature=0.1,
+            max_tokens=2048,
+            top_p=0.9
+        )
+        print(f"✅ vLLM 已连接: {self.vllm_url}")
+    
+    def _setup_qdrant(self):
+        """配置 Qdrant 向量库"""
+        self.client = QdrantClient(path=self.qdrant_path)
+        
+        # 检查并创建 collection
+        try:
+            self.client.get_collection(self.collection_name)
+            print(f"✅ 使用已有 collection: {self.collection_name}")
+        except:
+            # 获取嵌入维度
+            test_emb = self.embeddings.embed_query("test")
+            dim = len(test_emb)
+            
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(
+                    size=dim,
+                    distance=Distance.COSINE,
+                    on_disk=True  # 磁盘存储，适合大量文档
+                )
+            )
+            print(f"✅ 创建新 collection: {self.collection_name} (dim={dim})")
+    
+    def ingest_documents(self, force_reingest: bool = False):
+        """文档摄入"""
+        if not force_reingest:
+            # 检查是否已有数据
+            try:
+                info = self.client.get_collection(self.collection_name)
+                if info.points_count > 0:
+                    print(f"📂 已有 {info.points_count} 个向量，跳过摄入")
+                    self.vectorstore = QdrantVectorStore(
+                        client=self.client,
+                        collection_name=self.collection_name,
+                        embedding=self.embeddings
+                    )
+                    return
+            except:
+                pass
+        
+        print("🔨 开始文档摄入...")
+        
+        # 解析 HTML
+        parser = HTMLDocumentParser(min_length=100)
+        documents = parser.parse_directory(self.data_dir)
+        
+        # 文档分块（文档场景优化）
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=150,
+            separators=[
+                "\n## ",      # 二级标题
+                "\n### ",     # 三级标题
+                "\n\n",       # 段落
+                "\n",         # 换行
+                ". ",         # 句子
+                " ",          # 单词
+                ""            # 字符
+            ],
+            length_function=len
+        )
+        
+        chunks = text_splitter.split_documents(documents)
+        print(f"📄 生成 {len(chunks)} 个文本块")
+        
+        # 存入 Qdrant
+        self.vectorstore = QdrantVectorStore.from_documents(
+            chunks,
+            self.embeddings,
+            client=self.client,
+            collection_name=self.collection_name,
+            force_recreate=True
+        )
+        print(f"✅ 已存入 {len(chunks)} 个向量")
+    
+    def build_qa_chain(self):
+        """构建问答链"""
+        # 基础检索器
+        base_retriever = self.vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 10}  # 先检索 10 个
+        )
+        
+        # 重排序压缩（可选，提升精度）
+        # compressor = LLMChainExtractor.from_llm(self.llm)
+        # retriever = ContextualCompressionRetriever(
+        #     base_compressor=compressor,
+        #     base_retriever=base_retriever
+        # )
+        retriever = base_retriever
+        
+        # 文档问答专用 Prompt
+        DOCUMENT_QA_PROMPT = PromptTemplate(
+            template="""你是一个专业的文档问答助手。请严格基于以下提供的文档内容回答问题。
+如果文档中没有相关信息，请明确说明"根据提供的文档，无法找到相关信息"。
+
+文档内容：
+{context}
+
+问题：{question}
+
+请提供准确、简洁的答案。如果涉及多个文档，请综合回答并注明来源。""",
+            input_variables=["context", "question"]
+        )
+        
+        self.qa_chain = RetrievalQA.from_chain_type(
+            llm=self.llm,
+            chain_type="stuff",
+            retriever=retriever,
+            chain_type_kwargs={"prompt": DOCUMENT_QA_PROMPT},
+            return_source_documents=True,
+            verbose=False
+        )
+        print("✅ 问答链已构建")
+    
+    def query(self, question: str) -> dict:
+        """查询接口"""
+        if not self.qa_chain:
+            raise RuntimeError("请先调用 build_qa_chain()")
+        
+        result = self.qa_chain.invoke({"query": question})
+        
+        sources = []
+        for doc in result["source_documents"]:
+            sources.append({
+                "content": doc.page_content[:300] + "...",
+                "metadata": doc.metadata,
+                "title": doc.metadata.get("title", "Unknown"),
+                "source": doc.metadata.get("source", "Unknown")
+            })
+        
+        return {
+            "answer": result["result"],
+            "sources": sources
+        }
+    
+    def search(self, query: str, top_k: int = 5) -> list[dict]:
+        """纯检索接口"""
+        retriever = self.vectorstore.as_retriever(search_kwargs={"k": top_k})
+        docs = retriever.invoke(query)
+        
+        return [{
+            "content": d.page_content,
+            "metadata": d.metadata,
+            "score": None  # similarity search 不返回分数
+        } for d in docs]
+
+
+# 使用示例
+if __name__ == "__main__":
+    pipeline = VLLMRAGPipeline(
+        data_dir="./html_documents",
+        qdrant_path="./qdrant_db",
+        vllm_url="http://localhost:8000/v1"
+    )
+    
+    # 摄入文档
+    pipeline.ingest_documents(force_reingest=False)
+    
+    # 构建问答链
+    pipeline.build_qa_chain()
+    
+    # 测试
+    result = pipeline.query("HTML5 引入了哪些新的语义化标签？")
+    print("\n答案:", result["answer"])
+    print("\n来源:")
+    for src in result["sources"]:
+        print(f"  - {src['title']}")
+```
+
+### 5. 混合检索增强（BM25 + Dense）
+
+对于纯文档场景，**混合检索**（关键词匹配 + 语义匹配）能显著提升召回率，特别是处理包含特定术语的查询时。
+
+```python
+"""
+hybrid_retrieval.py - 混合检索实现
+需要: pip install rank-bm25
+"""
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
+from langchain_qdrant import QdrantVectorStore
+
+
+class HybridRetriever:
+    """BM25 + 向量检索混合方案"""
+    
+    def __init__(self, vectorstore: QdrantVectorStore, documents: list):
+        self.vectorstore = vectorstore
+        
+        # BM25 检索器
+        self.bm25_retriever = BM25Retriever.from_documents(
+            documents,
+            k=5,
+            preprocess_func=lambda text: text.lower()
+        )
+        
+        # 向量检索器
+        self.vector_retriever = vectorstore.as_retriever(
+            search_kwargs={"k": 5}
+        )
+        
+        # 混合检索器（权重可调整）
+        self.ensemble_retriever = EnsembleRetriever(
+            retrievers=[self.bm25_retriever, self.vector_retriever],
+            weights=[0.3, 0.7]  # BM25 占 30%，向量占 70%
+        )
+    
+    def retrieve(self, query: str):
+        return self.ensemble_retriever.invoke(query)
+
+
+# 集成到 Pipeline
+def build_hybrid_qa_chain(self):
+    """使用混合检索构建问答链"""
+    # 需要重新加载原始 chunks 用于 BM25
+    # 实际使用时在 ingest 阶段保存 chunks
+    pass
+```
+
+---
+
+## 两方案对比（纯文档场景）
+
+| 维度 | 方案一（Ollama + LlamaIndex） | 方案二（vLLM + LangChain） |
+|------|------------------------------|---------------------------|
+| **部署复杂度** | ⭐ 极低（一键安装 Ollama） | ⭐⭐ 中等（需启动 vLLM 服务） |
+| **并发能力** | 低（单请求顺序处理） | 高（支持 10+ 并发） |
+| **吞吐量** | ~5-10 req/s | ~30-50 req/s |
+| **HTML 处理** | 自定义语义提取 | 自定义语义提取 |
+| **分块策略** | SentenceSplitter（段落级） | RecursiveCharacterTextSplitter（多级分隔） |
+| **检索精度** | 基础向量检索 | 可扩展混合检索（BM25 + Dense） |
+| **GPU 显存** | 8GB 可跑 7B 模型 | 8GB 可跑 7B 模型，利用率更高 |
+| **适用规模** | < 5000 文档 | 10万+ 文档 |
+| **Coding Agent 集成** | FastAPI 简单封装 | FastAPI + 流式输出 |
+| **维护成本** | 低 | 中等 |
+
+---
+
+## 推荐选择路径
+
+1. **快速验证 / 个人项目** → 方案一（30 分钟跑通全流程）
+2. **团队使用 / 高频调用** → 方案二（vLLM 的并发能力不可替代）
+3. **文档质量要求高** → 无论哪个方案，都要投入精力在 `HTMLDocumentProcessor` 的**语义提取逻辑**上，这是纯文档 RAG 的核心瓶颈

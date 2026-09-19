@@ -1,0 +1,24 @@
+# Doc mirror (huge, not source)
+/Manual/
+/ScriptReference/
+
+# Generated RAG artefacts
+/corpus/
+/index/
+/failures.jsonl
+
+# Legacy generated indices
+/chunks.pkl
+/index.pkl
+/index_word.pkl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Tooling temp
+.kimix_cache/

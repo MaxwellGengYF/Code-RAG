@@ -1,0 +1,16 @@
+{
+  "tokenizer": "word",
+  "path_boost": 3,
+  "fuzziness": 0,
+  "min_should_match": 0.6,
+  "per_file": 1,
+  "embedder": "none",
+  "ollama_model": "nomic-embed-text",
+  "bm25_k": 200,
+  "final_k": 8,
+  "alpha": 1.0,
+  "dirs": ["Manual", "ScriptReference"],
+  "index_path": "index_word.pkl",
+  "ngram_index_path": "index.pkl",
+  "chunks_path": "chunks.pkl"
+}

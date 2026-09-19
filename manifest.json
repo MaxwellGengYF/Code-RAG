@@ -1,0 +1,16 @@
+{
+  "indices": {
+    "index_word.pkl": {
+      "built_at": "2026-09-19T07:11:26+0800",
+      "tokenizer": "word",
+      "path_boost": 3,
+      "n_chunks": 83183,
+      "n_docs_indexed": 83183,
+      "chunks_path": "chunks.pkl",
+      "chunks_size": 49832085,
+      "chunks_sha1_8": "f678b0c9",
+      "index_size": 37369324,
+      "index_sha1_8": "91a76367"
+    }
+  }
+}

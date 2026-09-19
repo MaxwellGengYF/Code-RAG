@@ -1,0 +1,22 @@
+{
+  "dirs": ["Manual", "ScriptReference"],
+  "corpus_dir": "corpus",
+  "index_dir": "index",
+  "tokenizer": "word",
+  "path_boost": 3,
+  "fuzziness": 0,
+  "min_should_match": 0.6,
+  "per_file": 1,
+  "bm25_k": 200,
+  "dense_k": 200,
+  "final_k": 8,
+  "rrf_k": 60,
+  "mode": "hybrid",
+  "rerank": false,
+  "rerank_model": "BAAI/bge-reranker-v2-m3",
+  "embed_model": "BAAI/bge-m3",
+  "embed_device": "auto",
+  "max_input_chars": 24000,
+  "max_chunk_chars": 1200,
+  "compile_workers": 8
+}
