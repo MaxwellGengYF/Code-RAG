@@ -40,7 +40,7 @@ TYPO_CASES = [
 def score_legacy(index_path: str, tokenizer_name: str, fuzziness, label: str):
     """Legacy engine (hybrid_retrieve) on its own artefacts."""
     from retrieval import InvertedIndex, Searcher
-    from hybrid_retrieve import (build_page_map, dedupe_by_source,
+    from hybrid_retrieve import (dedupe_by_source,
                                  get_tokenizer, load_chunks_pickle)
 
     t0 = time.time()
@@ -126,4 +126,5 @@ def main():
     print("new side can mean 'page not generated yet' rather than a ranking failure.")
 
 
-main()
+if __name__ == "__main__":
+    main()

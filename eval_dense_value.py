@@ -62,4 +62,5 @@ def main():
           f"hybrid={h_hits}/{len(CASES)}  dense-rescued-zero-hit={rescued}")
 
 
-main()
+if __name__ == "__main__":
+    main()

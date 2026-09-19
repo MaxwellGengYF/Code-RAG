@@ -30,7 +30,7 @@ from rag.corpus import (
     extract_page,
     generate_page_corpus,
 )
-from rag.corpus.prompts import PROMPT_VERSION, system_prompt
+from rag.corpus.prompts import PROMPT_VERSION
 from rag.llm.base import LLMClient
 from rag.store import CorpusStore, FileManager, ManifestDiff
 

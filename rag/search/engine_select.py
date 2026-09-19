@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
-
 from rag import resolve_path
 
 #: fraction of mirrored pages that must have corpus coverage before the RAG index

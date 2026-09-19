@@ -99,4 +99,5 @@ async def main():
     print(f"  VERDICT: {'PASS' if ok else 'CHECK ABOVE'}")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

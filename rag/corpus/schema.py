@@ -12,8 +12,6 @@ from datetime import datetime, timezone
 
 import msgspec
 
-from rag.corpus.prompts import PROMPT_VERSION
-
 SCHEMA_VERSION = "v1"
 EXTRACTOR_VERSION = "v1"  # bump when rag/corpus/extract.py rendering changes
 

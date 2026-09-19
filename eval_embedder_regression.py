@@ -155,4 +155,5 @@ def main():
     return results
 
 
-main()
+if __name__ == "__main__":
+    main()

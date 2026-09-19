@@ -11,7 +11,6 @@ Commands:
 from __future__ import annotations
 
 import argparse
-import sys
 
 
 def main(argv: list[str] | None = None) -> int:

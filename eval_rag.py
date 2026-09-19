@@ -143,8 +143,6 @@ def table_ranker(rows, cfg, *, mode="hybrid", aux=None, path_boost=None,
     mismatch would silently pair every BM25 doc id with the wrong vector.
     """
     import heapq
-    import numpy as np
-    from rag.corpus.schema import CorpusChunk, to_embed_text
     from rag.index.bm25_index import build_bm25, new_searcher
     from rag.index.vector_index import embed_query
     from rag.index.fuse import rrf_fuse

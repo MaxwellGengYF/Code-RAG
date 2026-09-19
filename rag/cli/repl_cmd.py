@@ -19,8 +19,6 @@ from __future__ import annotations
 
 import json
 import sys
-from pathlib import Path
-
 from rag import resolve_path
 from rag.compile import load_rag_config
 
