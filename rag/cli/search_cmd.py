@@ -58,6 +58,20 @@ def run_search(
 
     from rag.search.engine import SearchEngine
     engine = SearchEngine(cfg)
+    try:
+        engine.load()
+    except FileNotFoundError as exc:
+        # No index yet (fresh checkout, or corpus step not run). Report the exact
+        # next command instead of a traceback — this is the expected state after
+        # `git clone`, not an internal error.
+        print(str(exc), file=sys.stderr)
+        print("\nnothing has been built in this checkout yet. To build:", file=sys.stderr)
+        print("  1. uv run python rag.py compile --provider D:/qwen_flash.json "
+              "--no-thinking   # LLM corpus (slow, resumable)", file=sys.stderr)
+        print("  2. uv run python rag.py compile --steps index                "
+              "                  # BM25 + dense indexes", file=sys.stderr)
+        print("see AGENTS.md for the full workflow.", file=sys.stderr)
+        return 1
 
     if mentions:
         res = engine.mentions(mentions)

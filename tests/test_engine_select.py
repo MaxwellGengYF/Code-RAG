@@ -60,7 +60,13 @@ def test_no_index_is_not_complete(mirror):
     st = rag_index_status(cfg)
     assert st["built"] is False and st["complete"] is False
     assert "not built" in st["reason"]
-    assert choose_engine(cfg) == ("legacy", st)
+    engine, chosen = choose_engine(cfg)
+    assert engine == "legacy"
+    # choose_engine enriches the status with legacy availability; the RAG fields
+    # must be carried through unchanged
+    for key in ("built", "complete", "coverage", "reason"):
+        assert chosen[key] == st[key]
+    assert "legacy" in chosen and "nothing_built" in chosen
 
 
 def test_partial_index_selects_legacy(mirror):
@@ -101,6 +107,49 @@ def test_forced_preference_overrides(mirror):
     write_index(index_dir, n_pages=1, n_chunks=2)  # clearly partial
     assert choose_engine(cfg, prefer="rag")[0] == "rag"
     assert choose_engine(cfg, prefer="legacy")[0] == "legacy"
+
+
+def test_nothing_built_when_both_engines_absent(mirror, monkeypatch):
+    """Fresh checkout: neither engine built. Must not claim LEGACY would serve."""
+    import rag.search.engine_select as es
+
+    root, index_dir, corpus_dir = mirror
+    cfg = cfg_for(root, index_dir, corpus_dir)
+    monkeypatch.setattr(es, "legacy_index_status",
+                        lambda: {"built": False,
+                                 "missing": ["chunks.pkl", "index_word.pkl"]})
+    engine, st = es.choose_engine(cfg)
+    assert engine == "legacy"  # caller's not-found handler prints the rebuild hint
+    assert st["nothing_built"] is True
+    assert st["legacy"]["missing"] == ["chunks.pkl", "index_word.pkl"]
+
+
+def test_not_nothing_built_when_legacy_present(mirror, monkeypatch):
+    """Partial RAG index + full legacy artefacts: legacy genuinely serves."""
+    import rag.search.engine_select as es
+
+    root, index_dir, corpus_dir = mirror
+    cfg = cfg_for(root, index_dir, corpus_dir)
+    write_index(index_dir, n_pages=8, n_chunks=40)
+    monkeypatch.setattr(es, "legacy_index_status",
+                        lambda: {"built": True, "missing": []})
+    engine, st = es.choose_engine(cfg)
+    assert engine == "legacy"
+    assert st["nothing_built"] is False
+
+
+def test_legacy_index_status_reports_missing(monkeypatch, tmp_path):
+    """legacy_index_status resolves against the repo root; check its shape."""
+    import rag.search.engine_select as es
+
+    monkeypatch.setattr(es, "resolve_path", lambda p: tmp_path / p)
+    st = es.legacy_index_status()
+    assert st["built"] is False
+    assert set(st["missing"]) == {"chunks.pkl", "index_word.pkl"}
+    (tmp_path / "chunks.pkl").write_bytes(b"x")
+    (tmp_path / "index_word.pkl").write_bytes(b"x")
+    st = es.legacy_index_status()
+    assert st["built"] is True and st["missing"] == []
 
 
 def test_corrupt_index_manifest_handled(mirror):

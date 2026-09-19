@@ -923,9 +923,17 @@ def main(argv: list[str] | None = None) -> int:
         engine_name, status = choose_engine(
             rag_cfg, prefer="rag" if getattr(args, "rag", False) else None)
         if engine_name != "rag":
-            print(f"[engine] using LEGACY index: RAG index {status['reason']}. "
-                  f"Rebuild with `rag.py compile` (then --steps index) to switch.",
-                  file=sys.stderr)
+            if status.get("nothing_built"):
+                print(f"[engine] no index built in this checkout: RAG index "
+                      f"{status['reason']}; legacy missing "
+                      f"{', '.join(status['legacy']['missing'])}. Build with "
+                      f"`rag.py compile --provider <cfg> --no-thinking`, or "
+                      f"`hybrid_retrieve.py --build --force` for the legacy index.",
+                      file=sys.stderr)
+            else:
+                print(f"[engine] using LEGACY index: RAG index {status['reason']}. "
+                      f"Rebuild with `rag.py compile` (then --steps index) to switch.",
+                      file=sys.stderr)
         else:
             from rag.cli.search_cmd import run_search
             queries = args.query or []

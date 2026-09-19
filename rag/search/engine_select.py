@@ -70,14 +70,35 @@ def rag_index_status(cfg: dict) -> dict:
     return out
 
 
+def legacy_index_status() -> dict:
+    """Whether the legacy artefacts (chunks.pkl + index_word.pkl) are present.
+
+    Needed because auto-selection falls back to the legacy engine: on a fresh
+    checkout NEITHER engine is built, and claiming "LEGACY would serve this
+    query" would be wrong — the honest answer is that nothing has been built yet.
+    """
+    chunks = resolve_path("chunks.pkl")
+    index = resolve_path("index_word.pkl")
+    present = chunks.exists() and index.exists()
+    return {
+        "built": present,
+        "missing": [p.name for p in (chunks, index) if not p.exists()],
+    }
+
+
 def choose_engine(cfg: dict, *, prefer: str | None = None) -> tuple[str, dict]:
     """Return ("rag"|"legacy", status) for a search request.
 
     ``prefer`` forces the choice ("rag"/"legacy") when the caller passes an
     explicit flag; otherwise the RAG engine is used only once its index is both
-    built and complete.
+    built and complete. When neither engine is available the answer is still
+    "legacy" (so the caller's own not-found handling runs and prints the rebuild
+    hint), but ``status["nothing_built"]`` says so plainly.
     """
     status = rag_index_status(cfg)
+    legacy = legacy_index_status()
+    status["legacy"] = legacy
+    status["nothing_built"] = not status["built"] and not legacy["built"]
     if prefer == "rag":
         return "rag", status
     if prefer == "legacy":

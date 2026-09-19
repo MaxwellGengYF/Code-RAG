@@ -131,9 +131,16 @@ def run_status(*, config_path: str = "rag_config.json") -> int:
     # replaces the legacy full-corpus index once it covers the mirror.
     from rag.search.engine_select import choose_engine
     engine, st = choose_engine(cfg)
-    print(f"engine     : {engine.upper()} would serve `hybrid_retrieve.py --query ...`")
-    print(f"             {st['reason']}")
-    if engine != "rag":
-        print("             (hybrid_retrieve.py --rag forces the RAG engine; "
-              "--legacy forces the old one)")
+    if st.get("nothing_built"):
+        print("engine     : NEITHER engine is built in this checkout")
+        print(f"             RAG index: {st['reason']}")
+        print(f"             legacy:    missing {', '.join(st['legacy']['missing'])}")
+        print("             build with: uv run python rag.py compile "
+              "--provider <cfg> --no-thinking  (then --steps index)")
+    else:
+        print(f"engine     : {engine.upper()} would serve `hybrid_retrieve.py --query ...`")
+        print(f"             {st['reason']}")
+        if engine != "rag":
+            print("             (hybrid_retrieve.py --rag forces the RAG engine; "
+                  "--legacy forces the old one)")
     return 0
