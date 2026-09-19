@@ -403,10 +403,35 @@ def emit(results: list[dict], args) -> int:
         print("[eval] GATE: not evaluated — this run used a contaminated gold set "
               f"({gate_rows[0]['gold']}); rerun with --gold-set base")
         return 0
+
+    # Corpus-coverage guard: a subset index has far fewer distractors than the
+    # full mirror, so scores are optimistic and NOT comparable to the baseline
+    # (measured: BM25-only MRR 0.917 on a 3k-page subset vs 0.826 on 26k pages).
+    # Refusing to print a verdict here prevents a partial run from being quoted
+    # as the gate result.
+    from rag.compile import load_rag_config
+    from rag.search.engine_select import count_html_pages
+    from rag.store import CorpusStore
+    from rag import resolve_path
+
+    cfg = load_rag_config(getattr(args, "config", "rag_config.json"))
+    n_html = count_html_pages(cfg.get("dirs", ["Manual", "ScriptReference"]))
+    n_corpus = sum(1 for _ in CorpusStore(
+        resolve_path(cfg.get("corpus_dir", "corpus"))).iterate_all())
+    coverage = (n_corpus / n_html) if n_html else 0.0
+    if coverage < 0.95:
+        best = max(gate_rows, key=lambda r: r["MRR"])
+        print(f"[eval] GATE: DEFERRED — corpus coverage is {coverage:.1%} "
+              f"({n_corpus:,}/{n_html:,} pages), below the 95% needed for a "
+              f"comparable measurement. Best this run: {best['config']} at "
+              f"MRR={best['MRR']} hit@10={best['hit@10']}. Numbers on a subset "
+              f"are optimistic (fewer distractors); rerun after the full build.")
+        return 0
+
     passed = [r for r in gate_rows if r["MRR"] >= 0.875 and r["hit@10"] >= 0.917]
     if passed:
         print(f"[eval] GATE PASS: {passed[0]['config']} meets/exceeds the baseline "
-              f"(MRR>=0.875 AND hit@10>=0.917)")
+              f"(MRR>=0.875 AND hit@10>=0.917) on {coverage:.0%} corpus coverage")
     else:
         best = max(gate_rows, key=lambda r: r["MRR"])
         print(f"[eval] GATE FAIL: best was {best['config']} at MRR={best['MRR']} "
