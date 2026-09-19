@@ -59,6 +59,51 @@ def _compile_running() -> bool:
         return False  # cannot tell -> allow (caller was warned in the docstring)
 
 
+def estimate_pending(pending: int, sampled_rels: list[str], cfg: dict) -> str:
+    """Token/cost estimate for *pending* pages, from a small extraction sample.
+
+    Extracting every pending page to size the estimate costs minutes (measured
+    158 s for the full 44k mirror), so sample a few and extrapolate by mean
+    markdown size. The estimator constants are the ones --dry-run uses, which are
+    calibrated against real gateway usage (see compile_cmd), so this agrees with
+    a dry run without paying for the full scan.
+    """
+    import random
+
+    from rag.cli.compile_cmd import estimate_tokens
+    from rag.corpus import extract_page
+    from rag.corpus.prompts import system_prompt
+
+    if not pending:
+        return "est. cost  : nothing pending"
+    if not sampled_rels:
+        return "est. cost  : no pages available to sample"
+
+    rng = random.Random(0)
+    sample = rng.sample(sampled_rels, min(40, len(sampled_rels)))
+    root = resolve_path(".")
+    pages = []
+    for rel in sample:
+        p = extract_page(root / rel, root=root,
+                         max_chars=cfg.get("max_input_chars", 24_000))
+        if p:
+            pages.append(p)
+    if not pages:
+        return "est. cost  : sample extraction failed"
+
+    sys_p = system_prompt(cfg.get("max_chunk_chars", 1200))
+    s_in, s_out = estimate_tokens(pages, sys_p, thinking=False)
+    scale = pending / len(pages)
+    est_in, est_out = int(s_in * scale), int(s_out * scale)
+    mean_chars = sum(p.char_len for p in pages) // len(pages)
+    lines = [f"est. cost  : {pending:,} pages pending -> "
+             f"~{est_in/1e6:.1f}M input / ~{est_out/1e6:.1f}M output tokens",
+             f"             (extrapolated from {len(pages)} sampled pages, mean "
+             f"{mean_chars:,} chars; pass --price-in/--price-out to compile for "
+             f"a priced estimate)"]
+    return "\n".join(lines)
+
+
 def run_status(*, config_path: str = "rag_config.json") -> int:
     cfg = load_rag_config(config_path)
     corpus_dir = resolve_path(cfg.get("corpus_dir", "corpus"))
@@ -98,15 +143,17 @@ def run_status(*, config_path: str = "rag_config.json") -> int:
     print(f"diff       : added={len(diff.added)} changed={len(diff.changed)} "
           f"removed={len(diff.removed)} unchanged={len(diff.unchanged)}")
     # Honest pending count: diff trusts the manifest, so phantom entries inflate
-    # `unchanged`. Count pages that genuinely still need work.
-    pending = 0
-    for rel in diff.unchanged:
-        if store.missing(rel) or rel in set(manifest.get("needs_regen", [])):
-            pending += 1
-    pending += len(diff.added) + len(diff.changed)
+    # `unchanged`. Count pages that genuinely still need work, and keep their
+    # paths so the cost estimate can sample from the real pending set.
+    flagged = set(manifest.get("needs_regen", []))
+    pending_rels = [rel for rel in diff.unchanged
+                    if store.missing(rel) or rel in flagged]
+    pending_rels = sorted(set(pending_rels) | set(diff.added) | set(diff.changed))
+    pending = len(pending_rels)
     print(f"pending    : {pending} pages still need generation "
           f"({len(diff.added) + len(diff.changed)} new/changed + "
           f"{pending - len(diff.added) - len(diff.changed)} missing-or-flagged)")
+    print(estimate_pending(pending, pending_rels, cfg))
     failures = corpus_dir / "failures.jsonl"
     if failures.exists():
         n_fail = sum(1 for _ in open(failures, encoding="utf-8"))
