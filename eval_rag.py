@@ -33,6 +33,7 @@ from eval_lib import GOLD as GOLD_BASE
 from eval_lib import evaluate
 
 EXTENDED_GOLD_PATH = Path(__file__).resolve().parent / "eval_gold_extended.json"
+PROBE_GOLD_PATH = Path(__file__).resolve().parent / "eval_gold_probe.json"
 
 
 def generate_extended_gold(n_target: int = 16, seed: int = 13) -> list[dict]:
@@ -93,6 +94,14 @@ def load_gold(name: str):
             raise SystemExit(f"{EXTENDED_GOLD_PATH} not found — generate it first")
         data = json.loads(EXTENDED_GOLD_PATH.read_text(encoding="utf-8"))
         return [(q["query"], q["gold"]) for q in data], f"ext-{len(data)}"
+    if name == "probe":
+        # probe-scoped semantic queries: gold pages guaranteed present in the
+        # probe corpus, so this measures dense/hybrid value on paraphrase
+        # questions rather than being dominated by pages that were not sampled.
+        if not PROBE_GOLD_PATH.exists():
+            raise SystemExit(f"{PROBE_GOLD_PATH} not found — generate it first")
+        data = json.loads(PROBE_GOLD_PATH.read_text(encoding="utf-8"))
+        return [(q["query"], q["gold"]) for q in data], f"probe-{len(data)}"
     if name == "all":
         ext, _ = load_gold("ext")
         return GOLD_BASE + ext, f"all-{len(GOLD_BASE) + len(ext)}"
@@ -112,7 +121,7 @@ def engine_ranker(engine, k: int, mode: str):
 
 
 def table_ranker(rows, cfg, *, mode="hybrid", aux=True, path_boost=3, rrf_k=60,
-                 per_file=1):
+                 per_file=1, fusion="rrf", alpha=1.0):
     """In-memory ranker over the chunk table with explicit ablation knobs.
 
     BM25 is rebuilt from *rows* so aux/path_boost can be ablated without touching
@@ -160,8 +169,17 @@ def table_ranker(rows, cfg, *, mode="hybrid", aux=True, path_boost=3, rrf_k=60,
             top = heapq.nlargest(int(cfg.get("dense_k", 200)), range(len(scores)),
                                  key=lambda i: (float(scores[i]), -i))
             dense = [(i, float(scores[i])) for i in top]
-        fused = rrf_fuse(bm25, dense, k=rrf_k) if mode == "hybrid" and dense else (
-            dense if mode == "dense" else bm25)
+        if mode == "dense" or not dense:
+            fused = dense if mode == "dense" else bm25
+        elif fusion == "linear":
+            # the legacy hybrid_search behaviour: min-max score fusion. This is
+            # the ablation that shows WHY rank fusion is used -- BM25 scores are
+            # unbounded and cosine is bounded, so a linear blend lets whichever
+            # scale happens to be wider dominate.
+            from rag.index.fuse import linear_fuse
+            fused = linear_fuse(bm25, dense, alpha=alpha)
+        else:
+            fused = rrf_fuse(bm25, dense, k=rrf_k)
         seen: dict[str, int] = {}
         out = []
         for d, _s in fused:
@@ -219,18 +237,26 @@ def _assert_vector_alignment(idx_dir: Path, rows, sample: int = 64) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["bm25", "dense", "hybrid"], default="hybrid")
-    ap.add_argument("--gold-set", choices=["base", "ext", "all"], default="all")
+    ap.add_argument("--gold-set", choices=["base", "ext", "all", "probe"], default="all")
     ap.add_argument("--configs", default=None,
                     help="legacy compat: ignored, single engine evaluated per run")
     ap.add_argument("--sweep-aux", action="store_true")
     ap.add_argument("--sweep-path-boost", default=None, help="e.g. 0,1,3,5")
     ap.add_argument("--sweep-rrf-k", default=None, help="e.g. 20,40,60,120")
+    ap.add_argument("--sweep-fusion", action="store_true",
+                    help="compare rrf vs linear-alpha fusion on identical scores "
+                         "(shows why RRF is the default: BM25 is unbounded, "
+                         "cosine is bounded)")
     ap.add_argument("--per-file", type=int, default=None)
     ap.add_argument("--rerank", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--show-gold", action="store_true")
     ap.add_argument("--generate-gold", action="store_true",
                     help="regenerate eval_gold_extended.json from corpus qa fields, then exit")
+    ap.add_argument("--config", default="rag_config.json",
+                    help="rag config to read index_dir/corpus_dir from (use a "
+                         "scratch config to evaluate a probe index without "
+                         "disturbing the production one)")
     args = ap.parse_args()
 
     if args.generate_gold:
@@ -249,7 +275,7 @@ def main() -> int:
     from rag.store import CorpusStore
     from rag import resolve_path
 
-    cfg = load_rag_config()
+    cfg = load_rag_config(args.config)
     if args.rerank:
         cfg["rerank"] = True
 
@@ -295,6 +321,14 @@ def main() -> int:
         for k in [int(x) for x in args.sweep_rrf_k.split(",")]:
             run(f"table {args.mode} rrf_k={k}",
                 table_ranker(rows, cfg, mode=args.mode, rrf_k=k))
+        return emit(results, args)
+    if args.sweep_fusion:
+        # identical BM25 + BGE-M3 scores, different fusion rules
+        run("table hybrid fusion=rrf(k=60)",
+            table_ranker(rows, cfg, mode="hybrid", fusion="rrf", rrf_k=60))
+        for a in (0.3, 0.5, 0.7, 0.9):
+            run(f"table hybrid fusion=linear(alpha={a})",
+                table_ranker(rows, cfg, mode="hybrid", fusion="linear", alpha=a))
         return emit(results, args)
     if args.per_file is not None:
         run(f"table {args.mode} per_file={args.per_file}",
