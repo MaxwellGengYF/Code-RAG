@@ -200,8 +200,16 @@ Hard-won gateway facts (measured 2026-09):
 - `search` says artefacts not found → run `compile` (corpus step, then index).
 - Index "refusing to build / gen_key changed" → corpus was regenerated after
   the index; rerun `compile --steps index` (it rebuilds everything from the
-  current corpus — BM25 minutes, dense hours on CPU).
-- Slow compile → check `corpus/failures.jsonl` for 429 storms; lower `--workers`.
+  current corpus — BM25 ~10 s, dense ~1.1 h idle / ~8 h if a corpus build is
+  running concurrently, so stop the build first).
+- Slow compile → check `corpus/failures.jsonl` for the error mix. `429
+  Throttling` means lower `--workers`; `403 ... usage limit` / `AccessDenied`
+  means a provider's quota window or subscription is exhausted (see the gateway
+  facts). The run pauses rather than degrading pages when every provider is down.
+- Index/search reports a `vectors.f32` row-count or interrupted-embed mismatch →
+  the dense build was killed or the corpus changed since; rebuild with
+  `compile --steps index --force` (resumable, so this continues rather than
+  restarting).
 - Interrupted compile → just rerun the same command; the manifest diff resumes.
 - A page's corpus looks wrong → `compile --only Manual/foo.html --provider ...`
   regenerates exactly one page.
@@ -222,7 +230,11 @@ When `tail .kimix_cache/full_compile.log` shows `COMPILE COMPLETE`:
 uv run python rag.py status            # look for the phantom WARNING line
 uv run python rag.py audit-corpus
 
-# 1. build both index layers (BM25 minutes; BGE-M3 dense ~1.5-3 h on this CPU)
+# 1. build both index layers. IMPORTANT: only run this AFTER the corpus build has
+#    stopped. Dense BGE-M3 encode saturates the CPU; running it concurrently with
+#    the corpus build measured 7x slower (57 min vs ~8 min for 10.6k chunks).
+#    Full corpus ~90k chunks: ~1.1 h alone, ~8 h if concurrent. BM25 alone is ~10 s.
+#    The dense embed is resumable (vectors.f32.progress) if interrupted.
 uv run python rag.py compile --steps index --force
 
 # 2. regenerate the extended gold set from the finished corpus, then evaluate

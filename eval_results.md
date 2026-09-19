@@ -266,6 +266,36 @@ that too was a subset artefact.
 Anything ≥20 is equivalent; k=60 kept (standard, and perturbs the BM25 order less).
 Needs re-measuring on the full corpus with vectors built.
 
+## Build performance (SA-5 acceptance: 5k-page index build < 30 min)
+
+Measured directly, 10,607 chunks from 5,000 corpus pages, **while the full corpus
+build was running concurrently**:
+
+| stage | time | throughput |
+| --- | --- | --- |
+| BM25 (flatten + tokenize + save) | 9–11 s | — |
+| BGE-M3 dense encode | **3,414 s (57 min)** | **3.1 chunks/s** |
+| **verdict vs 30-min budget** | **FAIL** | |
+
+So the acceptance criterion does **not** hold on this machine when the dense build
+shares the CPU with the corpus build. For reference, isolated BGE-M3 encode
+throughput on the same machine measured 22–25 chunks/s (batch-size insensitive
+across 16/32/64/128), which would put 10,607 chunks at ~8 min — comfortably inside
+budget. The 7× gap is contention, not a code problem: transformer inference
+saturates the CPU, while the corpus build is network-bound but still needs CPU for
+HTML extraction across its workers.
+
+Practical rule, now in the AGENTS.md runbook: **run `compile --steps index` only
+after the corpus build has stopped**, or budget the longer time. Extrapolating to
+the full corpus (~90k chunks once all 43,938 pages are built): ~1.1 h if run
+alone, ~8 h if run concurrently. The dense embed is resumable via the
+`vectors.f32.progress` sidecar, so an interrupted build continues rather than
+restarting, which is what makes the long concurrent case survivable.
+
+This is recorded as FAIL-under-contention rather than silently re-benched on an
+idle machine, because the number a future maintainer actually hits depends on
+whether they follow the runbook ordering.
+
 ## Measurement caveats (read before trusting any number here)
 
 1. **ext-16 and probe-24 are contaminated.** Their queries were harvested from the
