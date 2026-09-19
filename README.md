@@ -31,14 +31,31 @@ ScriptReference/docdata/toc.js; assets discovered by parsing HTML/CSS references
 
 RAG retrieval over the mirror
 
-The mirror is indexed by an LLM-built RAG system (two commands, see AGENTS.md):
+The mirror is indexed by an LLM-built RAG system (see AGENTS.md for the full
+operational manual):
 
-    uv run python rag.py compile --provider D:/qwen_flash.json   # corpus + indexes
-    uv run python rag.py search --query "Rigidbody.AddForce"     # ranked results
+    uv run python rag.py compile --provider D:/qwen_flash.json --no-thinking
+    uv run python rag.py search --query "Rigidbody.AddForce"
+    uv run python rag.py status     # coverage, pending pages, est. cost, engine
 
 `compile` sends each page (as dumpdoc-style markdown) through an LLM to produce
 semantic chunks plus retrieval aux fields (summary/keywords/synonyms/QA), then
 builds a word-tokenizer BM25 index (aux text included) and a BGE-M3 dense index
 (clean text only), fused by RRF at query time. Regeneration is md5-incremental:
-only added/changed pages re-hit the LLM, and a prompt/model/version bump
-rekeys every page. Generated artefacts live in corpus/ and index/ (gitignored).
+only added/changed pages re-hit the LLM, and a prompt/model/version bump rekeys
+every page. Generated artefacts live in corpus/ and index/ (gitignored).
+
+Two flags matter for a first full build over ~44k pages:
+
+- `--no-thinking` — reasoning gateways otherwise apply server-side thinking and
+  cost ~8k output tokens and ~100 s per page instead of ~300 tokens / ~15 s.
+- repeat `--provider` once per DISTINCT quota pool (a pool is host + api_key) to
+  parallelise. Two configs sharing one key add no redundancy, and if that pool's
+  quota runs out the run pauses and resumes later rather than degrading pages.
+
+The build is checkpointed and resumable: interrupt it at any point and rerun the
+same command to continue. `rag.py search --mentions TERM` enumerates literal
+occurrences, `--explain` shows per-term document frequencies and the fusion
+breakdown, and `rag.py repl` keeps a persistent JSONL session so the index loads
+once for many queries.
+
