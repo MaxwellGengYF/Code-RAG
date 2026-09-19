@@ -612,13 +612,19 @@ def finalize(fm: FileManager, diff: ManifestDiff, files_state: dict[str, str],
     report.pruned = len(diff.removed)
 
     store = CorpusStore(fm.corpus_dir)
-    old_files = fm.load_manifest().get("files", {})
+    # The filesystem is the only ground truth for "was this page generated".
+    # An earlier version also accepted `rel in old_files`, which let phantom
+    # entries inherited from a previous broken run survive forever — the manifest
+    # kept claiming all 43,938 pages while ~18k corpus files existed. Filter on
+    # existence alone so finalize is self-healing.
     honest_files = {rel: md5 for rel, md5 in files_state.items()
-                    if rel in old_files or store.exists(rel)}
+                    if store.exists(rel)}
     honest_keys = {rel: k for rel, k in page_gen_keys.items() if rel in honest_files}
 
     flagged = (set(fm.load_manifest().get("needs_regen", []))
                if needs_regen is None else set(needs_regen))
+    # drop flags for pages we no longer claim (e.g. pruned)
+    flagged &= set(honest_files)
     fm.save_manifest(honest_files, gen_key, gen_parts,
                      page_gen_keys=honest_keys, needs_regen=flagged)
     report.pages_claimed = len(honest_files)

@@ -376,3 +376,69 @@ def test_plan_work_requeues_needs_regen_flag(env):
     diff = fm.diff(scanned)
     work = plan_work(fm, store, diff, valid_gen_keys=valid_gen_keys([a]))
     assert work == rels[:5]
+
+
+async def test_finalize_is_self_healing_for_phantom_entries(env):
+    """finalize must drop manifest entries whose corpus file does not exist.
+
+    A previous broken run claimed the whole scan (43,938 pages) while writing only
+    ~18k corpus files. An earlier finalize filtered on `rel in old_files or
+    exists(rel)`, which preserved those inherited phantoms forever -- status kept
+    reporting 100% claimed while coverage was 42%. Filtering on existence alone
+    makes finalize repair the manifest on every run.
+    """
+    root, corpus_dir, fm, cfg = env
+    shards = [shard("fake-model")]
+    scanned = fm.scan()
+    rels = sorted(scanned)
+    store = CorpusStore(corpus_dir)
+
+    # simulate the damage: manifest claims ALL pages, but only 5 corpus files exist
+    for r in rels[:5]:
+        store.save(r, {"source": r, "chunks": []})
+    fm.save_manifest(scanned, set_gen_key(shards), dict(shards[0].gen_parts),
+                     page_gen_keys={r: shards[0].gen_key for r in rels},
+                     needs_regen=[])
+    assert len(fm.load_manifest()["files"]) == 24  # phantoms present
+    assert len(fm.load_manifest()["page_gen_keys"]) == 24
+
+    # a run that processes nothing still finalizes
+    report = await run_corpus_compile(shards, cfg, work=[], scanned=scanned,
+                                      fm=fm, workers_per_provider=2,
+                                      progress=False)
+    from rag.cli.compile_cmd import finalize
+    finalize(fm, fm.diff(scanned), scanned,
+             fm.load_manifest().get("page_gen_keys", {}),
+             set_gen_key(shards), dict(shards[0].gen_parts), report)
+
+    m = fm.load_manifest()
+    assert len(m["files"]) == 5, f"phantom entries survived: {len(m['files'])}"
+    assert len(m["page_gen_keys"]) == 5
+    # the 19 phantom pages now correctly requeue as work
+    work = plan_work(fm, store, fm.diff(fm.scan()),
+                     valid_gen_keys=valid_gen_keys(shards))
+    assert len(work) == 19, len(work)
+
+
+async def test_finalize_drops_stale_needs_regen_flags(env):
+    """Flags for pages the manifest no longer claims must not accumulate."""
+    root, corpus_dir, fm, cfg = env
+    shards = [shard("fake-model")]
+    scanned = fm.scan()
+    rels = sorted(scanned)
+    store = CorpusStore(corpus_dir)
+    for r in rels[:3]:
+        store.save(r, {"source": r, "chunks": []})
+    # flag a page that has no corpus file (stale/phantom flag)
+    fm.save_manifest({r: scanned[r] for r in rels[:3]}, set_gen_key(shards),
+                     dict(shards[0].gen_parts), page_gen_keys={},
+                     needs_regen=[rels[0], rels[20]])
+    report = await run_corpus_compile(shards, cfg, work=[], scanned=scanned,
+                                      fm=fm, workers_per_provider=2,
+                                      progress=False)
+    from rag.cli.compile_cmd import finalize
+    finalize(fm, fm.diff(scanned), {r: scanned[r] for r in rels[:3]},
+             {}, set_gen_key(shards), dict(shards[0].gen_parts), report)
+    flagged = fm.load_manifest()["needs_regen"]
+    assert rels[0] in flagged, "flag for a real page must survive"
+    assert rels[20] not in flagged, "flag for a phantom page must be dropped"
