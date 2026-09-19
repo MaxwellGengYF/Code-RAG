@@ -83,6 +83,35 @@ identifier-heavy gold set.
 
 ## Ablations
 
+### The n-gram back-end is not needed: dense subsumes its typo tolerance
+
+The project goal framed the new system as "BM25 + n-gram + dense", and the legacy
+n-gram index was retained specifically "for typo tolerance". The new architecture
+ships only **BM25 + dense**, so that omission needs justification rather than
+assumption. Measured on 8 typo/misspelling queries (gold page in top-5):
+
+| arm | found |
+| --- | --- |
+| legacy word BM25 (full 83k-chunk corpus) | 3/8 |
+| new BM25 (word + path terms, clean+aux) | 3/8 |
+| **new dense (BGE-M3)** | **8/8** |
+| **new hybrid (BM25 + dense, RRF)** | **8/8** |
+
+Every case BM25 misses, dense finds: `Rigidboddy velocity`,
+`MaterialPropertyBlokc`, `Renderer.SetProperyBlock`, `Shader.ProperyToID`,
+`Graphics.DrawMesch`. A character-trigram index cannot do better here and pays
+for it catastrophically on exact identifiers (recorded legacy ngram MRR 0.04–0.52
+vs word 0.875, plus run-to-run nondeterminism from
+`LevenshteinAutomaton`'s truncated expansion set). So the n-gram layer's one
+unique job is done strictly better by the dense layer, and the plan's three-way
+framing correctly reduces to two.
+
+Caveat: the new arms were scored on a 3,039-page probe index while legacy arms
+saw the full corpus, so a new-arm MISS could mean "page not generated yet". That
+asymmetry works *against* the conclusion, which makes 8/8 for dense the more
+credible of the two numbers. The legacy n-gram arm could not be run at all —
+`index.pkl` is no longer on disk.
+
 ### Cross-encoder rerank: measurably HARMFUL — stays off
 
 `BAAI/bge-reranker-v2-m3` over the top-50 fused candidates, same index, same
@@ -175,9 +204,14 @@ uv run python eval_rag.py --gold-set base --mode bm25          # the gate
 uv run python eval_rag.py --gold-set base --sweep-aux
 uv run python eval_rag.py --gold-set base --sweep-path-boost 0,1,3,5,8,12,20
 uv run python eval_rag.py --gold-set base --sweep-rrf-k 5,20,60,200,1000
-uv run python eval_rag.py --gold-set base --sweep-fusion       # rrf vs linear
-uv run python eval_rag.py --generate-gold                      # rebuild ext set
+uv run python eval_rag.py --gold-set base --sweep-fusion # rrf vs linear
+uv run python eval_rag.py --gold-set base --sweep-rerank --config <rerank-cfg>
+uv run python eval_rag.py --generate-gold # rebuild ext set
 uv run python eval_retrieval.py                                # old engine, same gold
+uv run python eval_smoke.py                                    # integration smoke
+uv run python eval_dense_value.py                              # zero-hit rescue probe
+uv run python eval_embedder_regression.py probe                # hash vs BGE-M3 cause
+uv run python eval_typo_tolerance.py                           # n-gram vs dense
 ```
 
 `eval_rag.py --config <scratch>.json` evaluates an alternate index/corpus pair
