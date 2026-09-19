@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import heapq
 import json
+import sys
 from pathlib import Path
 
-import msgspec
 import numpy as np
 
 from rag import resolve_path
@@ -33,6 +33,7 @@ class SearchEngine:
         self.vector_meta: dict | None = None
         self.embed_model = cfg.get("embed_model", "BAAI/bge-m3")
         self._loaded = False
+        self._warned_dense = False
 
     # ------------------------------------------------------------------ loading
 
@@ -115,6 +116,22 @@ class SearchEngine:
         top = heapq.nlargest(k, range(len(scores)), key=lambda i: (float(scores[i]), -i))
         return [(i, float(scores[i])) for i in top]
 
+    def _warn_dense_missing(self, mode: str) -> None:
+        """Warn ONCE when a dense-requiring mode silently degrades to BM25-only.
+
+        Without vectors the engine still returns results, so the degradation is
+        invisible — and dense is what rescues typo/paraphrase queries where BM25's
+        min_should_match returns zero hits. JSON output already reports
+        ``dense: false``; this covers the --text path.
+        """
+        if mode not in ("hybrid", "dense") or self.has_dense or self._warned_dense:
+            return
+        self._warned_dense = True
+        print(f"[search] mode={mode} requested but no dense vectors are built — "
+              f"falling back to BM25-only, which returns 0 hits for typo and "
+              f"paraphrase queries. Build them with: uv run python rag.py compile "
+              f"--steps index", file=sys.stderr)
+
     def search(
         self,
         query: str,
@@ -133,6 +150,8 @@ class SearchEngine:
         rrf_k = int(self.cfg.get("rrf_k", 60))
 
         bm25 = self._bm25_candidates(query, bm25_k)
+        if mode in ("hybrid", "dense"):
+            self._warn_dense_missing(mode)
         dense = self._dense_candidates(query, dense_k) if mode in ("hybrid", "dense") else []
 
         if mode == "bm25":

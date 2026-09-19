@@ -230,3 +230,29 @@ def test_engine_accepts_vectors_without_progress_sidecar(tiny_index):
     engine = SearchEngine(cfg)
     engine.load()
     assert engine.has_dense is True
+
+
+# --------------------------------------------------------------------------------------
+# dense-missing warning (mode=hybrid/dense silently degrades to BM25 without vectors)
+# --------------------------------------------------------------------------------------
+
+
+def test_hybrid_without_vectors_warns_once(tiny_index, capsys):
+    """hybrid/dense with no vectors must warn on stderr — the degradation is
+    otherwise invisible in --text mode, and dense is what rescues zero-hit queries.
+    Also guards the sys import the warning needs (it was missing -> NameError)."""
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    engine = SearchEngine(cfg)
+    engine.search("rigidbody velocity", k=3, mode="hybrid")
+    engine.search("rigidbody velocity", k=3, mode="hybrid")
+    err = capsys.readouterr().err
+    assert "no dense vectors" in err
+    assert err.count("no dense vectors") == 1, "must warn only once per engine"
+
+
+def test_bm25_mode_does_not_warn(tiny_index, capsys):
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    SearchEngine(cfg).search("rigidbody velocity", k=3, mode="bm25")
+    assert "no dense vectors" not in capsys.readouterr().err
