@@ -143,3 +143,90 @@ def test_engine_missing_index_errors_cleanly(tmp_path):
     with pytest.raises(FileNotFoundError) as exc:
         engine.search("x")
     assert "rag.py compile" in str(exc.value)
+
+
+# --------------------------------------------------------------------------------------
+# dual-index consistency guards (plan risk: "Dual-index drift")
+# --------------------------------------------------------------------------------------
+
+
+def _write_vectors(index_dir, count: int, dim: int = 8, rows_done: int | None = None):
+    import numpy as np
+    (index_dir / "vector_meta.json").write_text(
+        json.dumps({"model": "BAAI/bge-m3", "dim": dim, "count": count,
+                    "normalized": True}), encoding="utf-8")
+    (index_dir / "vectors.f32").write_bytes(
+        np.ones((count, dim), dtype=np.float32).tobytes())
+    if rows_done is not None:
+        (index_dir / "vectors.f32.progress").write_text(f"sha-x\n{rows_done}\n",
+                                                        encoding="utf-8")
+
+
+def test_engine_refuses_vector_row_count_mismatch(tiny_index):
+    """vectors.f32 built from a different chunk table must be refused, not used.
+
+    Dense rows are positional (no ids), so a mismatch would attribute every dense
+    score to the wrong chunk — silent corruption, not a crash.
+    """
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    index_dir = Path(cfg["index_dir"])
+    _write_vectors(index_dir, count=len(rows) + 7)  # wrong row count
+
+    engine = SearchEngine(cfg)
+    with pytest.raises(RuntimeError) as exc:
+        engine.load()
+    msg = str(exc.value)
+    assert "different chunk table" in msg
+    assert "--steps index --force" in msg  # tells the user how to fix it
+
+
+def test_engine_refuses_partially_embedded_vectors(tiny_index):
+    """An interrupted embed leaves a full-size file whose tail is zeros."""
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    index_dir = Path(cfg["index_dir"])
+    n = len(rows)
+    _write_vectors(index_dir, count=n, rows_done=n // 2)  # only half embedded
+
+    engine = SearchEngine(cfg)
+    with pytest.raises(RuntimeError) as exc:
+        engine.load()
+    assert "interrupted build" in str(exc.value)
+    assert "pre-allocated zeros" in str(exc.value)
+
+
+def test_engine_accepts_consistent_vectors(tiny_index, monkeypatch):
+    """Matching row count + complete progress record loads normally."""
+    import numpy as np
+
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    index_dir = Path(cfg["index_dir"])
+    n = len(rows)
+    _write_vectors(index_dir, count=n, rows_done=n)
+
+    # stub the query embedder so this stays network-free (no BGE-M3 download).
+    # Patch the name bound in the engine module, not its source module.
+    monkeypatch.setattr("rag.search.engine.embed_query",
+                        lambda q, model=None: np.ones(8, dtype=np.float32) /
+                        np.sqrt(8))
+
+    engine = SearchEngine(cfg)
+    engine.load()
+    assert engine.has_dense is True
+    assert engine.n_chunks == n
+    out = engine.search("rigidbody velocity", k=3, mode="hybrid")
+    assert out["hits"]
+
+
+def test_engine_accepts_vectors_without_progress_sidecar(tiny_index):
+    """A complete file from before the sidecar existed must still load."""
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    index_dir = Path(cfg["index_dir"])
+    _write_vectors(index_dir, count=len(rows), rows_done=None)
+
+    engine = SearchEngine(cfg)
+    engine.load()
+    assert engine.has_dense is True

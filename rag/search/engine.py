@@ -63,9 +63,35 @@ class SearchEngine:
             min_should_match=float(self.cfg.get("min_should_match", 0.6)))
         if meta_path.exists() and vecs_path.exists():
             self.vector_meta = load_meta(meta_path)
+            n_rows = len(self.rows)
+            count = int(self.vector_meta["count"])
+            # Dual-index consistency: dense rows are POSITIONAL (vectors.f32
+            # stores no ids), so a vector file built from a different chunk table
+            # would silently attach every score to the wrong chunk. Refuse rather
+            # than degrade: this is the plan's "build refuses on hash mismatch".
+            if count != n_rows:
+                raise RuntimeError(
+                    f"index/vectors.f32 has {count} rows but chunks.msgpack has "
+                    f"{n_rows}: the dense index was built from a different chunk "
+                    f"table, so every dense score would be attributed to the wrong "
+                    f"chunk. Rebuild with: uv run python rag.py compile "
+                    f"--steps index --force")
+            stamp_path = Path(str(vecs_path) + ".progress")
+            if stamp_path.exists():
+                try:
+                    parts = stamp_path.read_text(encoding="utf-8").split()
+                    done = int(parts[1]) if len(parts) > 1 else -1
+                except (ValueError, OSError):
+                    done = -1
+                if 0 <= done < n_rows:
+                    raise RuntimeError(
+                        f"index/vectors.f32 is only {done}/{n_rows} rows embedded "
+                        f"(an interrupted build): the remaining rows are "
+                        f"pre-allocated zeros, so dense search would return "
+                        f"garbage for them. Rebuild with: uv run python rag.py "
+                        f"compile --steps index --force")
             self.vectors = load_vectors(
-                vecs_path, dim=int(self.vector_meta["dim"]),
-                count=int(self.vector_meta["count"]))
+                vecs_path, dim=int(self.vector_meta["dim"]), count=count)
         self._loaded = True
 
     @property
