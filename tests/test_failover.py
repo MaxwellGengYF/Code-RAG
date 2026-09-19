@@ -442,3 +442,69 @@ async def test_finalize_drops_stale_needs_regen_flags(env):
     flagged = fm.load_manifest()["needs_regen"]
     assert rels[0] in flagged, "flag for a real page must survive"
     assert rels[20] not in flagged, "flag for a phantom page must be dropped"
+
+
+async def test_persistent_per_page_failure_still_exits_cleanly(env):
+    """A page that always fails validation must NOT wedge the run or the resume loop.
+
+    Termination contract: per-page fallbacks exit 0 (loop terminates, page stays
+    flagged for the next run); only all-providers-down aborts exit 3 (where
+    retrying genuinely helps, e.g. a quota window reset). A permanently
+    unchunkable page must never make the whole build non-terminating.
+    """
+    root, corpus_dir, fm, cfg = env
+    shards = [shard("fake-model")]
+    scanned = fm.scan()
+    store = CorpusStore(corpus_dir)
+
+    # every page fails validation both attempts -> heuristic fallback, but the API
+    # is healthy so the circuit never opens
+    class AlwaysInvalid(FakeClient):
+        async def generate(self, system_prompt, user_prompt):
+            from rag.llm.base import GenerationResult
+            self.calls += 1
+            return GenerationResult(text="this is not JSON at all",
+                                    input_tokens=10, output_tokens=5)
+
+    bad = ProviderShard(AlwaysInvalid("fake-model"), "fake-model")
+    report = await run_corpus_compile(
+        [bad], cfg, work=sorted(scanned), scanned=scanned, fm=fm,
+        workers_per_provider=2, progress=False, wait_budget_s=0.0)
+
+    # run completed rather than aborting
+    assert report.aborted_all_providers_down is False
+    assert report.pages_done == len(scanned)
+    assert report.fallback == len(scanned)
+    # every page is flagged for retry but still has a usable corpus file
+    assert len(report.needs_regen) == len(scanned)
+    assert len(list(store.iterate_all())) == len(scanned)
+    assert report.input_tokens > 0  # the LLM really was called (and really failed)
+
+
+async def test_api_death_sets_abort_flag_but_validation_failure_does_not(env):
+    """Distinguish 'provider is down' (abort, exit 3) from 'model output is bad'
+    (fallback, exit 0) — they need opposite handling from the resume loop."""
+    root, corpus_dir, fm, cfg = env
+    scanned = fm.scan()
+    store = CorpusStore(corpus_dir)
+
+    dead = [shard("dead", dead=True)]
+    r_dead = await run_corpus_compile(
+        dead, cfg, work=sorted(scanned)[:4], scanned=scanned, fm=fm,
+        workers_per_provider=1, progress=False,
+        circuit_threshold=1, circuit_cooldown=10_000, wait_budget_s=0.0)
+    assert r_dead.aborted_all_providers_down is True
+
+    class AlwaysInvalid(FakeClient):
+        async def generate(self, system_prompt, user_prompt):
+            from rag.llm.base import GenerationResult
+            self.calls += 1
+            return GenerationResult(text="not json", input_tokens=1, output_tokens=1)
+
+    bad = [ProviderShard(AlwaysInvalid("bad"), "bad")]
+    r_bad = await run_corpus_compile(
+        bad, cfg, work=sorted(scanned)[4:8], scanned=scanned, fm=fm,
+        workers_per_provider=1, progress=False, wait_budget_s=0.0)
+    assert r_bad.aborted_all_providers_down is False, \
+        "bad model output must not look like provider death"
+    assert r_bad.pages_done == 4

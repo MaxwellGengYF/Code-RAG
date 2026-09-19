@@ -211,6 +211,14 @@ Hard-won gateway facts (measured 2026-09):
   `compile --steps index --force` (resumable, so this continues rather than
   restarting).
 - Interrupted compile → just rerun the same command; the manifest diff resumes.
+- **Does the auto-resume loop ever spin forever on a page that keeps failing?** No.
+  Per-page fallbacks (bad JSON that survives one repair retry, an empty page) still
+  exit **0**, so the loop terminates and the page stays flagged `needs_regen` for
+  the *next* manual run. Only the all-providers-down abort exits **3**, which is the
+  case where retrying genuinely helps (quota window resets). That split is
+  deliberate: a permanently unchunkable page must not wedge the whole build.
+  Check `rag.py status` → `needs_regen` for the backlog, and
+  `eval_corpus_quality.py` to confirm the first-try rate is healthy.
 - A page's corpus looks wrong → `compile --only Manual/foo.html --provider ...`
   regenerates exactly one page.
 - Deleting corpus: `rm -rf corpus index` is safe; everything regenerates.
