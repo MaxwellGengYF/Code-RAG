@@ -1,50 +1,98 @@
 [
   {
-    "query": "How do you import assets into a Unity project?",
+    "query": "How is the target's position constrained during a drag?",
     "gold": [
-      "Manual/AssetWorkflow.html"
+      "Manual/UIE-create-drag-and-drop-ui.html"
     ]
   },
   {
-    "query": "Can Unity import assets from external sources?",
+    "query": "How is the AndroidJavaProxy constructor used?",
     "gold": [
-      "Manual/AssetTypes.html"
+      "ScriptReference/AndroidJavaProxy.html"
     ]
   },
   {
-    "query": "How should parameters be defined in the plug-in file?",
+    "query": "What happens without resampling on a 0 to 270 degree x rotation over six frames?",
     "gold": [
-      "Manual/AudioNativeDSPPlugin.html"
+      "Manual/AnimationRotate.html"
     ]
   },
   {
-    "query": "When is Code Coverage Support available for Linux builds?",
+    "query": "What is the return type of RequestUserAuthorization?",
     "gold": [
-      "Manual/Buildsettings-linux.html"
+      "ScriptReference/Application.RequestUserAuthorization.html"
     ]
   },
   {
-    "query": "Does static batching use CPU at runtime?",
+    "query": "When does the Collider Update Mode property appear?",
     "gold": [
-      "Manual/DrawCallBatching-Enable.html"
+      "Manual/UIE-Runtime-Panel-Settings.html"
     ]
   },
   {
-    "query": "What is the default linear velocity of a physics body?",
+    "query": "How do you add an icon to a Button in UI Builder?",
     "gold": [
-      "Manual/2d-physics-api/2d-physics-api-reference-body.html"
+      "Manual/UIE-uxml-element-Button.html"
     ]
   },
   {
-    "query": "Why would you set a unique volume for a specific clip?",
+    "query": "Which method transforms coordinates between two elements' local spaces?",
     "gold": [
-      "Manual/AudioRandomContainer-UI.html"
+      "Manual/UIE-coordinate-and-position-system.html"
     ]
   },
   {
-    "query": "Where can developers find scripting details for build profiles?",
+    "query": "Can I create AvatarIKGoals other than LeftFoot, RightFoot, LeftHand, and RightHand?",
     "gold": [
-      "Manual/BuildSettings.html"
+      "Manual/MecanimFAQ.html"
+    ]
+  },
+  {
+    "query": "What does Cubemap.ClearRequestedMipmapLevel do?",
+    "gold": [
+      "ScriptReference/Cubemap.ClearRequestedMipmapLevel.html"
+    ]
+  },
+  {
+    "query": "Which menu item opens the example window?",
+    "gold": [
+      "ScriptReference/EditorGUI.IntSlider.html"
+    ]
+  },
+  {
+    "query": "Where do the Compile flags appear in the Xcode project?",
+    "gold": [
+      "Manual/ios-native-plugin-automated-integration.html"
+    ]
+  },
+  {
+    "query": "What does AudioImporter.SetOverrideSampleSettings return?",
+    "gold": [
+      "ScriptReference/AudioImporter.SetOverrideSampleSettings.html"
+    ]
+  },
+  {
+    "query": "What object describes the properties of the link passed to AddLink?",
+    "gold": [
+      "ScriptReference/AI.NavMesh.AddLink.html"
+    ]
+  },
+  {
+    "query": "What is the recommended way to edit an .asmdef file?",
+    "gold": [
+      "Manual/cus-asmdef.html"
+    ]
+  },
+  {
+    "query": "What happens if the camera parameter is null?",
+    "gold": [
+      "ScriptReference/Graphics.DrawMeshInstancedProcedural.html"
+    ]
+  },
+  {
+    "query": "What replaces the obsolete Application.stackTraceLogType property?",
+    "gold": [
+      "ScriptReference/Application-stackTraceLogType.html"
     ]
   }
 ]

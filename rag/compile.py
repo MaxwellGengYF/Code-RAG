@@ -178,9 +178,10 @@ async def run_corpus_step(
     return report
 
 
-def run_index_step(cfg: dict, *, force: bool = False) -> int:
+def run_index_step(cfg: dict, *, force: bool = False,
+                   skip_dense: bool = False) -> int:
     from rag.index.build import build_indexes
-    return build_indexes(cfg, force=force)
+    return build_indexes(cfg, force=force, skip_dense=skip_dense)
 
 
 def run_compile(
@@ -196,6 +197,7 @@ def run_compile(
     no_thinking: bool = False,
     price_in: float | None = None,
     price_out: float | None = None,
+    skip_dense: bool = False,
     config_path: str = "rag_config.json",
 ) -> int:
     cfg = load_rag_config(config_path)
@@ -220,5 +222,5 @@ def run_compile(
             price_in=price_in, price_out=price_out))
     if "index" in steps and not dry_run:
         print("[compile] step: index", file=sys.stderr)
-        return run_index_step(cfg, force=force)
+        return run_index_step(cfg, force=force, skip_dense=skip_dense)
     return 0

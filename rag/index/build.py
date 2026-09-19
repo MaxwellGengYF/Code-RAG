@@ -102,10 +102,12 @@ def build_indexes(cfg: dict, *, force: bool = False, skip_dense: bool = False,
                   f"mix chunks from two generations. Re-run with --force after "
                   f"the corpus step completes.", file=sys.stderr)
             return 1
-        have_all = all((index_dir / f).exists() for f in (
-            "chunks.msgpack", "bm25_word.pkl", "vector_meta.json",
-            "vectors.f32"))
-        if have_all and not skip_dense:
+        # which artefacts must be present depends on whether dense is being built
+        required = ["chunks.msgpack", "bm25_word.pkl"]
+        if not skip_dense:
+            required += ["vector_meta.json", "vectors.f32"]
+        have_all = all((index_dir / f).exists() for f in required)
+        if have_all:
             print(f"[index] up to date ({im.get('n_chunks')} chunks)", file=sys.stderr)
             return 0
 
@@ -121,8 +123,9 @@ def build_indexes(cfg: dict, *, force: bool = False, skip_dense: bool = False,
     titles = [r.title for r in rows]
 
     # single chunk table
-    (index_dir / "chunks.msgpack").write_bytes(
-        msgspec.msgpack.encode([msgspec.to_builtins(r) for r in rows]))
+    chunks_bytes = msgspec.msgpack.encode([msgspec.to_builtins(r) for r in rows])
+    chunks_sha = hashlib.sha1(chunks_bytes).hexdigest()[:8]
+    (index_dir / "chunks.msgpack").write_bytes(chunks_bytes)
     print(f"[index] wrote chunks.msgpack ({time.time() - t0:.0f}s)", file=sys.stderr)
 
     from rag.index.bm25_index import build_bm25
@@ -133,15 +136,48 @@ def build_indexes(cfg: dict, *, force: bool = False, skip_dense: bool = False,
     print(f"[index] wrote bm25_word.pkl ({time.time() - t0:.0f}s)", file=sys.stderr)
 
     embed_model = cfg.get("embed_model", "BAAI/bge-m3")
+    vecs_path = index_dir / "vectors.f32"
+    meta_path = index_dir / "vector_meta.json"
+    prev_im = json.loads(im_path.read_text(encoding="utf-8")) if im_path.exists() else {}
+
     if not skip_dense and embed_model not in ("", "none"):
-        from rag.index.vector_index import build_vectors, save_vectors, save_meta
-        vecs = build_vectors(chunks, titles, model=embed_model)
-        save_vectors(vecs, index_dir / "vectors.f32")
-        save_meta(index_dir / "vector_meta.json", model=embed_model,
-                  dim=int(vecs.shape[1]), count=int(vecs.shape[0]))
-        print(f"[index] wrote vectors.f32 {vecs.shape} ({time.time() - t0:.0f}s)",
-              file=sys.stderr)
+        # The embed text (title + heading_path + clean text) is a pure function of
+        # the chunk table — it does NOT depend on the BM25-only knobs (path_boost,
+        # aux). So when the chunk table is byte-identical to the last build and the
+        # existing vectors describe exactly these rows with the same model, reuse
+        # them instead of re-embedding (which costs ~1.5 h on CPU for 41k chunks).
+        # This is what makes the path_boost/aux ablation loop fast.
+        reusable = (
+            prev_im.get("chunks_sha1_8") == chunks_sha
+            and prev_im.get("embed_model") == embed_model
+            and vecs_path.exists() and meta_path.exists()
+        )
+        if reusable:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            reusable = (int(meta.get("count", -1)) == len(rows)
+                        and meta.get("model") == embed_model)
+        if reusable:
+            print(f"[index] reusing vectors.f32 — chunk table unchanged "
+                  f"(sha1_8={chunks_sha}, {len(rows)} rows); dense does not depend "
+                  f"on path_boost/aux", file=sys.stderr)
+        else:
+            from rag.index.vector_index import build_vectors, save_vectors, save_meta
+            vecs = build_vectors(chunks, titles, model=embed_model)
+            save_vectors(vecs, vecs_path)
+            save_meta(meta_path, model=embed_model,
+                      dim=int(vecs.shape[1]), count=int(vecs.shape[0]))
+            print(f"[index] wrote vectors.f32 {vecs.shape} ({time.time() - t0:.0f}s)",
+                  file=sys.stderr)
     elif skip_dense:
+        # A stale vectors.f32 from an earlier build would be positionally
+        # misaligned with the freshly flattened rows (vectors carry no ids), so
+        # remove it rather than let dense silently score the wrong chunks.
+        for stale in ("vectors.f32", "vector_meta.json"):
+            p = index_dir / stale
+            if p.exists():
+                p.unlink()
+                print(f"[index] removed stale {stale} (dense skipped)",
+                      file=sys.stderr)
         print("[index] dense skipped (--skip-dense)", file=sys.stderr)
 
     im = {

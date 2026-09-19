@@ -113,7 +113,14 @@ def engine_ranker(engine, k: int, mode: str):
 
 def table_ranker(rows, cfg, *, mode="hybrid", aux=True, path_boost=3, rrf_k=60,
                  per_file=1):
-    """In-memory ranker over the chunk table with explicit ablation knobs."""
+    """In-memory ranker over the chunk table with explicit ablation knobs.
+
+    BM25 is rebuilt from *rows* so aux/path_boost can be ablated without touching
+    artefacts. Dense vectors cannot be rebuilt cheaply, so they are read from the
+    prebuilt ``vectors.f32`` — which is only valid when its row order matches
+    *rows* exactly. That alignment is asserted below (uid-by-uid) because a
+    mismatch would silently pair every BM25 doc id with the wrong vector.
+    """
     import heapq
     import numpy as np
     from rag.corpus.schema import CorpusChunk, to_embed_text
@@ -128,12 +135,21 @@ def table_ranker(rows, cfg, *, mode="hybrid", aux=True, path_boost=3, rrf_k=60,
                           aux=aux, verbose=False)
     searcher = new_searcher(index)
     dense_mat = None
-    vecs_path = Path(engine_index_dir(cfg)) / "vectors.f32"
-    meta_path = Path(engine_index_dir(cfg)) / "vector_meta.json"
+    idx_dir = Path(engine_index_dir(cfg))
+    vecs_path = idx_dir / "vectors.f32"
+    meta_path = idx_dir / "vector_meta.json"
     if mode in ("hybrid", "dense") and vecs_path.exists():
         from rag.index.vector_index import load_meta, load_vectors
         meta = load_meta(meta_path)
-        dense_mat = load_vectors(vecs_path, dim=meta["dim"], count=meta["count"])
+        count, dim = int(meta["count"]), int(meta["dim"])
+        if count != len(rows):
+            print(f"[eval] WARNING: vectors.f32 has {count} rows but the corpus "
+                  f"flattened to {len(rows)} — index is stale. Dense disabled for "
+                  f"this ablation; rebuild with `rag.py compile --steps index "
+                  f"--force`.", file=sys.stderr)
+        else:
+            dense_mat = load_vectors(vecs_path, dim=dim, count=count)
+            _assert_vector_alignment(idx_dir, rows)
 
     def rank(query: str) -> list[str]:
         bm25 = searcher.search(query, top_k=int(cfg.get("bm25_k", 200)))
@@ -161,6 +177,38 @@ def table_ranker(rows, cfg, *, mode="hybrid", aux=True, path_boost=3, rrf_k=60,
 def engine_index_dir(cfg) -> str:
     from rag import resolve_path
     return str(resolve_path(cfg.get("index_dir", "index")))
+
+
+def _assert_vector_alignment(idx_dir: Path, rows, sample: int = 64) -> None:
+    """Verify vectors.f32 row i is the embedding of rows[i].
+
+    vectors.f32 stores no ids, so alignment is positional: it is only valid if
+    the corpus has not changed since `compile --steps index` ran. Compare the
+    built chunk table's uids against the freshly flattened rows; a mismatch means
+    every dense score would be attributed to the wrong chunk.
+    """
+    import msgspec
+    from rag.index.build import ChunkRow
+
+    table_path = idx_dir / "chunks.msgpack"
+    if not table_path.exists():
+        print("[eval] WARNING: no chunks.msgpack to verify vector alignment; "
+              "dense results may be misattributed", file=sys.stderr)
+        return
+    built = [ChunkRow(**r) for r in msgspec.msgpack.decode(table_path.read_bytes())]
+    if len(built) != len(rows):
+        raise RuntimeError(
+            f"vector/chunk misalignment: index table has {len(built)} rows but the "
+            f"corpus flattened to {len(rows)}. Rebuild the index "
+            f"(`rag.py compile --steps index --force`) before evaluating dense.")
+    step = max(1, len(rows) // sample)
+    for i in range(0, len(rows), step):
+        if built[i].chunk_uid != rows[i].chunk_uid:
+            raise RuntimeError(
+                f"vector/chunk misalignment at row {i}: index has "
+                f"{built[i].chunk_uid} ({built[i].source}) but corpus has "
+                f"{rows[i].chunk_uid} ({rows[i].source}). Rebuild the index.")
+    print(f"[eval] vector alignment verified ({len(rows)} rows)", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------------------
@@ -225,7 +273,7 @@ def main() -> int:
 
     def run(name, rank_fn):
         res = evaluate(name, rows, lambda q: _sources_to_ids(rank_fn(q)),
-                       verbose=args.verbose)
+                       verbose=args.verbose, gold_set=gold)
         res["gold"] = gold_name
         results.append(res)
         print(f"  {name:<28} MRR={res['MRR']:.3f} hit@1={res['hit@1']:.3f} "
@@ -235,22 +283,22 @@ def main() -> int:
     print(f"[eval] gold set: {gold_name} ({len(gold)} queries)")
     if args.sweep_aux:
         for aux in (True, False):
-            run(f"table hybrid aux={aux}",
-                table_ranker(rows, cfg, mode="hybrid", aux=aux))
+            run(f"table {args.mode} aux={aux}",
+                table_ranker(rows, cfg, mode=args.mode, aux=aux))
         return emit(results, args)
     if args.sweep_path_boost:
         for pb in [int(x) for x in args.sweep_path_boost.split(",")]:
-            run(f"table hybrid path_boost={pb}",
-                table_ranker(rows, cfg, mode="hybrid", path_boost=pb))
+            run(f"table {args.mode} path_boost={pb}",
+                table_ranker(rows, cfg, mode=args.mode, path_boost=pb))
         return emit(results, args)
     if args.sweep_rrf_k:
         for k in [int(x) for x in args.sweep_rrf_k.split(",")]:
-            run(f"table hybrid rrf_k={k}",
-                table_ranker(rows, cfg, mode="hybrid", rrf_k=k))
+            run(f"table {args.mode} rrf_k={k}",
+                table_ranker(rows, cfg, mode=args.mode, rrf_k=k))
         return emit(results, args)
     if args.per_file is not None:
-        run(f"table hybrid per_file={args.per_file}",
-            table_ranker(rows, cfg, mode="hybrid", per_file=args.per_file))
+        run(f"table {args.mode} per_file={args.per_file}",
+            table_ranker(rows, cfg, mode=args.mode, per_file=args.per_file))
         return emit(results, args)
 
     # standard engine path (dense uses the built vectors)

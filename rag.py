@@ -43,6 +43,10 @@ def main(argv: list[str] | None = None) -> int:
                            help="Input price per 1M tokens (for cost estimate)")
     p_compile.add_argument("--price-out", type=float, default=None,
                            help="Output price per 1M tokens (for cost estimate)")
+    p_compile.add_argument("--skip-dense", action="store_true",
+                           help="With --steps index: build BM25 only (minutes "
+                                "instead of hours); dense stays absent so hybrid "
+                                "search degrades to BM25")
     p_compile.add_argument("--config", default="rag_config.json")
 
     p_search = sub.add_parser("search", help="query -> ranked results")
@@ -71,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
             workers=args.workers, max_files=args.max_files, force=args.force,
             regen=args.regen, only=args.only, dry_run=args.dry_run,
             no_thinking=args.no_thinking, price_in=args.price_in,
-            price_out=args.price_out,
+            price_out=args.price_out, skip_dense=args.skip_dense,
             config_path=args.config,
         )
     if args.command == "search":

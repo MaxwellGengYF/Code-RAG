@@ -175,12 +175,21 @@ def evaluate(
     run_rank,
     ks=(1, 3, 5, 10),
     verbose: bool = False,
+    gold_set: list[tuple[str, list[str]]] | None = None,
 ) -> dict:
+    """Score *run_rank* against a gold set.
+
+    ``gold_set`` defaults to this module's GOLD (the 24-query baseline set) so
+    existing callers are unaffected; eval_rag.py passes its own set so the
+    extended/all gold sets are actually scored instead of silently falling back
+    to the base 24.
+    """
+    queries = GOLD if gold_set is None else gold_set
     stats = {f"recall@{k}": 0.0 for k in ks}
     stats.update({f"hit@{k}": 0 for k in ks})
     rr = 0.0
     n = 0
-    for query, gold in GOLD:
+    for query, gold in queries:
         ranked = run_rank(query)
         paths = [Path(chunks[i].source).as_posix() for i in ranked]
         n += 1
