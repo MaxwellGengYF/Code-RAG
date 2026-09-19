@@ -12,6 +12,7 @@
 /eval_results_latest.md
 /rag_probe_config.json
 /rag_probe_rerank.json
+/manifest_quality_probe.json
 
 # Legacy generated indices
 /chunks.pkl

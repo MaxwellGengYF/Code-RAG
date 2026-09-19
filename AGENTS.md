@@ -60,7 +60,9 @@ carries the same new keys plus the legacy ones.
    validation (chunk text MUST be a verbatim excerpt of the page markdown,
    checked whitespace/punctuation/quote-insensitively) → one repair retry with
    the validation errors echoed → heuristic fallback (fixed-size chunker, empty
-   aux fields). Measured on samples: ~80–95% first-try valid, 100% usable.
+   aux fields). Acceptance measured on 40 sampled pages with the shipped config:
+   **98% first-try valid, 100% usable, 2.20 chunks/page, 0 verbatim violations**
+   (`eval_corpus_quality.py`).
 4. **Checkpointing**: every 25 pages the manifest is atomically rewritten,
    merging prior entries. Kill the process any time; rerunning `compile`
    continues exactly where it left off. `corpus/failures.jsonl` logs pages that
