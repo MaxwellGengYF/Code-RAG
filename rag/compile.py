@@ -106,6 +106,21 @@ async def run_corpus_step(
     if no_thinking:
         print("[corpus] thinking disabled (--no-thinking)", file=sys.stderr)
 
+    # Repair phantom manifest entries BEFORE diffing. A run that is killed before
+    # finalize leaves entries inherited from the last checkpoint, which may claim
+    # pages whose corpus file does not exist (the checkpoint merges the previous
+    # manifest, so old phantoms persist). Planning already tolerates them — it
+    # checks the filesystem — but they make `status` overstate progress and they
+    # never converge on their own. Costs ~1 s (a stat pass over the manifest).
+    #
+    # Skipped for --dry-run: the audit WRITES the manifest, and a dry run must be
+    # read-only so it can be run safely alongside an active build.
+    if not dry_run:
+        audit = fm.audit_manifest(verbose=False)
+        if audit["dropped"]:
+            print(f"[corpus] manifest repaired: dropped {audit['dropped']:,} entries "
+                  f"claiming pages with no corpus file", file=sys.stderr)
+
     scanned = fm.scan()
     diff = fm.diff(scanned)
 

@@ -61,7 +61,7 @@ def make_site(tmp_path: Path, n: int) -> Path:
 @pytest.fixture()
 def env(tmp_path):
     root = make_site(tmp_path / "site", 40)
-    corpus_dir = tmp_path / "corpus"
+    corpus_dir = root / "corpus"   # matches cfg + the monkeypatched resolve_path
     fm = FileManager(root=root, dirs=["ScriptReference"], corpus_dir=corpus_dir)
     cfg = {"max_input_chars": 24000, "max_chunk_chars": 1200}
     return root, corpus_dir, fm, cfg
@@ -413,3 +413,84 @@ async def test_dry_run_samples_large_work_lists(tmp_path, monkeypatch):
     assert extracted["n"] <= 200, f"extracted {extracted['n']} pages; dry-run must sample"
     assert extracted["n"] > 0, "sampling must still extract SOME pages"
     assert report.est_input_tokens > 0
+
+
+# --------------------------------------------------------------------------------------
+# startup manifest repair: phantoms must not survive a killed run
+# --------------------------------------------------------------------------------------
+
+
+async def _run_corpus_step(root, tmp_path, monkeypatch, *, dry_run: bool,
+                           client=None):
+    """Drive run_corpus_step against a tmp mirror with a fake provider."""
+    from rag.compile import run_corpus_step
+
+    prov = tmp_path / "prov.json"
+    prov.write_text(json.dumps({
+        "model": "fake-model", "type": "openai_legacy", "api_key": "sk-test",
+        "url": "http://127.0.0.1:1/v1", "max_tokens": 1000,
+    }), encoding="utf-8")
+
+    # corpus_dir is RELATIVE on purpose: the monkeypatched resolve_path rebases
+    # non-"." paths under root, so an absolute tmp path would land somewhere else
+    # than the helper below writes to.
+    cfg = {"corpus_dir": "corpus",
+           "dirs": [str(root / "ScriptReference")],
+           "max_input_chars": 24000, "max_chunk_chars": 1200}
+    import rag.compile as rc
+    monkeypatch.setattr(rc, "resolve_path",
+                        lambda p=".", *a, **k: (root if str(p) == "." else root / str(p)))
+    if client is None:
+        client = FakeClient()
+    monkeypatch.setattr(rc, "create_llm", lambda *a, **k: client)
+    return await run_corpus_step(cfg, [str(prov)], workers=2, max_files=None,
+                                 force=False, regen=False, only=None,
+                                 dry_run=dry_run, no_thinking=True,
+                                 price_in=None, price_out=None)
+
+
+def _plant_phantoms(root, tmp_path, n_real: int, n_phantom: int):
+    """Write a manifest claiming more pages than have corpus files."""
+    from rag.store import CorpusStore, FileManager
+
+    corpus_dir = root / "corpus"   # matches cfg + the monkeypatched resolve_path
+    fm = FileManager(root=root, dirs=["ScriptReference"], corpus_dir=corpus_dir)
+    store = CorpusStore(corpus_dir)
+    scanned = fm.scan()
+    rels = sorted(scanned)
+    for r in rels[:n_real]:
+        store.save(r, {"source": r, "chunks": []})
+    fake = {r: scanned.get(r, "deadbeef") for r in rels}
+    fake.update({f"ScriptReference/Ghost{i}.html": "0" * 32
+                 for i in range(n_phantom)})
+    fm.save_manifest(fake, "gk", {"model": "fake-model"},
+                     page_gen_keys={r: "k" for r in fake}, needs_regen=[])
+    return fm, len(fake)
+
+
+async def test_startup_audit_repairs_phantoms(tmp_path, monkeypatch):
+    """A real (non-dry) run repairs phantom entries before diffing, so they
+    cannot persist across runs that are killed before finalize."""
+    root = make_site(tmp_path / "site", 10)
+    fm, claimed = _plant_phantoms(root, tmp_path, n_real=4, n_phantom=6)
+    assert len(fm.load_manifest()["files"]) == claimed  # 10 + 6 ghosts
+
+    await _run_corpus_step(root, tmp_path, monkeypatch, dry_run=False)
+
+    after = fm.load_manifest()
+    # ghosts dropped; the 10 real pages remain (6 newly generated + 4 pre-existing)
+    assert len(after["files"]) == 10, len(after["files"])
+    assert all("Ghost" not in r for r in after["files"])
+
+
+async def test_dry_run_leaves_manifest_untouched(tmp_path, monkeypatch):
+    """--dry-run must be read-only so it can run alongside an active build."""
+    root = make_site(tmp_path / "site", 10)
+    fm, claimed = _plant_phantoms(root, tmp_path, n_real=4, n_phantom=6)
+    mtime_before = (root / "corpus" / "manifest.json").stat().st_mtime_ns
+
+    await _run_corpus_step(root, tmp_path, monkeypatch, dry_run=True)
+
+    after = fm.load_manifest()
+    assert len(after["files"]) == claimed, "dry-run must not repair the manifest"
+    assert (root / "corpus" / "manifest.json").stat().st_mtime_ns == mtime_before
