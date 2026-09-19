@@ -902,32 +902,46 @@ def main(argv: list[str] | None = None) -> int:
                         "(relative paths resolve against the current directory)")
     parser.add_argument("--text", action="store_true", help="Print compact human-readable output")
     parser.add_argument("--legacy", action="store_true",
-                        help="Use the legacy chunks.pkl/index_word.pkl engine instead "
-                             "of the RAG engine (corpus/index built by rag.py compile)")
+                        help="Force the legacy chunks.pkl/index_word.pkl engine")
+    parser.add_argument("--rag", action="store_true",
+                        help="Force the RAG engine even if its index is still "
+                             "partial (default auto-selects by coverage)")
     args = parser.parse_args(argv)
     args.index_path_explicit = any(
         a.startswith("--index-path") for a in (argv if argv is not None else sys.argv[1:])
     )
 
     if not args.legacy and not args.build and not args.repl:
-        # Default path: delegate to the RAG engine (rag.py compile artefacts).
-        # --legacy preserves this file's original engine until the eval gate in
-        # SA-7 retires it.
-        from rag.cli.search_cmd import run_search
-        queries = args.query or []
-        if args.out:
-            import io, contextlib
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                rc = run_search(
-                    queries=queries, query_file=args.query_file, k=args.final_k,
-                    mentions=args.mentions, explain=args.explain, text=args.text)
-            Path(args.out).write_text(buf.getvalue(), encoding="utf-8")
-            print(f"wrote {args.out}", file=sys.stderr)
-            return rc
-        return run_search(
-            queries=queries, query_file=args.query_file, k=args.final_k,
-            mentions=args.mentions, explain=args.explain, text=args.text)
+        # Default path: delegate to the RAG engine, but only once its index is
+        # built AND covers essentially the whole mirror. While `rag.py compile`
+        # is still working through the corpus, the legacy artefacts below cover
+        # every page and the RAG index would silently retrieve from a subset.
+        # --legacy forces this file's original engine; --rag forces the new one.
+        from rag.compile import load_rag_config
+        from rag.search.engine_select import choose_engine
+        rag_cfg = load_rag_config()
+        engine_name, status = choose_engine(
+            rag_cfg, prefer="rag" if getattr(args, "rag", False) else None)
+        if engine_name != "rag":
+            print(f"[engine] using LEGACY index: RAG index {status['reason']}. "
+                  f"Rebuild with `rag.py compile` (then --steps index) to switch.",
+                  file=sys.stderr)
+        else:
+            from rag.cli.search_cmd import run_search
+            queries = args.query or []
+            if args.out:
+                import io, contextlib
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = run_search(
+                        queries=queries, query_file=args.query_file, k=args.final_k,
+                        mentions=args.mentions, explain=args.explain, text=args.text)
+                Path(args.out).write_text(buf.getvalue(), encoding="utf-8")
+                print(f"wrote {args.out}", file=sys.stderr)
+                return rc
+            return run_search(
+                queries=queries, query_file=args.query_file, k=args.final_k,
+                mentions=args.mentions, explain=args.explain, text=args.text)
 
     if isinstance(args.fuzziness, str) and args.fuzziness != "AUTO":
         try:

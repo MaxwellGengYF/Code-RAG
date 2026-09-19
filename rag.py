@@ -65,6 +65,12 @@ def main(argv: list[str] | None = None) -> int:
     p_status = sub.add_parser("status", help="corpus/index freshness + counts")
     p_status.add_argument("--config", default="rag_config.json")
 
+    p_audit = sub.add_parser(
+        "audit-corpus",
+        help="repair manifest entries claiming pages with no corpus file "
+             "(run only when no compile is active)")
+    p_audit.add_argument("--config", default="rag_config.json")
+
     args = parser.parse_args(argv)
 
     if args.command == "compile":
@@ -89,6 +95,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "status":
         from rag.cli.status_cmd import run_status
         return run_status(config_path=args.config)
+    if args.command == "audit-corpus":
+        from rag.cli.status_cmd import run_audit_corpus
+        return run_audit_corpus(config_path=args.config)
     return 2
 
 

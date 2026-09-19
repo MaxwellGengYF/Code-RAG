@@ -232,3 +232,32 @@ class FileManager:
         """
         for rel in removed:
             corpus_path(self.corpus_dir, rel).unlink(missing_ok=True)
+
+    def audit_manifest(self, verbose: bool = True) -> dict[str, int]:
+        """Repair manifest entries that claim pages with no corpus file.
+
+        Such entries are a scar of an earlier bug (a run claimed the whole scan
+        instead of only the pages it processed). They do not break planning —
+        ``plan_work`` verifies the filesystem, so those pages still requeue — but
+        they make ``status``/``diff`` report far more progress than exists. This
+        drops the phantom entries so the manifest reflects reality.
+
+        Returns counts for reporting; rewrites the manifest only when it changed.
+        """
+        manifest = self.load_manifest()
+        files = manifest.get("files", {})
+        keys = manifest.get("page_gen_keys", {})
+        keep_files = {rel: md5 for rel, md5 in files.items()
+                      if corpus_path(self.corpus_dir, rel).exists()}
+        keep_keys = {rel: k for rel, k in keys.items() if rel in keep_files}
+        dropped = len(files) - len(keep_files)
+        if verbose:
+            print(f"[manifest] files {len(files)} -> {len(keep_files)} "
+                  f"(dropped {dropped} phantom entries with no corpus file)")
+        if dropped:
+            self.save_manifest(keep_files, manifest.get("gen_key", ""),
+                               manifest.get("gen_parts", {}),
+                               page_gen_keys=keep_keys,
+                               needs_regen=manifest.get("needs_regen", []))
+        return {"files": len(keep_files), "dropped": dropped,
+                "gen_keys": len(keep_keys)}

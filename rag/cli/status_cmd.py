@@ -9,6 +9,56 @@ from rag import resolve_path
 from rag.compile import load_rag_config
 
 
+def run_audit_corpus(*, config_path: str = "rag_config.json") -> int:
+    """Repair manifest entries that claim pages with no corpus file.
+
+    Safe only when no compile is running (it rewrites corpus/manifest.json, which
+    a live build also owns).
+    """
+    from rag.store import FileManager
+
+    cfg = load_rag_config(config_path)
+    fm = FileManager(root=resolve_path("."), dirs=cfg.get("dirs", []),
+                     corpus_dir=resolve_path(cfg.get("corpus_dir", "corpus")))
+    running = _compile_running()
+    if running:
+        print("REFUSING: a `rag.py compile` process appears to be running and owns "
+              "corpus/manifest.json. Wait for it to finish (or stop it) and rerun.",
+              file=sys.stderr)
+        return 1
+    before = len(fm.load_manifest().get("files", {}))
+    res = fm.audit_manifest()
+    print(f"[audit] manifest files {before} -> {res['files']} "
+          f"(dropped {res['dropped']}); gen_keys {res['gen_keys']}")
+    print("[audit] dropped pages now show as 'added' on the next compile, which is "
+          "correct — they have no corpus file.")
+    return 0
+
+
+def _compile_running() -> bool:
+    """Best-effort check for a live compile process (Windows + POSIX)."""
+    import os
+    import subprocess
+
+    me = os.getpid()
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                 "Where-Object { $_.CommandLine -like '*steps corpus*' } | "
+                 "ForEach-Object { $_.ProcessId }"],
+                capture_output=True, text=True, timeout=60).stdout
+            pids = {int(x) for x in out.split() if x.strip().isdigit()}
+            return bool(pids - {me})
+        out = subprocess.run(["pgrep", "-f", "rag.py compile"],
+                             capture_output=True, text=True, timeout=60).stdout
+        pids = {int(x) for x in out.split() if x.strip().isdigit()}
+        return bool(pids - {me, os.getppid()})
+    except Exception:
+        return False  # cannot tell -> allow (caller was warned in the docstring)
+
+
 def run_status(*, config_path: str = "rag_config.json") -> int:
     cfg = load_rag_config(config_path)
     corpus_dir = resolve_path(cfg.get("corpus_dir", "corpus"))
@@ -28,8 +78,35 @@ def run_status(*, config_path: str = "rag_config.json") -> int:
     print(f"corpus     : {n_corpus_files} .rag.json files under {corpus_dir}")
     print(f"manifest   : gen_key={manifest.get('gen_key', '-')!r} "
           f"({len(manifest.get('files', {}))} recorded)")
+    n_claimed = len(manifest.get("files", {}))
+    if n_claimed > n_corpus_files:
+        # Phantom entries: the manifest claims pages whose corpus file does not
+        # exist (scar of an earlier bug where a run claimed the whole scan). They
+        # do NOT break planning — plan_work verifies the filesystem, so those
+        # pages still requeue — but they overstate progress here. Repair with
+        # `rag.py audit-corpus` when no compile is running.
+        print(f"             WARNING: manifest claims {n_claimed} pages but only "
+              f"{n_corpus_files} corpus files exist ({n_claimed - n_corpus_files} "
+              f"phantom). Coverage/diff below use the FILESYSTEM, so planning is "
+              f"still correct. Repair when idle: rag.py audit-corpus")
+    print(f"coverage   : {n_corpus_files}/{len(scanned)} pages "
+          f"({(n_corpus_files / len(scanned) if scanned else 0):.1%}) have a corpus file")
+    n_flagged = len(manifest.get("needs_regen", []))
+    if n_flagged:
+        print(f"needs_regen: {n_flagged} pages hold heuristic-fallback chunks and "
+              f"will be retried automatically")
     print(f"diff       : added={len(diff.added)} changed={len(diff.changed)} "
           f"removed={len(diff.removed)} unchanged={len(diff.unchanged)}")
+    # Honest pending count: diff trusts the manifest, so phantom entries inflate
+    # `unchanged`. Count pages that genuinely still need work.
+    pending = 0
+    for rel in diff.unchanged:
+        if store.missing(rel) or rel in set(manifest.get("needs_regen", [])):
+            pending += 1
+    pending += len(diff.added) + len(diff.changed)
+    print(f"pending    : {pending} pages still need generation "
+          f"({len(diff.added) + len(diff.changed)} new/changed + "
+          f"{pending - len(diff.added) - len(diff.changed)} missing-or-flagged)")
     failures = corpus_dir / "failures.jsonl"
     if failures.exists():
         n_fail = sum(1 for _ in open(failures, encoding="utf-8"))
@@ -49,4 +126,14 @@ def run_status(*, config_path: str = "rag_config.json") -> int:
                 print(f"             {f}: {p.stat().st_size / 1e6:.1f} MB")
     else:
         print("index      : NOT BUILT — run: uv run python rag.py compile --steps index")
+
+    # Which engine a query would actually use, and why. The RAG index only
+    # replaces the legacy full-corpus index once it covers the mirror.
+    from rag.search.engine_select import choose_engine
+    engine, st = choose_engine(cfg)
+    print(f"engine     : {engine.upper()} would serve `hybrid_retrieve.py --query ...`")
+    print(f"             {st['reason']}")
+    if engine != "rag":
+        print("             (hybrid_retrieve.py --rag forces the RAG engine; "
+              "--legacy forces the old one)")
     return 0

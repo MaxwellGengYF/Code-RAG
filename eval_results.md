@@ -11,7 +11,8 @@ AGENTS.md history and are directly comparable (same 24-query gold set).
 
 | config | gold set | MRR | hit@1 | hit@10 |
 | --- | --- | --- | --- | --- |
-| **old baseline** (word BM25, fuzziness 0) | base-24 | **0.875** | **0.833** | **0.917** |
+| old baseline, **re-measured today** (`eval_retrieval.py --configs word`) | base-24 | 0.833 | 0.750 | 0.917 |
+| old baseline, historical record (AGENTS.md) | base-24 | **0.875** | **0.833** | **0.917** |
 | old word+dense(**hash**) linear | base-24 | 0.792 | 0.667 | 0.917 |
 | **new engine, mode=bm25** | base-24 | **0.917** | 0.875 | 0.958 |
 | **new engine, mode=hybrid (default)** | base-24 | 0.917 | 0.875 | 0.958 |
@@ -21,6 +22,18 @@ AGENTS.md history and are directly comparable (same 24-query gold set).
 
 New engine clears the gate on the independent base-24 set: MRR 0.917 ≥ 0.875 and
 hit@10 0.958 ≥ 0.917, with hit@1 also up (0.875 vs 0.833).
+
+Note the old engine re-measured 0.833 today rather than the recorded 0.875. This
+is **not** an artefact of the new harness: the only change to `eval_lib.py` is an
+optional `gold_set` parameter that defaults to the original `GOLD` list, so
+`eval_retrieval.py`'s behaviour is byte-identical (verified by `git diff`). The
+legacy `chunks.pkl`/`index_word.pkl` on disk carry a 07:11 build timestamp, i.e.
+they post-date the recorded 0.875 run, and two gold queries now miss entirely
+(`rank=None`, outside the top-10): `per-object material property without
+instantiating material` and `MaterialPropertyBlock arrays Vector4[] Matrix4x4[]
+ComputeBuffer`. The gate is therefore evaluated against the **stricter historical
+0.875**, which the new engine still passes (0.917); against today's 0.833 the
+margin is wider.
 
 ## Why the old word+dense(hash) regressed, and what BGE-M3 changes
 
