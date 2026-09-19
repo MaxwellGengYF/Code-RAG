@@ -55,7 +55,16 @@ def main(argv: list[str] | None = None) -> int:
     p_search.add_argument("--k", type=int, default=None)
     p_search.add_argument("--mode", choices=["hybrid", "bm25", "dense"], default=None)
     p_search.add_argument("--mentions", default=None, metavar="TERM")
+    p_search.add_argument("--mentions-limit", type=int, default=60,
+                          help="With --mentions: max files to list (default 60)")
+    p_search.add_argument("--mentions-context", type=int, default=0,
+                          help="With --mentions: capture N chars of surrounding "
+                               "text per file")
     p_search.add_argument("--explain", action="store_true")
+    p_search.add_argument("--out", default=None,
+                          help="Write JSON results to this file")
+    p_search.add_argument("--snippet-width", type=int, default=500,
+                          help="Max chars of each hit snippet")
     p_search.add_argument("--no-rerank", action="store_true")
     p_search.add_argument("--text", action="store_true", help="Compact human output")
     p_search.add_argument("--legacy", action="store_true",
@@ -88,8 +97,11 @@ def main(argv: list[str] | None = None) -> int:
         from rag.cli.search_cmd import run_search
         return run_search(
             queries=args.query, query_file=args.query_file, k=args.k,
-            mode=args.mode, mentions=args.mentions, explain=args.explain,
+            mode=args.mode, mentions=args.mentions,
+            mentions_limit=args.mentions_limit,
+            mentions_context=args.mentions_context, explain=args.explain,
             no_rerank=args.no_rerank, text=args.text, legacy=args.legacy,
+            out=args.out, snippet_width=args.snippet_width,
             config_path=args.config,
         )
     if args.command == "status":

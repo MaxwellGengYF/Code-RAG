@@ -29,10 +29,14 @@ def run_search(
     k: int | None = None,
     mode: str | None = None,
     mentions: str | None = None,
+    mentions_limit: int = 60,
+    mentions_context: int = 0,
     explain: bool = False,
     no_rerank: bool = False,
     text: bool = False,
     legacy: bool = False,
+    out: str | None = None,
+    snippet_width: int = 500,
     config_path: str = "rag_config.json",
 ) -> int:
     cfg = load_rag_config(config_path)
@@ -52,6 +56,12 @@ def run_search(
             argv.append("--explain")
         if mentions:
             argv += ["--mentions", mentions]
+        if mentions_context:
+            argv += ["--mentions-context", str(mentions_context)]
+        if mentions_limit != 60:
+            argv += ["--mentions-limit", str(mentions_limit)]
+        if snippet_width != 500:
+            argv += ["--snippet-width", str(snippet_width)]
         if text:
             argv.append("--text")
         return hybrid_retrieve.main(argv)
@@ -74,17 +84,25 @@ def run_search(
         return 1
 
     if mentions:
-        res = engine.mentions(mentions)
+        res = engine.mentions(mentions, limit=mentions_limit,
+                              context=mentions_context)
         if not res:
             print(f"[mentions] 0 files contain {mentions!r} (literal, case-insensitive)",
                   file=sys.stderr)
-        out = {mentions: res}
+        out_payload = {mentions: res}
+        body = json.dumps(out_payload, ensure_ascii=False, indent=2)
+        if out:
+            Path(out).write_text(body, encoding="utf-8")
+            print(f"wrote {out}", file=sys.stderr)
         if text:
             print(f"# {mentions}: {len(res)} files")
             for r in res:
-                print(f"  {r['count']:>4}  {r['source']}")
+                line = f"  {r['count']:>4}  {r['source']}"
+                if r.get("context"):
+                    line += f"\n        …{r['context']}…"
+                print(line)
         else:
-            print(json.dumps(out, ensure_ascii=False, indent=2))
+            print(body)
         return 0
 
     qs = _read_queries(queries, query_file)
@@ -94,7 +112,8 @@ def run_search(
 
     t0 = time.time()
     results = [engine.search(q, k=k, mode=mode, explain=explain,
-                             no_rerank=no_rerank) for q in qs]
+                             no_rerank=no_rerank,
+                             snippet_width=snippet_width) for q in qs]
     payload = {
         "_meta": {
             "engine": "rag.search",
@@ -105,6 +124,10 @@ def run_search(
         },
         "results": results,
     }
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    if out:
+        Path(out).write_text(body, encoding="utf-8")
+        print(f"wrote {out}", file=sys.stderr)
     if text:
         for r in results:
             print(f"\n### {r['query']}")
@@ -115,5 +138,5 @@ def run_search(
                 print(f"  {h['fused_score']:<9.4f} {h['title']}  ({h['source']})")
                 print(f"            {h['text'][:160]}")
     else:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print(body)
     return 0

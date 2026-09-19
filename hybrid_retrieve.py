@@ -936,20 +936,17 @@ def main(argv: list[str] | None = None) -> int:
                       file=sys.stderr)
         else:
             from rag.cli.search_cmd import run_search
-            queries = args.query or []
-            if args.out:
-                import io, contextlib
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    rc = run_search(
-                        queries=queries, query_file=args.query_file, k=args.final_k,
-                        mentions=args.mentions, explain=args.explain, text=args.text)
-                Path(args.out).write_text(buf.getvalue(), encoding="utf-8")
-                print(f"wrote {args.out}", file=sys.stderr)
-                return rc
+            # Pass every legacy flag through. SA-6 requires "keep every old flag
+            # working", and --mentions-context / --mentions-limit / --out /
+            # --snippet-width were previously accepted-then-silently-dropped, which
+            # is worse than erroring: the output just looks plausible.
             return run_search(
-                queries=queries, query_file=args.query_file, k=args.final_k,
-                mentions=args.mentions, explain=args.explain, text=args.text)
+                queries=args.query or [], query_file=args.query_file,
+                k=args.final_k, mentions=args.mentions,
+                mentions_limit=args.mentions_limit,
+                mentions_context=args.mentions_context,
+                explain=args.explain, text=args.text, out=args.out,
+                snippet_width=args.snippet_width)
 
     if isinstance(args.fuzziness, str) and args.fuzziness != "AUTO":
         try:

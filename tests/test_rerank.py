@@ -161,3 +161,63 @@ def test_rerank_off_by_default(tmp_path, monkeypatch):
     out = engine.search("rigidbody velocity", k=3, mode="bm25")
     assert out["hits"]
     assert "reranked" not in out
+
+
+# --------------------------------------------------------------------------------------
+# SA-6 parity: every legacy CLI flag must reach the engine, not be silently dropped
+# --------------------------------------------------------------------------------------
+
+
+def test_run_search_forwards_mentions_flags(monkeypatch, capsys):
+    """--mentions-context/--mentions-limit must reach engine.mentions.
+
+    These were previously accepted by argparse and then dropped, so the output
+    looked plausible while silently ignoring the flags -- worse than erroring.
+    """
+    import rag.cli.search_cmd as sc
+
+    seen = {}
+
+    class FakeEngine:
+        cfg = {}
+        n_chunks = 1
+        has_dense = False
+
+        def load(self):
+            pass
+
+        def mentions(self, term, *, limit=60, context=0):
+            seen["term"] = term
+            seen["limit"] = limit
+            seen["context"] = context
+            return [{"source": "ScriptReference/A.html", "count": 3,
+                     "context": "some surrounding text"}]
+
+    monkeypatch.setattr("rag.search.engine.SearchEngine", lambda cfg: FakeEngine())
+    sc.run_search(mentions="Foo", mentions_limit=7, mentions_context=120,
+                  text=False, legacy=False)
+    assert seen == {"term": "Foo", "limit": 7, "context": 120}
+    body = capsys.readouterr().out
+    assert '"context"' in body, "context must appear in JSON output"
+
+
+def test_run_search_legacy_forwards_mentions_flags(monkeypatch):
+    """The --legacy delegation must forward the same flags to hybrid_retrieve."""
+    import rag.cli.search_cmd as sc
+
+    captured = {}
+
+    class FakeLegacy:
+        @staticmethod
+        def main(argv):
+            captured["argv"] = argv
+            return 0
+
+    monkeypatch.setitem(__import__("sys").modules, "hybrid_retrieve", FakeLegacy())
+    sc.run_search(mentions="Foo", mentions_limit=5, mentions_context=80,
+                  legacy=True, snippet_width=300)
+    argv = captured["argv"]
+    assert "--mentions" in argv and "Foo" in argv
+    assert argv[argv.index("--mentions-limit") + 1] == "5"
+    assert argv[argv.index("--mentions-context") + 1] == "80"
+    assert argv[argv.index("--snippet-width") + 1] == "300"
