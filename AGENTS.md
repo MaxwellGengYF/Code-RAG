@@ -94,6 +94,17 @@ Index text composition (the aux design):
 - Fusion is **RRF** (`Σ 1/(60+rank)`), not linear score fusion: BM25 scores are
   unbounded, cosine is bounded. The legacy linear-alpha path survives in
   `rag/index/fuse.py` for ablations.
+- **There is no n-gram layer.** The plan framed the system as "BM25 + n-gram +
+  dense", but the shipped index is BM25 + dense only. The legacy character-trigram
+  back-end was retained solely for typo tolerance, and BGE-M3 does that job
+  strictly better (8/8 vs 3/8 on typo queries) while the trigram model destroys
+  exact identifiers (MRR 0.04–0.52 vs 0.875, and nondeterministic across runs).
+  Evidence: `eval_typo_tolerance.py`, written up in `eval_results.md`.
+- **The cross-encoder reranker is off by default** (`"rerank": false`), and should
+  stay off: measured MRR 0.917 → 0.760 on base-24. It sees chunk text but not the
+  source path, so it discards the `path_terms` signal that makes API lookups work.
+  The code path exists and is tested (`tests/test_rerank.py`) for corpora whose
+  documents are not identifiable by filename.
 
 The index build refuses to mix generations: when the corpus gen_key changes,
 `compile --steps index` demands a rebuild (it replaces all artefacts).
