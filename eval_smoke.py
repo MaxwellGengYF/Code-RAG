@@ -193,8 +193,14 @@ def main() -> int:
         assert len(srcs) == len(set(srcs)), f"per_file=1 violated: {srcs}"
 
     def _empty_query_hint():
-        out = engine.search("zzzqqqxxxnotaterm", k=3)
-        assert out["hits"] == []
+        """A term-free query must produce 0 hits AND a hint.
+
+        Checked in bm25 mode: dense always returns nearest neighbours (cosine
+        similarity is defined for every vector), so a nonsense query legitimately
+        yields low-relevance hits there — that is expected, not a missing hint.
+        """
+        out = engine.search("zzzqqqxxxnotaterm", k=3, mode="bm25")
+        assert out["hits"] == [], f"bm25 matched a nonsense term: {out['hits'][:2]}"
         assert "hint" in out
 
     def _modes():

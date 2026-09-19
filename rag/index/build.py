@@ -161,18 +161,27 @@ def build_indexes(cfg: dict, *, force: bool = False, skip_dense: bool = False,
                   f"(sha1_8={chunks_sha}, {len(rows)} rows); dense does not depend "
                   f"on path_boost/aux", file=sys.stderr)
         else:
-            from rag.index.vector_index import build_vectors, save_vectors, save_meta
-            vecs = build_vectors(chunks, titles, model=embed_model)
-            save_vectors(vecs, vecs_path)
-            save_meta(meta_path, model=embed_model,
-                      dim=int(vecs.shape[1]), count=int(vecs.shape[0]))
-            print(f"[index] wrote vectors.f32 {vecs.shape} ({time.time() - t0:.0f}s)",
-                  file=sys.stderr)
+            from rag.index.vector_index import (build_vectors_resumable,
+                                                ensure_embed_model, save_meta)
+            m = ensure_embed_model(embed_model)
+            dim = int(getattr(m, "get_embedding_dimension", None)()
+                      if hasattr(m, "get_embedding_dimension")
+                      else m.get_sentence_embedding_dimension())
+            build_vectors_resumable(
+                chunks, titles, out_path=vecs_path,
+                model=embed_model, dim=dim,
+                # rows belong to THIS chunk table; a partial file from a different
+                # one must be discarded, not resumed (see build_vectors_resumable)
+                stamp=chunks_sha,
+                log=lambda msg: print(msg, file=sys.stderr))
+            save_meta(meta_path, model=embed_model, dim=dim, count=len(chunks))
+            print(f"[index] wrote vectors.f32 ({len(chunks)}, {dim}) "
+                  f"({time.time() - t0:.0f}s)", file=sys.stderr)
     elif skip_dense:
         # A stale vectors.f32 from an earlier build would be positionally
         # misaligned with the freshly flattened rows (vectors carry no ids), so
         # remove it rather than let dense silently score the wrong chunks.
-        for stale in ("vectors.f32", "vector_meta.json"):
+        for stale in ("vectors.f32", "vectors.f32.stamp", "vector_meta.json"):
             p = index_dir / stale
             if p.exists():
                 p.unlink()
