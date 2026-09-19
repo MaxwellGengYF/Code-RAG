@@ -911,6 +911,21 @@ def main(argv: list[str] | None = None) -> int:
         a.startswith("--index-path") for a in (argv if argv is not None else sys.argv[1:])
     )
 
+    if args.repl and not args.legacy:
+        # REPL is engine-aware too: once the RAG index covers the mirror, the
+        # persistent session should serve from it, not from chunks.pkl. The
+        # protocol is identical (see rag/cli/repl_cmd.py) so clients are unaffected.
+        from rag.compile import load_rag_config
+        from rag.search.engine_select import choose_engine
+        engine_name, status = choose_engine(
+            load_rag_config(), prefer="rag" if getattr(args, "rag", False) else None)
+        if engine_name == "rag":
+            from rag.cli.repl_cmd import repl_loop as rag_repl
+            print("[engine] --repl served by the RAG engine", file=sys.stderr)
+            return rag_repl()
+        print(f"[engine] --repl served by LEGACY index: RAG index "
+              f"{status['reason']}", file=sys.stderr)
+
     if not args.legacy and not args.build and not args.repl:
         # Default path: delegate to the RAG engine, but only once its index is
         # built AND covers essentially the whole mirror. While `rag.py compile`

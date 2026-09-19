@@ -71,6 +71,11 @@ def main(argv: list[str] | None = None) -> int:
                           help="Use the legacy hybrid_retrieve engine")
     p_search.add_argument("--config", default="rag_config.json")
 
+    p_repl = sub.add_parser(
+        "repl", help="persistent JSONL session (query/mentions/read), index loads once")
+    p_repl.add_argument("--mode", choices=["hybrid", "bm25", "dense"], default=None)
+    p_repl.add_argument("--config", default="rag_config.json")
+
     p_status = sub.add_parser("status", help="corpus/index freshness + counts")
     p_status.add_argument("--config", default="rag_config.json")
 
@@ -104,6 +109,9 @@ def main(argv: list[str] | None = None) -> int:
             out=args.out, snippet_width=args.snippet_width,
             config_path=args.config,
         )
+    if args.command == "repl":
+        from rag.cli.repl_cmd import repl_loop
+        return repl_loop(config_path=args.config, mode=args.mode)
     if args.command == "status":
         from rag.cli.status_cmd import run_status
         return run_status(config_path=args.config)
