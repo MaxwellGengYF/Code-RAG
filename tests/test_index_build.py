@@ -178,3 +178,55 @@ def test_decode_rows_yields_typed_qa_not_dicts(corpus):
     naive = msgspec.msgpack.decode(blob)
     assert isinstance(naive[0]["qa"][0], dict), \
         "if msgspec ever types nested structs by default, this guard is obsolete"
+
+
+# --------------------------------------------------------------------------------------
+# plan risk: "ROOT-relative posix paths everywhere" (Windows backslash leakage)
+# --------------------------------------------------------------------------------------
+
+
+def test_corpus_paths_are_root_relative_posix(tmp_path):
+    """Sources must be forward-slash ROOT-relative so results are stable across
+    machines and cwds, and so gold-set substring matching works on Windows."""
+    root = tmp_path / "site"
+    nested = root / "ScriptReference" / "sub"
+    nested.mkdir(parents=True)
+    (nested / "Deep.Page.html").write_text(
+        "<html><head><title>Unity - Scripting API: Deep.Page</title></head>"
+        "<body><div id='content-wrap'><div class='section'><h1>Deep.Page</h1>"
+        "<p>Some documentation body about nested pages.</p>"
+        "</div></div></body></html>", encoding="utf-8")
+
+    from rag.corpus import extract_page
+    page = extract_page(nested / "Deep.Page.html", root=root)
+    assert page is not None
+    assert page.source == "ScriptReference/sub/Deep.Page.html"
+    assert "\\" not in page.source
+
+
+def test_flatten_preserves_posix_sources(corpus):
+    store = CorpusStore(corpus)
+    rows, _ = flatten_corpus(store)
+    for r in rows:
+        assert "\\" not in r.source, r.source
+        assert not r.source.startswith("/"), "must be ROOT-relative, not absolute"
+        assert r.source.split("/")[0] in ("Manual", "ScriptReference")
+
+
+def test_non_ascii_survives_corpus_roundtrip(tmp_path):
+    """UTF-8 end to end: Unity docs contain typographic quotes and CJK."""
+    d = tmp_path / "corpus"
+    d.mkdir()
+    text = "Shader property “_Color” — 颜色 and naïve café"
+    write_corpus(d, "Manual/Unicode.html",
+                 [{"chunk_uid": make_chunk_uid("Manual/Unicode.html", 0),
+                   "heading_path": ["Unicode"], "text": text,
+                   "summary": "typographic and CJK content", "keywords": ["_Color"],
+                   "synonyms": [], "qa": []}])
+    rows, pages = flatten_corpus(CorpusStore(d))
+    assert pages == 1
+    assert rows[0].text == text, rows[0].text
+    # ensure_ascii=False keeps it readable on disk (not \uXXXX escapes)
+    raw = (d / "Manual/Unicode.html.rag.json").read_text(encoding="utf-8")
+    assert "颜色" in raw
+    assert "\\u" not in raw, "json must not escape non-ASCII"
