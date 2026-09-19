@@ -83,6 +83,39 @@ identifier-heavy gold set.
 
 ## Ablations
 
+### Cross-encoder rerank: measurably HARMFUL — stays off
+
+`BAAI/bge-reranker-v2-m3` over the top-50 fused candidates, same index, same
+queries, run in one process so both arms see identical state:
+
+| gold set | rerank off | rerank on | Δ MRR |
+| --- | --- | --- | --- |
+| base-24 (independent) | **0.917** | 0.760 | **−0.157** |
+| probe-24 (semantic) | **0.972** | 0.895 | −0.077 |
+
+hit@1 drops too (0.875 → 0.667 on base-24) while hit@10 is unchanged, so the
+reranker is demoting the correct page out of the top few rather than adding
+recall. It loses on both an identifier-heavy set and a paraphrase set, which
+removes the usual "it helps on semantic queries" escape hatch.
+
+Why: the fusion ranking is already anchored by `path_terms` — filename/title
+terms repeated `path_boost` times — which is decisive for API lookups
+(`Renderer.SetPropertyBlock.html` for "Renderer.SetPropertyBlock"). The
+cross-encoder sees only the chunk text, not the source path, so it has no access
+to the strongest signal in this corpus and reorders on prose relevance instead.
+Reranking also costs seconds of CPU per query versus milliseconds, so it is worse
+on both quality and latency here. `"rerank": false` stays the default; keep the
+flag for future corpora where documents are not identifiable by filename.
+
+Two bugs found while first exercising this path (it had been untested dead code):
+`_rerank` reordered hits while keeping the original fusion scores, so the
+reported `fused_score` could not explain the reported order; and reranking ran
+*after* truncating to k, so it could only shuffle results already shown instead
+of promoting better candidates. Both fixed — the rerank score is now reported
+separately and a wider pool (k×5, min 50) is scored before truncation.
+
+### Aux fields, path_boost, rrf_k
+
 Aux fields (summary/keywords/synonyms/qa) in the BM25 index text, base-24:
 
 | aux | MRR | hit@1 | hit@10 |
@@ -106,10 +139,12 @@ prose in the vector space is exactly the failure mode the hash regression showed
 | 12 | 0.931 | — |
 | 20 | 0.932 | — |
 
-path_boost=5 looks better on base-24 (0.938 vs 0.917) but is **identical** on the
-independent ext-16 set. A 0.021 MRR delta on 24 queries is half a query, so the
-apparent gain is noise. The proven default of 3 is kept — changing it would be
-fitting to the eval set.
+path_boost=5 looks better on base-24 (0.938 vs 0.917) but is identical on the
+separate ext-16 set (0.906 both ways), so the gain does not reproduce. A 0.021
+MRR delta on 24 queries is half a query, which is within noise. Note this is a
+non-replication argument, not an independence argument — ext-16 is contaminated
+(see caveats below), so it can corroborate "no change" but cannot confirm a gain.
+The proven default of 3 is kept rather than fitting to base-24.
 
 `rrf_k` (base-24, hybrid): k=5 → 0.875, k=20/60/200/1000 → 0.917. Anything ≥20
 is equivalent; k=60 kept (standard, and less disruptive to the BM25 order).

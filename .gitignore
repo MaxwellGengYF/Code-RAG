@@ -9,7 +9,9 @@
 /index_probe/
 /failures.jsonl
 /eval_gold_probe.json
+/eval_results_latest.md
 /rag_probe_config.json
+/rag_probe_rerank.json
 
 # Legacy generated indices
 /chunks.pkl
