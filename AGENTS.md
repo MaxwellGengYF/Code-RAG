@@ -142,6 +142,35 @@ Hard-won gateway facts (measured 2026-09):
   regenerates exactly one page.
 - Deleting corpus: `rm -rf corpus index` is safe; everything regenerates.
 
+## Runbook: completing a full build (state 2026-09-19)
+
+The full-corpus compile runs via `.kimix_cache/run_full_compile.sh` (auto-resume
+loop, 6 provider gateways, `--no-thinking --workers 12`, ~0.5 pages/s ≈ 24 h).
+It is safe to interrupt; the loop or a manual rerun resumes from the md5
+manifest. When `tail .kimix_cache/full_compile.log` shows `COMPILE COMPLETE`:
+
+```
+# 1. build both index layers (BM25 minutes; BGE-M3 dense hours on CPU)
+uv run python rag.py compile --steps index --force
+
+# 2. regenerate the extended gold set from the finished corpus, then evaluate
+uv run python eval_rag.py --generate-gold
+uv run python eval_rag.py --gold-set all --mode hybrid
+uv run python eval_rag.py --gold-set all --mode bm25
+uv run python eval_rag.py --sweep-aux
+
+# 3. gate: new engine becomes the default only if eval_results.md shows
+#    MRR >= 0.875 AND hit@10 >= 0.917 (24+16 query gold set), or a documented
+#    hit@10 win without MRR loss. Otherwise iterate chunking/aux/RRF and rerun.
+
+# 4. final smoke: batch + mentions + explain on known-answer queries
+uv run python rag.py search --query "MaterialPropertyBlock" --k 5 --text
+uv run python rag.py search --mentions MaterialPropertyBlock | head
+```
+
+Fill the "New engine numbers" section below with the measured rows, then delete
+this runbook section.
+
 ## Testing
 
 `uv run python -m pytest tests/` — 57 tests, all network-free (httpx
