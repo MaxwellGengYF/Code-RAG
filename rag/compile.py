@@ -200,9 +200,21 @@ def run_compile(
     price_in: float | None = None,
     price_out: float | None = None,
     skip_dense: bool = False,
+    install_embed_model: bool = False,
     config_path: str = "rag_config.json",
 ) -> int:
     cfg = load_rag_config(config_path)
+    if install_embed_model:
+        # standalone model download; needs no provider and does not touch corpus
+        from rag.index.vector_index import ensure_embed_model
+        model = cfg.get("embed_model", "BAAI/bge-m3")
+        print(f"[deps] installing embed model {model} ...", file=sys.stderr)
+        m = ensure_embed_model(model)
+        dim = int(getattr(m, "get_embedding_dimension", None)()
+                  if hasattr(m, "get_embedding_dimension")
+                  else m.get_sentence_embedding_dimension())
+        print(f"[deps] embed model ready: {model} (dim={dim})")
+        return 0
     if not steps:
         steps = list(ALL_STEPS)
     unknown = [s for s in steps if s not in ALL_STEPS]

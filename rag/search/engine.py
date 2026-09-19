@@ -51,8 +51,11 @@ class SearchEngine:
             raise FileNotFoundError(
                 "index artefacts not found: " + ", ".join(str(m) for m in missing)
                 + "\n  build them with: uv run python rag.py compile --steps index")
-        raw = msgspec.msgpack.decode(chunks_path.read_bytes())
-        self.rows = [ChunkRow(**r) for r in raw]
+        # Decode with the type so nested QA structs come back as objects, not
+        # dicts — ChunkRow(**r) would leave qa as dicts and to_index_text would
+        # then raise AttributeError on q.q.
+        from rag.index.build import load_rows
+        self.rows = load_rows(chunks_path)
         self.index = InvertedIndex()
         self.index.load(str(bm25_path))
         self.searcher = new_searcher(

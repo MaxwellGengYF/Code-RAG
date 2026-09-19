@@ -43,6 +43,10 @@ def main(argv: list[str] | None = None) -> int:
                            help="Input price per 1M tokens (for cost estimate)")
     p_compile.add_argument("--price-out", type=float, default=None,
                            help="Output price per 1M tokens (for cost estimate)")
+    p_compile.add_argument("--install-embed-model", action="store_true",
+                           help="Download/cache the dense embed model (BGE-M3) and "
+                                "exit; needs no provider. Same as --steps deps but "
+                                "skips the pip-import checks")
     p_compile.add_argument("--skip-dense", action="store_true",
                            help="With --steps index: build BM25 only (minutes "
                                 "instead of hours); dense stays absent so hybrid "
@@ -96,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
             regen=args.regen, only=args.only, dry_run=args.dry_run,
             no_thinking=args.no_thinking, price_in=args.price_in,
             price_out=args.price_out, skip_dense=args.skip_dense,
+            install_embed_model=args.install_embed_model,
             config_path=args.config,
         )
     if args.command == "search":

@@ -217,15 +217,14 @@ def _assert_vector_alignment(idx_dir: Path, rows, sample: int = 64) -> None:
     built chunk table's uids against the freshly flattened rows; a mismatch means
     every dense score would be attributed to the wrong chunk.
     """
-    import msgspec
-    from rag.index.build import ChunkRow
+    from rag.index.build import load_rows
 
     table_path = idx_dir / "chunks.msgpack"
     if not table_path.exists():
         print("[eval] WARNING: no chunks.msgpack to verify vector alignment; "
               "dense results may be misattributed", file=sys.stderr)
         return
-    built = [ChunkRow(**r) for r in msgspec.msgpack.decode(table_path.read_bytes())]
+    built = load_rows(table_path)
     if len(built) != len(rows):
         raise RuntimeError(
             f"vector/chunk misalignment: index table has {len(built)} rows but the "

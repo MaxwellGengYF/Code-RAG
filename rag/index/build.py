@@ -48,6 +48,27 @@ class ChunkRow(msgspec.Struct, kw_only=True):
         )
 
 
+def encode_rows(rows: list[ChunkRow]) -> bytes:
+    """Serialize the chunk table."""
+    return msgspec.msgpack.encode(rows)
+
+
+def decode_rows(blob: bytes) -> list[ChunkRow]:
+    """Deserialize the chunk table into real ChunkRow/QA structs.
+
+    Decoding WITHOUT the type yields plain dicts for nested structs, so
+    ``ChunkRow(**r)`` would leave ``qa`` as a list of dicts and the first
+    ``to_index_text`` call would raise AttributeError on ``q.q``. Always decode
+    with ``type=list[ChunkRow]``.
+    """
+    return msgspec.msgpack.decode(blob, type=list[ChunkRow])
+
+
+def load_rows(path: str | Path) -> list[ChunkRow]:
+    """Read a persisted chunk table."""
+    return decode_rows(Path(path).read_bytes())
+
+
 def flatten_corpus(store: CorpusStore) -> tuple[list[ChunkRow], int]:
     """Corpus files -> (deterministic flat chunk table, page count with corpus)."""
     rows: list[ChunkRow] = []
@@ -123,7 +144,7 @@ def build_indexes(cfg: dict, *, force: bool = False, skip_dense: bool = False,
     titles = [r.title for r in rows]
 
     # single chunk table
-    chunks_bytes = msgspec.msgpack.encode([msgspec.to_builtins(r) for r in rows])
+    chunks_bytes = encode_rows(rows)
     chunks_sha = hashlib.sha1(chunks_bytes).hexdigest()[:8]
     (index_dir / "chunks.msgpack").write_bytes(chunks_bytes)
     print(f"[index] wrote chunks.msgpack ({time.time() - t0:.0f}s)", file=sys.stderr)
