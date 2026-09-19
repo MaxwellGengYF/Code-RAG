@@ -200,8 +200,9 @@ the result **reversed with corpus size**:
 | 3,039 pages (probe) | 0.917 | 0.906 | ON |
 | 26,201 pages (59%) | 0.826 | **0.881** | **OFF** |
 
-So the default is now `bm25_aux: false`. Two mechanisms explain the reversal, both
-of which scale with corpus size:
+So the default is now `bm25_aux: false`. Three mechanisms explain why aux hurts at
+scale (the third, and the sign-flip proof it rests on, is documented under the
+Corpus quality note and Caveat 1 below); the first two scale with corpus size:
 
 1. **Sibling-symbol dilution.** Every `MaterialPropertyBlock.SetX` / `.HasX` page's
    aux fields repeat the parent class name, so aux injects the *same* identifier
@@ -298,22 +299,38 @@ whether they follow the runbook ordering.
 
 ## Measurement caveats (read before trusting any number here)
 
-1. **ext-16 and probe-24 are contaminated.** Their queries were harvested from the
-   corpus `qa` fields, and `qa.q` is itself indexed in the aux text — BM25 is
-   being asked to find a string it was handed at build time. This shows directly
-   in the aux ablation on ext-16 (0.906 with aux vs 0.781 without) and in a
-   ceiling effect (BM25 already 0.972 on probe-24). **base-24 is the only
-   independent set** and is what the gate is decided on. ext/probe numbers are
-   reported for ablation *trends*, not as accuracy claims.
-2. **The corpus was partial for every number above** (~18–19k of 43,938 pages at
+1. **ext-16 and probe-24 are contaminated, and it is now PROVEN by a sign flip.**
+   Their queries were harvested from the corpus `qa` fields, and `qa.q` is indexed
+   when `bm25_aux` is true — BM25 is being asked to find a string it was handed at
+   build time. The aux ablation confirms this directly, because the aux effect
+   **reverses sign** between the independent set and the contaminated one:
+
+   | gold set | aux ON | aux OFF | Δ (aux ON − OFF) |
+   | --- | --- | --- | --- |
+   | base-24 (independent) | 0.826 | **0.881** | **−0.055** (aux hurts) |
+   | ext-16 (contaminated) | **0.891** | 0.781 | **+0.110** (aux "helps") |
+
+   On base-24 aux hurts, as the dilution mechanisms predict. On ext-16 aux
+   *helps by 0.11* purely because the gold questions are literally present in the
+   aux text — a self-fulfilling result, not a retrieval win. probe-24 shows the
+   same ceiling effect (BM25 0.972). **base-24 is the only independent set and is
+   what the gate is decided on.** ext/probe are reported for ablation *trends*
+   within a fixed aux setting, never as accuracy claims, and never against base-24.
+   Note the shipped `bm25_aux=false` default closes the leakage path (qa.q is no
+   longer indexed), but the queries still originate from text the model saw while
+   chunking, so they remain easier than independent ones. All 16 were
+   human-verified (`eval_gold_verification.md`).
+2. The corpus was partial for every number above (~18–31k of 43,938 pages at
    measurement time). Dense/hybrid numbers come from a 3,039-page probe subset
    (`corpus_probe/` + `index_probe/`) built specifically so all three modes score
    identical content; a full-corpus rebuild is required before these are final.
 3. **Small n.** 24 queries → 1 query ≈ 0.04 MRR. Treat differences under ~0.04 as
-   noise, which is why path_boost stayed at 3.
-4. **CPU-only dense.** BGE-M3 on this machine runs ~7–13 chunks/s; 41k chunks is
-   ~1.5–3 h. Not a quality issue, but it is why `--skip-dense` and vector reuse
-   (see below) exist.
+   noise, which is why path_boost stayed at 3 (5 tied it at 26k and "won" only on
+   a subset).
+4. **CPU-only dense.** BGE-M3 runs 22–25 chunks/s idle on this machine (3.1 under
+   contention with the corpus build); ~90k chunks is ~1.1 h idle, ~8 h concurrent.
+   Not a quality issue, but it is why `--skip-dense`, vector reuse, and the
+   resumable `vectors.f32.progress` exist. See "Build performance" above.
 
 ## Reproducing
 
