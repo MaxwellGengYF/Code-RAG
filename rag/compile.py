@@ -166,9 +166,9 @@ async def run_corpus_step(
     return report
 
 
-def run_index_step(cfg: dict) -> int:
+def run_index_step(cfg: dict, *, force: bool = False) -> int:
     from rag.index.build import build_indexes
-    return build_indexes(cfg)
+    return build_indexes(cfg, force=force)
 
 
 def run_compile(
@@ -208,5 +208,5 @@ def run_compile(
             price_in=price_in, price_out=price_out))
     if "index" in steps and not dry_run:
         print("[compile] step: index", file=sys.stderr)
-        return run_index_step(cfg)
+        return run_index_step(cfg, force=force)
     return 0
