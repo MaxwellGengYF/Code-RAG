@@ -62,9 +62,15 @@ class CompileReport:
     dry_run: bool = False
     est_input_tokens: int = 0
     est_output_tokens: int = 0
+    #: pages whose corpus is a heuristic fallback and should be retried later
+    needs_regen: set[str] = field(default_factory=set)
+    #: pages the final manifest claims as processed (set by finalize)
+    pages_claimed: int = 0
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items()}
+        out = dict(self.__dict__)
+        out["needs_regen"] = sorted(out.get("needs_regen", ()))
+        return out
 
 
 # --------------------------------------------------------------------------------------
@@ -101,10 +107,134 @@ def make_expected_gen_key(shards: Sequence[ProviderShard]) -> Callable[[str], st
     return lambda rel: keys[shard_index(rel, len(keys))]
 
 
+def valid_gen_keys(shards: Sequence[ProviderShard]) -> set[str]:
+    """Every gen_key the current fleet can legitimately produce.
+
+    Used by :func:`plan_work` to decide whether a page's stored corpus is still
+    valid. Set membership (rather than an exact per-shard match) is what makes
+    cross-provider failover safe: a page served by a backup provider after its
+    primary died keeps a valid key and is not pointlessly regenerated.
+    """
+    return {s.gen_key for s in shards}
+
+
 def set_gen_key(shards: Sequence[ProviderShard]) -> str:
     """Manifest-level marker for a multi-provider build (informational only;
     per-page validity is tracked in ``page_gen_keys``)."""
     return "|".join(sorted({s.gen_key for s in shards}))
+
+
+# --------------------------------------------------------------------------------------
+# provider pool: circuit breaker + cross-provider failover
+# --------------------------------------------------------------------------------------
+
+#: consecutive hard API failures before a provider is tripped open
+CIRCUIT_THRESHOLD = 12
+#: how long a tripped provider stays out of rotation before a probe (seconds).
+#: Deliberately short: 429 throttling recovers in seconds, and even a kimi-style
+#: 5-hour quota window is better re-probed every few minutes (one wasted request
+#: per probe) than assumed dead for the rest of the run.
+CIRCUIT_COOLDOWN = 180.0
+
+
+class ProviderPool:
+    """Per-provider circuit breakers with automatic failover.
+
+    Rationale (learned the hard way on a 44k-page build): several of these
+    gateways die mid-run — exhausted 5-hour quota windows (kimi: 403
+    access_terminated), revoked model access (403 AccessDenied.Unpurchased).
+    Without failover every page assigned to a dead provider silently degrades to
+    the aux-less heuristic fallback while still being marked complete.
+
+    So: after CIRCUIT_THRESHOLD consecutive hard API failures a provider is
+    tripped open; its pages are served by the next healthy provider (which
+    records ITS gen_key — the per-page key registry keeps that honest). After
+    CIRCUIT_COOLDOWN one request is let through as a probe; success closes the
+    circuit again.
+
+    Note the pool deliberately ignores shard_index: assignment is dynamic.
+    Determinism of *content* comes from the page markdown, not from which model
+    chunked it; determinism of *incrementality* comes from page_gen_keys.
+    """
+
+    def __init__(self, shards: Sequence[ProviderShard], *,
+                 threshold: int = CIRCUIT_THRESHOLD,
+                 cooldown: float = CIRCUIT_COOLDOWN):
+        self.shards = list(shards)
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self.failures = [0] * len(shards)   # consecutive hard API failures
+        self.opened_at: list[float | None] = [None] * len(shards)
+        self.trips = [0] * len(shards)     # times tripped open (diagnostics)
+        self.served = [0] * len(shards)    # pages actually generated (diagnostics)
+
+    def is_open(self, i: int, now: float) -> bool:
+        """True when provider *i* must be skipped right now."""
+        if self.opened_at[i] is None:
+            return False
+        if now - self.opened_at[i] >= self.cooldown:
+            return False  # half-open: allow a probe request through
+        return True
+
+    def healthy_indices(self, now: float | None = None) -> list[int]:
+        now = time.time() if now is None else now
+        out = [i for i in range(len(self.shards)) if not self.is_open(i, now)]
+        return out
+
+    def pick(self, preferred: int, now: float | None = None) -> int | None:
+        """Provider to use: *preferred* when healthy, else the next healthy one.
+
+        Returns None when every provider is tripped (caller should then fall
+        back — and the page is left flagged needs_regen for a later run).
+        """
+        now = time.time() if now is None else now
+        if not self.is_open(preferred, now):
+            return preferred
+        for i in self.healthy_indices(now):
+            return i
+        return None
+
+    def order(self, preferred: int, now: float | None = None) -> list[int]:
+        """Candidate providers to try in order: *preferred* first (when healthy),
+        then every other healthy one.
+
+        Empty when all circuits are open and still cooling down — the caller must
+        then fall back instead of burning requests on providers known to be down.
+        """
+        now = time.time() if now is None else now
+        out: list[int] = []
+        if not self.is_open(preferred, now):
+            out.append(preferred)
+        for i in self.healthy_indices(now):
+            if i != preferred:
+                out.append(i)
+        return out
+
+    def record_success(self, i: int) -> None:
+        if self.opened_at[i] is not None:
+            log.info("provider %s circuit CLOSED again after probe",
+                     self.shards[i].model)
+        self.failures[i] = 0
+        self.opened_at[i] = None
+        self.served[i] += 1
+
+    def record_api_failure(self, i: int, now: float | None = None) -> None:
+        self.failures[i] += 1
+        if self.opened_at[i] is None and self.failures[i] >= self.threshold:
+            self.opened_at[i] = time.time() if now is None else now
+            self.trips[i] += 1
+            log.warning("provider %s circuit OPEN after %d consecutive API "
+                        "failures; its pages fail over to healthy providers for "
+                        "%.0fs", self.shards[i].model, self.failures[i],
+                        self.cooldown)
+
+    def summary(self) -> str:
+        parts = []
+        for i, s in enumerate(self.shards):
+            state = "OPEN" if self.opened_at[i] is not None else "ok"
+            parts.append(f"{s.model}: served={self.served[i]} trips={self.trips[i]} "
+                         f"state={state}")
+        return " | ".join(parts)
 
 
 # --------------------------------------------------------------------------------------
@@ -117,32 +247,51 @@ def plan_work(
     store: CorpusStore,
     diff: ManifestDiff,
     *,
-    expected_gen_key: Callable[[str], str] | None = None,
+    valid_gen_keys: set[str] | None = None,
     force: bool = False,
     regen: bool = False,
     only: str | None = None,
     max_files: int | None = None,
 ) -> list[str]:
-    """Pages needing (re)generation, sorted for determinism."""
+    """Pages needing (re)generation, sorted for determinism.
+
+    A page is requeued when any of:
+      * it is new or its html changed (the md5 diff);
+      * its corpus file is missing (stat-only check);
+      * its recorded gen_key is not among *valid_gen_keys* — i.e. it was built
+        with a stale prompt/extractor/schema version, or by a provider no longer
+        in the fleet. Set membership (not an exact per-shard match) is what makes
+        cross-provider failover safe: a page served by a backup provider after
+        its primary died is NOT pointlessly regenerated.
+      * it is flagged ``needs_regen`` in the manifest (heuristic fallback).
+
+    Bumping PROMPT_VERSION / EXTRACTOR_VERSION / SCHEMA_VERSION, or changing the
+    provider fleet's models, changes every valid key → full regeneration.
+    """
     if only:
         rel = only.replace("\\", "/").lstrip("./")
         if rel not in fm.scan():
             raise SystemExit(f"--only {only!r}: not an html page under {fm.dirs}")
         return [rel]
+    candidates = sorted(diff.added + diff.changed + diff.unchanged) \
+        if (force or regen) else sorted(diff.added + diff.changed)
     if force or regen:
-        return sorted(diff.added + diff.changed + diff.unchanged)[:max_files] if max_files \
-            else sorted(diff.added + diff.changed + diff.unchanged)
-    work = sorted(diff.added + diff.changed)
-    # Requeue: corpus file missing/corrupt, or generated with a different key
-    # (prompt/model/extractor/schema bump, or a different provider shard).
+        return candidates[:max_files] if max_files else candidates
+
     manifest = fm.load_manifest()
     page_gen_keys = manifest.get("page_gen_keys", {})
+    needs_regen = set(manifest.get("needs_regen", []))
+
+    work = list(candidates)
     for rel in diff.unchanged:
-        if store.missing_or_corrupt(rel):
+        if rel in needs_regen:
             work.append(rel)
-        elif expected_gen_key is not None and page_gen_keys.get(rel) != expected_gen_key(rel):
+        elif store.missing(rel):
             work.append(rel)
-    return sorted(set(work))[:max_files] if max_files else sorted(set(work))
+        elif valid_gen_keys is not None and page_gen_keys.get(rel) not in valid_gen_keys:
+            work.append(rel)
+    work = sorted(set(work))
+    return work[:max_files] if max_files else work
 
 
 # --------------------------------------------------------------------------------------
@@ -189,15 +338,21 @@ async def run_corpus_compile(
     workers_per_provider: int = 4,
     failures_path: Path | None = None,
     progress: bool = True,
+    circuit_threshold: int = CIRCUIT_THRESHOLD,
+    circuit_cooldown: float = CIRCUIT_COOLDOWN,
 ) -> CompileReport:
     store = CorpusStore(fm.corpus_dir)
     report = CompileReport(pages_total=len(scanned), pages_planned=len(work))
     t0 = time.time()
-    processed: dict[str, str] = {}  # rel -> gen_key actually used
+    processed: dict[str, str] = {}   # rel -> gen_key actually used
+    needs_regen: set[str] = set()    # heuristic-fallback pages (retry next run)
+    pool = ProviderPool(shards, threshold=circuit_threshold,
+                        cooldown=circuit_cooldown)
     sems = [asyncio.Semaphore(workers_per_provider) for _ in shards]
     done_counter = 0
     lock = asyncio.Lock()
-    expected = make_expected_gen_key(shards)
+    max_chunk_chars = cfg.get("max_chunk_chars", 1200)
+    max_input_chars = cfg.get("max_input_chars", 24_000)
 
     if failures_path is None:
         failures_path = fm.corpus_dir / "failures.jsonl"
@@ -206,54 +361,141 @@ async def run_corpus_compile(
         with open(failures_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+    def checkpoint() -> None:
+        """Merge this run's progress into the manifest (atomic tmp+rename).
+
+        Only actually-processed pages are claimed, and entries from earlier
+        partial runs survive — so an interrupted run resumes exactly where it
+        stopped instead of silently marking unprocessed pages done.
+        """
+        old = fm.load_manifest()
+        # Carry the previous fallback set forward, add this run's fallbacks, then
+        # drop every page this run regenerated successfully (it is in `processed`
+        # but not in the local `needs_regen` set).
+        still_flagged = (set(old.get("needs_regen", [])) | needs_regen) - (
+            set(processed) - needs_regen)
+        fm.save_manifest(
+            {**old.get("files", {}), **{r: scanned[r] for r in processed}},
+            set_gen_key(shards), dict(shards[0].gen_parts),
+            page_gen_keys={**old.get("page_gen_keys", {}), **processed},
+            needs_regen=still_flagged,
+        )
+
     async def one(rel: str) -> None:
         nonlocal done_counter
-        shard = shards[shard_index(rel, len(shards))]
-        async with sems[shard_index(rel, len(shards))]:
-            page = await asyncio.to_thread(
-                extract_page, fm.root / rel, root=fm.root,
-                max_chars=cfg.get("max_input_chars", 24_000))
-            if page is None:
-                corpus, stats = _empty_page_corpus(rel, scanned[rel], shard.gen_key)
-            else:
-                corpus, stats = await generate_page_corpus(
-                    shard.client, page, gen_key=shard.gen_key,
-                    html_md5=scanned[rel],
-                    max_chunk_chars=cfg.get("max_chunk_chars", 1200))
-            store.save(rel, corpus.to_json_dict())
-            async with lock:
-                processed[rel] = shard.gen_key
-                report.pages_done += 1
-                report.chunks += len(corpus.chunks)
-                report.input_tokens += stats.input_tokens
-                report.output_tokens += stats.output_tokens
-                report.first_try += int(stats.first_try_valid)
-                report.repaired += int(stats.repaired and not stats.first_try_valid)
-                report.fallback += int(stats.fallback)
-                if stats.fallback or stats.errors:
-                    report.failures.append({"source": rel, "errors": stats.errors[:6]})
-                    await asyncio.to_thread(write_failure,
-                                            {"source": rel, "errors": stats.errors})
-                done_counter += 1
-                if done_counter % CHECKPOINT_EVERY == 0:
-                    # Checkpoint processed pages MERGED with the existing
-                    # manifest: (a) only actually-processed pages are claimed
-                    # (an interrupted run must leave the rest "added"), and
-                    # (b) entries from earlier partial runs survive.
-                    old = fm.load_manifest()
-                    files_ckpt = {**old.get("files", {}),
-                                  **{rel: scanned[rel] for rel in processed}}
-                    keys_ckpt = {**old.get("page_gen_keys", {}), **processed}
-                    fm.save_manifest(files_ckpt, set_gen_key(shards),
-                                     dict(shards[0].gen_parts),
-                                     page_gen_keys=keys_ckpt)
-                if progress and report.pages_done % 50 == 0:
-                    print(f"  [{report.pages_done}/{len(work)}] "
-                          f"{time.time() - t0:.0f}s", file=sys.stderr)
+        page = await asyncio.to_thread(extract_page, fm.root / rel, root=fm.root,
+                                       max_chars=max_input_chars)
+        preferred = shard_index(rel, len(shards))
 
-    await asyncio.gather(*(one(rel) for rel in work))
+        if page is None:
+            # Nothing an LLM can do: record an empty corpus, no fallback flag.
+            shard = shards[preferred]
+            corpus, stats = _empty_page_corpus(rel, scanned[rel], shard.gen_key)
+        else:
+            corpus = None
+            stats = None
+            # Walk the healthy candidate list; on a hard API failure move to the
+            # next provider (its gen_key is recorded, which keeps the per-page
+            # key registry honest under failover).
+            for idx in pool.order(preferred):
+                shard = shards[idx]
+                async with sems[idx]:
+                    corpus, stats = await generate_page_corpus(
+                        shard.client, page, gen_key=shard.gen_key,
+                        html_md5=scanned[rel], max_chunk_chars=max_chunk_chars)
+                if stats.api_failed:
+                    pool.record_api_failure(idx)
+                    corpus = stats = None
+                    continue
+                pool.record_success(idx)
+                break
+            if corpus is None:  # every provider tripped open
+                corpus, stats = _all_providers_down(page, scanned[rel],
+                                                    shards[preferred].gen_key)
+
+        used_key = corpus.gen_key
+
+        # Heuristic-fallback pages (API death or unparseable output) are still
+        # written so search works, but flagged so a later run retries them.
+        # Pages with no extractable content are permanently empty — flagging
+        # those would requeue them forever, so they are excluded.
+        is_fallback = (page is not None and stats.fallback
+                       and not stats.first_try_valid and not stats.repaired)
+        if is_fallback:
+            corpus.needs_regen = True
+            needs_regen.add(rel)
+
+        store.save(rel, corpus.to_json_dict())
+        async with lock:
+            processed[rel] = used_key
+            report.pages_done += 1
+            report.chunks += len(corpus.chunks)
+            report.input_tokens += stats.input_tokens
+            report.output_tokens += stats.output_tokens
+            report.first_try += int(stats.first_try_valid)
+            report.repaired += int(stats.repaired and not stats.first_try_valid)
+            report.fallback += int(is_fallback)
+            if stats.fallback or stats.errors:
+                report.failures.append({"source": rel, "errors": stats.errors[:6]})
+                await asyncio.to_thread(write_failure,
+                                        {"source": rel, "errors": stats.errors})
+            done_counter += 1
+            if done_counter % CHECKPOINT_EVERY == 0:
+                checkpoint()
+            if progress and report.pages_done % 50 == 0:
+                print(f"  [{report.pages_done}/{len(work)}] "
+                      f"{time.time() - t0:.0f}s", file=sys.stderr)
+
+    # Bounded worker pool: keeps memory flat on a 44k-page work list instead of
+    # materialising one coroutine per page up front.
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    for rel in work:
+        queue.put_nowait(rel)
+    n_workers = max(1, workers_per_provider * len(shards))
+
+    async def worker() -> None:
+        while True:
+            try:
+                rel = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return  # queue is pre-filled; empty means the run is over
+            try:
+                await one(rel)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # never let one page kill the run
+                log.error("page %s failed hard: %s", rel, exc)
+                async with lock:
+                    report.failures.append({"source": rel,
+                                            "errors": [f"hard error: {exc}"]})
+
+    await asyncio.gather(*(worker() for _ in range(n_workers)))
+    checkpoint()
     report.wall_s = time.time() - t0
+    report.needs_regen = set(needs_regen)
+    if progress:
+        print(f"[corpus] providers: {pool.summary()}", file=sys.stderr)
+        if needs_regen:
+            print(f"[corpus] {len(needs_regen)} pages fell back to heuristic "
+                  f"chunks and are flagged needs_regen — rerun compile to retry "
+                  f"them (they are still indexed meanwhile)", file=sys.stderr)
     return report
+
+
+def _all_providers_down(page, html_md5: str, gen_key: str):
+    """Heuristic corpus for a page no provider could serve (all circuits open).
+
+    Flagged needs_regen so the next run retries it with real LLM chunks.
+    """
+    from rag.corpus.generate import PageGenStats, _fallback_corpus
+
+    stats = PageGenStats(source=page.source)
+    stats.fallback = True
+    stats.api_failed = True
+    stats.errors.append("fallback: all providers unavailable (circuits open)")
+    corpus = _fallback_corpus(page, gen_key)
+    corpus.html_md5 = html_md5
+    return corpus, stats
 
 
 def _empty_page_corpus(rel: str, html_md5: str, gen_key: str) -> tuple[PageCorpus, Any]:
@@ -269,12 +511,35 @@ def _empty_page_corpus(rel: str, html_md5: str, gen_key: str) -> tuple[PageCorpu
 
 def finalize(fm: FileManager, diff: ManifestDiff, files_state: dict[str, str],
              page_gen_keys: dict[str, str], gen_key: str, gen_parts: dict,
-             report: CompileReport) -> None:
-    """Prune removed pages and write the final manifest."""
+             report: CompileReport, *,
+             needs_regen: set[str] | None = None) -> None:
+    """Prune removed pages and write the final manifest.
+
+    Two honesty rules, both of which make the manifest self-healing:
+
+    1. A page is only claimed as processed when its corpus file actually exists.
+       Callers pass the full scan, so a ``--max-files 100`` run would otherwise
+       mark all 43k pages done and the rest would never be generated.
+    2. The heuristic-fallback flag set is taken from the manifest already on
+       disk: :func:`run_corpus_compile` checkpoints the correctly merged value
+       (previous flags, plus this run's fallbacks, minus pages regenerated
+       successfully). Re-deriving it from ``page_gen_keys`` would be wrong
+       because callers pass a merged dict covering every page ever processed.
+    """
     fm.prune(diff.removed)
     report.pruned = len(diff.removed)
-    fm.save_manifest(files_state, gen_key, gen_parts,
-                     page_gen_keys=page_gen_keys)
+
+    store = CorpusStore(fm.corpus_dir)
+    old_files = fm.load_manifest().get("files", {})
+    honest_files = {rel: md5 for rel, md5 in files_state.items()
+                    if rel in old_files or store.exists(rel)}
+    honest_keys = {rel: k for rel, k in page_gen_keys.items() if rel in honest_files}
+
+    flagged = (set(fm.load_manifest().get("needs_regen", []))
+               if needs_regen is None else set(needs_regen))
+    fm.save_manifest(honest_files, gen_key, gen_parts,
+                     page_gen_keys=honest_keys, needs_regen=flagged)
+    report.pages_claimed = len(honest_files)
 
 
 def print_report(report: CompileReport, out=sys.stdout) -> None:
@@ -288,6 +553,9 @@ def print_report(report: CompileReport, out=sys.stdout) -> None:
           file=out)
     print(f"pruned corpus files={report.pruned}", file=out)
     print(f"wall time: {report.wall_s:.0f}s", file=out)
+    if report.needs_regen:
+        print(f"needs_regen: {len(report.needs_regen)} pages fell back to "
+              f"heuristic chunks — rerun compile to retry them", file=out)
     if report.failures:
         print(f"pages with errors/fallback: {len(report.failures)} (see "
               f"corpus/failures.jsonl)", file=out)

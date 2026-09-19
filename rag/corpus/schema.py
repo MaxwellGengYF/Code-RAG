@@ -62,7 +62,13 @@ class CorpusChunk(msgspec.Struct, kw_only=True):
 
 
 class PageCorpus(msgspec.Struct, kw_only=True):
-    """Per-page corpus file — the unit of incremental regeneration."""
+    """Per-page corpus file — the unit of incremental regeneration.
+
+    ``needs_regen`` marks heuristic-fallback pages (the LLM never produced a
+    usable corpus): they are still indexed so search works, but every later
+    compile run retries them. Additive field with a default, so files written
+    before it decode unchanged — SCHEMA_VERSION is deliberately NOT bumped.
+    """
 
     source: str  # ROOT-relative posix
     title: str
@@ -70,6 +76,7 @@ class PageCorpus(msgspec.Struct, kw_only=True):
     gen_key: str
     generated_at: str  # ISO8601
     schema_version: str = SCHEMA_VERSION
+    needs_regen: bool = False
     chunks: list[CorpusChunk] = []
 
     def to_json_dict(self) -> dict:

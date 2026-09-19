@@ -97,6 +97,15 @@ class CorpusStore:
             return True
         return False
 
+    def missing(self, rel: str) -> bool:
+        """Stat-only existence check (no JSON parse) — fast enough to run over
+        the whole corpus during planning."""
+        return not self.exists(rel)
+
+    def set_of_missing(self, rels) -> set[str]:
+        """Subset of *rels* whose corpus file is absent (stat-only)."""
+        return {r for r in rels if not self.exists(r)}
+
     def iterate_all(self) -> Iterator[tuple[str, dict]]:
         """Yield (rel, data) for every corpus file, sorted by rel.
 

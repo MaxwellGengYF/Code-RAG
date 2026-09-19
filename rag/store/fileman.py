@@ -63,7 +63,8 @@ def _md5_hex(path: Path) -> str:
 
 def _empty_manifest() -> dict[str, Any]:
     """The manifest equivalent to "nothing generated yet"."""
-    return {"files": {}, "gen_key": "", "version": MANIFEST_VERSION}
+    return {"files": {}, "gen_key": "", "version": MANIFEST_VERSION,
+            "page_gen_keys": {}, "needs_regen": []}
 
 
 class FileManager:
@@ -143,6 +144,8 @@ class FileManager:
             data["files"] = {}
         if not isinstance(data.get("page_gen_keys"), dict):
             data["page_gen_keys"] = {}
+        if not isinstance(data.get("needs_regen"), list):
+            data["needs_regen"] = []
         return data
 
     def diff(self, scanned: dict[str, str] | None = None) -> ManifestDiff:
@@ -189,6 +192,7 @@ class FileManager:
         gen_key: str,
         gen_parts: dict,
         page_gen_keys: dict[str, str] | None = None,
+        needs_regen: set[str] | None = None,
     ) -> None:
         """Atomically persist the manifest.
 
@@ -197,6 +201,9 @@ class FileManager:
         are stored alongside the key so :meth:`current_gen_key` can recompute it.
         ``page_gen_keys`` records the gen_key each page was generated with (needed
         when one compile shards pages across several providers/models).
+        ``needs_regen`` lists pages whose corpus is a heuristic fallback (the LLM
+        never produced a usable result, e.g. a dead provider): they stay indexed but
+        every later run retries them.
         """
         self.corpus_dir.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -205,6 +212,7 @@ class FileManager:
             "gen_parts": dict(gen_parts),
             "files": dict(files),
             "page_gen_keys": dict(page_gen_keys or {}),
+            "needs_regen": sorted(needs_regen or ()),
         }
         tmp = self.manifest_path.parent / (self.manifest_path.name + ".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:

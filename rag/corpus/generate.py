@@ -45,6 +45,7 @@ class PageGenStats:
     first_try_valid: bool = False
     repaired: bool = False
     fallback: bool = False
+    api_failed: bool = False  # at least one attempt died on an API error
     dropped_chunks: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -191,7 +192,12 @@ async def generate_page_corpus(
         try:
             result = await call(user_prompt)
         except Exception as exc:  # API failed even after retries
+            stats.api_failed = True
             stats.errors.append(f"api error (attempt {attempt}): {exc}")
+            if attempt == 1:
+                # give the provider one more shot (it may have been a blip);
+                # if it fails again we fall through to the heuristic fallback
+                continue
             break
         try:
             obj = extract_json_object(result.text)
