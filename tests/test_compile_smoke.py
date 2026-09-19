@@ -326,3 +326,90 @@ def test_estimate_thinking_ratio_is_higher():
     _in_plain, out_plain = estimate_tokens([FakePage()], "", thinking=False)
     _in_think, out_think = estimate_tokens([FakePage()], "", thinking=True)
     assert out_think > out_plain, "thinking must estimate more output tokens"
+
+
+# --------------------------------------------------------------------------------------
+# --dry-run: must be cheap (sampled) and must never call the LLM
+# --------------------------------------------------------------------------------------
+
+
+def _write_provider(tmp_path, model="dry-model"):
+    """A provider config pointing at a host that cannot resolve, so any accidental
+    LLM call would fail loudly rather than silently succeed."""
+    p = tmp_path / "prov.json"
+    p.write_text(json.dumps({
+        "model": model, "type": "openai_legacy", "api_key": "sk-test",
+        "url": "http://127.0.0.1:1/v1",  # closed port: connection refused
+        "max_tokens": 1000,
+    }), encoding="utf-8")
+    return p
+
+
+async def test_dry_run_never_calls_llm(tmp_path, monkeypatch):
+    from rag.compile import run_corpus_step
+
+    root = make_site(tmp_path / "site", 30)
+    corpus_dir = tmp_path / "corpus"
+    prov = _write_provider(tmp_path)
+    cfg = {"corpus_dir": str(corpus_dir),
+           "dirs": [str(root / "ScriptReference")],
+           "max_input_chars": 24000, "max_chunk_chars": 1200}
+    # FileManager resolves dirs against root; point rag's resolve_path at tmp root
+    import rag.compile as rc
+    monkeypatch.setattr(rc, "resolve_path", lambda p=".", *a, **k: (root if str(p) == "." else root / str(p)))
+
+    calls = {"n": 0}
+
+    async def no_llm(*a, **k):
+        calls["n"] += 1
+        raise AssertionError("dry-run must not call the LLM")
+
+    monkeypatch.setattr("rag.llm.create_llm", lambda *a, **k: no_llm)
+
+    report = await run_corpus_step(cfg, [str(prov)], workers=2, max_files=None,
+                                   force=False, regen=False, only=None,
+                                   dry_run=True, no_thinking=True,
+                                   price_in=None, price_out=None)
+    assert report.dry_run is True
+    assert calls["n"] == 0
+    assert report.pages_planned == 30
+    assert report.est_input_tokens > 0 and report.est_output_tokens > 0
+
+
+async def test_dry_run_samples_large_work_lists(tmp_path, monkeypatch):
+    """A large work list must be SAMPLED, not fully extracted (dry-run must be cheap)."""
+    from rag.compile import run_corpus_step
+
+    n = 600
+    root = make_site(tmp_path / "site", n)
+    corpus_dir = tmp_path / "corpus"
+    prov = _write_provider(tmp_path)
+    cfg = {"corpus_dir": str(corpus_dir),
+           "dirs": [str(root / "ScriptReference")],
+           "max_input_chars": 24000, "max_chunk_chars": 1200}
+    import rag.compile as rc
+    monkeypatch.setattr(rc, "resolve_path", lambda p=".", *a, **k: (root if str(p) == "." else root / str(p)))
+    monkeypatch.setattr("rag.llm.create_llm",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM in dry-run")))
+
+    extracted = {"n": 0}
+    import rag.corpus.extract as ex
+    real_extract = ex.extract_page
+
+    def counting_extract(*a, **k):
+        extracted["n"] += 1
+        return real_extract(*a, **k)
+
+    monkeypatch.setattr(rc, "extract_page", counting_extract, raising=False)
+    monkeypatch.setattr("rag.corpus.extract_page", counting_extract)
+
+    report = await run_corpus_step(cfg, [str(prov)], workers=2, max_files=None,
+                                   force=False, regen=False, only=None,
+                                   dry_run=True, no_thinking=True,
+                                   price_in=None, price_out=None)
+    assert report.pages_planned == n
+    # sampled at the cap, not all n pages
+    print(f"OBSERVED extracted={extracted['n']} planned={report.pages_planned}")
+    assert extracted["n"] <= 200, f"extracted {extracted['n']} pages; dry-run must sample"
+    assert extracted["n"] > 0, "sampling must still extract SOME pages"
+    assert report.est_input_tokens > 0

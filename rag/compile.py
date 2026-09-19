@@ -145,18 +145,42 @@ async def run_corpus_step(
 
     sys_p = system_prompt(cfg.get("max_chunk_chars", 1200))
     if dry_run:
-        t0 = __import__("time").time()
-        pages = []
+        import random
+        import time as _time
         from rag.corpus import extract_page
-        for rel in work:
+
+        t0 = _time.time()
+        # Dry-run must stay CHEAP: extracting all 43k pages takes minutes (158 s
+        # measured alone, far longer while a build competes for CPU), which
+        # defeats the point of a preview. Sample a bounded set and extrapolate by
+        # mean page size — the estimator is calibrated on means anyway, so the
+        # extrapolation is as accurate as extracting everything, just not exact to
+        # the page. Small work lists (< sample cap) are extracted in full.
+        cap = 200
+        if len(work) <= cap:
+            sample = list(work)
+            sampled = False
+        else:
+            sample = random.Random(0).sample(work, cap)
+            sampled = True
+        pages = []
+        for rel in sample:
             p = extract_page(fm.root / rel, root=fm.root,
                              max_chars=cfg.get("max_input_chars", 24_000))
             if p:
                 pages.append(p)
+        if not pages:
+            print("[dry-run] no extractable pages in the sample", file=sys.stderr)
+            return report
         est_in, est_out = estimate_tokens(pages, sys_p, thinking=not no_thinking)
+        if sampled and pages:
+            scale = len(work) / len(pages)
+            est_in, est_out = int(est_in * scale), int(est_out * scale)
         report.est_input_tokens, report.est_output_tokens = est_in, est_out
-        print(f"[dry-run] {len(pages)} pages to regenerate "
-              f"(extraction took {__import__('time').time() - t0:.0f}s)")
+        scope = (f"extrapolated from {len(pages)} sampled pages" if sampled
+                 else f"from all {len(pages)} pages")
+        print(f"[dry-run] {len(work):,} pages to regenerate ({scope}, "
+              f"extraction took {_time.time() - t0:.0f}s)")
         print(report_cost(est_in, est_out, price_in, price_out))
         return report
 
