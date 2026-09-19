@@ -70,11 +70,10 @@ def test_resume_skips_completed_rows(fake_model, tmp_path):
     chunks, titles = make_chunks(20)
     out = tmp_path / "vectors.f32"
 
-    # first pass: stop after 8 rows by faking a truncated file
+    # first pass: embed only the first 8 rows (simulates a killed run)
     vi.build_vectors_resumable(chunks[:8], titles[:8], out_path=out, dim=8,
                                batch_size=4, stamp="sha-abc", progress_every=0,
                                log=lambda *_: None)
-    assert out.stat().st_size == 8 * 8 * 4
     before = len(fake_model.calls)
 
     # now build the full 20 with the same stamp: rows 0-7 must be reused
@@ -85,6 +84,55 @@ def test_resume_skips_completed_rows(fake_model, tmp_path):
     embedded = [t for call in fake_model.calls[before:] for t in call]
     assert len(embedded) == 12, f"expected only the 12 remaining rows, got {len(embedded)}"
     assert "text body number 0 for testing" not in " ".join(embedded)
+    # and no row is left as pre-allocated zeros
+    norms = np.linalg.norm(np.asarray(mat), axis=1)
+    assert np.all(norms > 0), "some rows were never embedded"
+
+
+def test_interrupted_full_size_file_is_not_treated_as_complete(fake_model, tmp_path):
+    """Regression: a killed embed leaves a FULL-SIZE file whose tail is zeros.
+
+    The file is pre-allocated to n*dim*4 bytes so the memmap is addressable, so
+    file size cannot distinguish 'done' from 'stopped at row k'. Trusting size
+    shipped 5,444 zero vectors in a real 10,788-row build. Progress must come from
+    the sidecar, and a missing sidecar must force a rebuild.
+    """
+    chunks, titles = make_chunks(20)
+    out = tmp_path / "vectors.f32"
+    progress = Path(str(out) + ".progress")
+
+    vi.build_vectors_resumable(chunks[:8], titles[:8], out_path=out, dim=8,
+                               batch_size=4, stamp="sha-abc", progress_every=0,
+                               log=lambda *_: None)
+    # grow the file to its FINAL size without embedding rows 8-19, then delete the
+    # progress record: exactly the state a killed run leaves behind
+    with open(out, "ab") as fh:
+        fh.truncate(20 * 8 * 4)
+    assert out.stat().st_size == 20 * 8 * 4
+    progress.unlink()
+
+    msgs = []
+    calls_before = len(fake_model.calls)
+    mat = vi.build_vectors_resumable(chunks, titles, out_path=out, dim=8,
+                                     batch_size=4, stamp="sha-abc",
+                                     progress_every=0, log=msgs.append)
+    assert any("no progress record" in m for m in msgs), msgs
+    embedded = [t for call in fake_model.calls[calls_before:] for t in call]
+    assert len(embedded) == 20, "must rebuild every row, not trust the file size"
+    norms = np.linalg.norm(np.asarray(mat), axis=1)
+    assert np.all(norms > 0), "zero-vector rows survived"
+
+
+def test_progress_sidecar_records_rows(fake_model, tmp_path):
+    chunks, titles = make_chunks(10)
+    out = tmp_path / "vectors.f32"
+    vi.build_vectors_resumable(chunks, titles, out_path=out, dim=8, batch_size=4,
+                               stamp="sha-x", progress_every=0, log=lambda *_: None)
+    progress = Path(str(out) + ".progress")
+    assert progress.exists()
+    parts = progress.read_text().split()
+    assert parts[0] == "sha-x"
+    assert int(parts[1]) == 10
 
 
 def test_resume_reports_progress(fake_model, tmp_path):

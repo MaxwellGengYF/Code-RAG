@@ -181,7 +181,8 @@ def build_indexes(cfg: dict, *, force: bool = False, skip_dense: bool = False,
         # A stale vectors.f32 from an earlier build would be positionally
         # misaligned with the freshly flattened rows (vectors carry no ids), so
         # remove it rather than let dense silently score the wrong chunks.
-        for stale in ("vectors.f32", "vectors.f32.stamp", "vector_meta.json"):
+        for stale in ("vectors.f32", "vectors.f32.stamp",
+                    "vectors.f32.progress", "vector_meta.json"):
             p = index_dir / stale
             if p.exists():
                 p.unlink()
