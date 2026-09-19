@@ -93,7 +93,35 @@ class SearchEngine:
                         f"compile --steps index --force")
             self.vectors = load_vectors(
                 vecs_path, dim=int(self.vector_meta["dim"]), count=count)
+        self._check_param_drift()
         self._loaded = True
+
+    def _check_param_drift(self) -> None:
+        """Warn when the index was built with different BM25 params than config.
+
+        Flipping ``bm25_aux`` or ``path_boost`` in rag_config.json without
+        rebuilding silently serves an index that does not match the config the
+        user thinks they set. Unlike a row-count mismatch (which is corruption)
+        this is only staleness, so warn rather than refuse.
+        """
+        manifest_path = self.index_dir / "manifest.json"
+        if not manifest_path.exists():
+            return
+        try:
+            built = json.loads(manifest_path.read_text(encoding="utf-8")).get("bm25")
+        except (json.JSONDecodeError, OSError):
+            return
+        if not built:
+            return
+        want_aux = bool(self.cfg.get("bm25_aux", False))
+        want_pb = int(self.cfg.get("path_boost", 3))
+        got_aux, got_pb = built.get("aux"), built.get("path_boost")
+        if got_aux != want_aux or got_pb != want_pb:
+            print(f"[search] WARNING: index was built with bm25 aux={got_aux} "
+                  f"path_boost={got_pb} but config asks for aux={want_aux} "
+                  f"path_boost={want_pb} — results reflect the OLD settings. "
+                  f"Rebuild with: uv run python rag.py compile --steps index "
+                  f"--force", file=sys.stderr)
 
     @property
     def has_dense(self) -> bool:

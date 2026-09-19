@@ -256,3 +256,62 @@ def test_bm25_mode_does_not_warn(tiny_index, capsys):
     cfg, rows = tiny_index
     SearchEngine(cfg).search("rigidbody velocity", k=3, mode="bm25")
     assert "no dense vectors" not in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------------------
+# BM25 param drift: index built with different settings than rag_config asks for
+# --------------------------------------------------------------------------------------
+
+
+def _write_index_manifest(index_dir, *, aux: bool, path_boost: int):
+    (index_dir / "manifest.json").write_text(json.dumps(
+        {"n_chunks": 1, "n_pages": 1, "corpus_gen_key": "gk",
+         "bm25": {"tokenizer": "word", "path_boost": path_boost, "aux": aux}}),
+        encoding="utf-8")
+
+
+def test_param_drift_warns(tiny_index, capsys):
+    """Flipping bm25_aux/path_boost without rebuilding must warn, not silently
+    serve results from the old settings."""
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    _write_index_manifest(Path(cfg["index_dir"]), aux=False, path_boost=3)
+
+    drifted = dict(cfg)
+    drifted["bm25_aux"] = True
+    drifted["path_boost"] = 5
+    SearchEngine(drifted).load()
+    err = capsys.readouterr().err
+    assert "WARNING: index was built with bm25 aux=False path_boost=3" in err
+    assert "--steps index --force" in err  # names the fix
+
+
+def test_no_warning_when_params_match(tiny_index, capsys):
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    _write_index_manifest(Path(cfg["index_dir"]), aux=False, path_boost=3)
+
+    cfg2 = dict(cfg)
+    cfg2["bm25_aux"] = False
+    cfg2["path_boost"] = 3
+    SearchEngine(cfg2).load()
+    assert "WARNING: index was built" not in capsys.readouterr().err
+
+
+def test_no_warning_without_index_manifest(tiny_index, capsys):
+    """A manifest-less index (older build) must not spuriously warn."""
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    assert not (Path(cfg["index_dir"]) / "manifest.json").exists()
+    SearchEngine(cfg).load()
+    assert "WARNING: index was built" not in capsys.readouterr().err
+
+
+def test_corrupt_index_manifest_does_not_crash(tiny_index, capsys):
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    (Path(cfg["index_dir"]) / "manifest.json").write_text("{not json",
+                                                          encoding="utf-8")
+    engine = SearchEngine(cfg)
+    engine.load()  # must not raise
+    assert engine.n_chunks == len(rows)
