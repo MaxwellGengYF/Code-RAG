@@ -141,6 +141,8 @@ class FileManager:
             return _empty_manifest()
         if not isinstance(data.get("files"), dict):
             data["files"] = {}
+        if not isinstance(data.get("page_gen_keys"), dict):
+            data["page_gen_keys"] = {}
         return data
 
     def diff(self, scanned: dict[str, str] | None = None) -> ManifestDiff:
@@ -181,12 +183,20 @@ class FileManager:
         except KeyError:
             return ""
 
-    def save_manifest(self, files: dict[str, str], gen_key: str, gen_parts: dict) -> None:
+    def save_manifest(
+        self,
+        files: dict[str, str],
+        gen_key: str,
+        gen_parts: dict,
+        page_gen_keys: dict[str, str] | None = None,
+    ) -> None:
         """Atomically persist the manifest.
 
         JSON is written to ``manifest.json.tmp`` (fsynced) and then os.replace-d over
         ``manifest.json``; *corpus_dir* is created when missing. The generation parts
         are stored alongside the key so :meth:`current_gen_key` can recompute it.
+        ``page_gen_keys`` records the gen_key each page was generated with (needed
+        when one compile shards pages across several providers/models).
         """
         self.corpus_dir.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -194,6 +204,7 @@ class FileManager:
             "gen_key": gen_key,
             "gen_parts": dict(gen_parts),
             "files": dict(files),
+            "page_gen_keys": dict(page_gen_keys or {}),
         }
         tmp = self.manifest_path.parent / (self.manifest_path.name + ".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:

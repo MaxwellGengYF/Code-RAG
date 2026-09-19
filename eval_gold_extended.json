@@ -1,0 +1,50 @@
+[
+  {
+    "query": "What is an example use case for the Spring Joint 2D?",
+    "gold": [
+      "Manual/2d-physics/joints/spring-joint-2d-fundamentals.html"
+    ]
+  },
+  {
+    "query": "How do I return a license if I've reached the activation limit?",
+    "gold": [
+      "Manual/ActivationFAQ.html"
+    ]
+  },
+  {
+    "query": "What does the Edge Radius property do on an Edge Collider 2D?",
+    "gold": [
+      "Manual/2d-physics/collider/edge-collider-2d-reference.html"
+    ]
+  },
+  {
+    "query": "What does a Rigidbody 2D component do?",
+    "gold": [
+      "Manual/2d-physics/rigidbody/introduction-to-rigidbody-2d.html"
+    ]
+  },
+  {
+    "query": "How do you enable Box Projection globally in the Built-In Render Pipeline?",
+    "gold": [
+      "Manual/AdvancedRefProbe.html"
+    ]
+  },
+  {
+    "query": "What does the Distance Joint 2D component do?",
+    "gold": [
+      "Manual/2d-physics/joints/distance-joint-2d-reference.html"
+    ]
+  },
+  {
+    "query": "How many active XR Origins are allowed in a scene?",
+    "gold": [
+      "Manual/AROverview.html"
+    ]
+  },
+  {
+    "query": "How many layers can objects use by default in the Physics Core 2D API?",
+    "gold": [
+      "Manual/2d-physics-api/2d-physics-api-collisions-enable.html"
+    ]
+  }
+]

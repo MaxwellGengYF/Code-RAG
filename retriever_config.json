@@ -12,5 +12,12 @@
   "dirs": ["Manual", "ScriptReference"],
   "index_path": "index_word.pkl",
   "ngram_index_path": "index.pkl",
-  "chunks_path": "chunks.pkl"
+  "chunks_path": "chunks.pkl",
+  "corpus_dir": "corpus",
+  "index_dir": "index",
+  "embed_model": "BAAI/bge-m3",
+  "dense_k": 200,
+  "rrf_k": 60,
+  "mode": "hybrid",
+  "rerank": false
 }

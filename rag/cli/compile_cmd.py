@@ -1,24 +1,28 @@
 """The ``compile`` command: LLM corpus generation with md5-incremental scheduling.
 
-Flow: scan → diff vs manifest → (gen_key change forces full regen) → async
-LLM generation with a worker semaphore → per-page corpus files (atomic) →
-checkpointed manifest flushes → failures.jsonl → final report.
+Flow: scan → diff vs manifest → (per-page gen_key mismatch forces regen) → async
+LLM generation with per-provider worker semaphores → per-page corpus files
+(atomic) → checkpointed manifest flushes → failures.jsonl → final report.
 
 Never aborts the run on per-page failures: a page that fails every LLM attempt
 falls back to heuristic chunking (see rag.corpus.generate) and is logged.
+
+Multi-provider sharding: pages are assigned to providers deterministically
+(md5(rel) % n_providers), which doubles throughput when two gateways are
+available and keeps reruns stable (a page always maps to the same provider).
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
-from rag import ROOT, resolve_path
 from rag.corpus import (
     EXTRACTOR_VERSION,
     SCHEMA_VERSION,
@@ -64,11 +68,11 @@ class CompileReport:
 
 
 # --------------------------------------------------------------------------------------
-# planning
+# generation keys + provider sharding
 # --------------------------------------------------------------------------------------
 
 
-def compute_gen_key(model: str) -> tuple[str, dict]:
+def gen_key_for_model(model: str) -> tuple[str, dict]:
     parts = {
         "prompt_version": PROMPT_VERSION,
         "model": model,
@@ -78,16 +82,46 @@ def compute_gen_key(model: str) -> tuple[str, dict]:
     return FileManager.gen_key(**parts), parts
 
 
+def shard_index(rel: str, n_shards: int) -> int:
+    """Deterministic provider assignment for one page."""
+    return int(hashlib.md5(rel.encode("utf-8")).hexdigest(), 16) % n_shards
+
+
+class ProviderShard:
+    """One provider's client + its generation key."""
+
+    def __init__(self, client: LLMClient, model: str):
+        self.client = client
+        self.model = model
+        self.gen_key, self.gen_parts = gen_key_for_model(model)
+
+
+def make_expected_gen_key(shards: Sequence[ProviderShard]) -> Callable[[str], str]:
+    keys = [s.gen_key for s in shards]
+    return lambda rel: keys[shard_index(rel, len(keys))]
+
+
+def set_gen_key(shards: Sequence[ProviderShard]) -> str:
+    """Manifest-level marker for a multi-provider build (informational only;
+    per-page validity is tracked in ``page_gen_keys``)."""
+    return "|".join(sorted({s.gen_key for s in shards}))
+
+
+# --------------------------------------------------------------------------------------
+# planning
+# --------------------------------------------------------------------------------------
+
+
 def plan_work(
     fm: FileManager,
     store: CorpusStore,
     diff: ManifestDiff,
     *,
+    expected_gen_key: Callable[[str], str] | None = None,
     force: bool = False,
     regen: bool = False,
     only: str | None = None,
     max_files: int | None = None,
-    gen_key_changed: bool = False,
 ) -> list[str]:
     """Pages needing (re)generation, sorted for determinism."""
     if only:
@@ -95,16 +129,20 @@ def plan_work(
         if rel not in fm.scan():
             raise SystemExit(f"--only {only!r}: not an html page under {fm.dirs}")
         return [rel]
-    if force or regen or gen_key_changed:
-        work = sorted(diff.added + diff.changed + diff.unchanged)
-    else:
-        work = sorted(diff.added + diff.changed)
-        # Requeue pages whose corpus file went missing / corrupt since the run.
-        work += [rel for rel in diff.unchanged if store.missing_or_corrupt(rel)]
-        work = sorted(set(work))
-    if max_files:
-        work = work[:max_files]
-    return work
+    if force or regen:
+        return sorted(diff.added + diff.changed + diff.unchanged)[:max_files] if max_files \
+            else sorted(diff.added + diff.changed + diff.unchanged)
+    work = sorted(diff.added + diff.changed)
+    # Requeue: corpus file missing/corrupt, or generated with a different key
+    # (prompt/model/extractor/schema bump, or a different provider shard).
+    manifest = fm.load_manifest()
+    page_gen_keys = manifest.get("page_gen_keys", {})
+    for rel in diff.unchanged:
+        if store.missing_or_corrupt(rel):
+            work.append(rel)
+        elif expected_gen_key is not None and page_gen_keys.get(rel) != expected_gen_key(rel):
+            work.append(rel)
+    return sorted(set(work))[:max_files] if max_files else sorted(set(work))
 
 
 # --------------------------------------------------------------------------------------
@@ -142,25 +180,24 @@ def report_cost(est_in: int, est_out: int, price_in: float | None,
 
 
 async def run_corpus_compile(
-    client: LLMClient,
+    shards: Sequence[ProviderShard],
     cfg: dict,
     *,
     work: list[str],
     scanned: dict[str, str],
     fm: FileManager,
-    gen_key: str,
-    gen_parts: dict[str, Any],
-    workers: int = 8,
+    workers_per_provider: int = 4,
     failures_path: Path | None = None,
     progress: bool = True,
 ) -> CompileReport:
     store = CorpusStore(fm.corpus_dir)
     report = CompileReport(pages_total=len(scanned), pages_planned=len(work))
     t0 = time.time()
-    processed: set[str] = set()
-    sem = asyncio.Semaphore(workers)
+    processed: dict[str, str] = {}  # rel -> gen_key actually used
+    sems = [asyncio.Semaphore(workers_per_provider) for _ in shards]
     done_counter = 0
     lock = asyncio.Lock()
+    expected = make_expected_gen_key(shards)
 
     if failures_path is None:
         failures_path = fm.corpus_dir / "failures.jsonl"
@@ -171,18 +208,21 @@ async def run_corpus_compile(
 
     async def one(rel: str) -> None:
         nonlocal done_counter
-        async with sem:
-            page = await asyncio.to_thread(extract_page, fm.root / rel, root=fm.root,
-                                           max_chars=cfg.get("max_input_chars", 24_000))
+        shard = shards[shard_index(rel, len(shards))]
+        async with sems[shard_index(rel, len(shards))]:
+            page = await asyncio.to_thread(
+                extract_page, fm.root / rel, root=fm.root,
+                max_chars=cfg.get("max_input_chars", 24_000))
             if page is None:
-                corpus, stats = _empty_page_corpus(rel, scanned[rel], gen_key)
+                corpus, stats = _empty_page_corpus(rel, scanned[rel], shard.gen_key)
             else:
                 corpus, stats = await generate_page_corpus(
-                    client, page, gen_key=gen_key, html_md5=scanned[rel],
+                    shard.client, page, gen_key=shard.gen_key,
+                    html_md5=scanned[rel],
                     max_chunk_chars=cfg.get("max_chunk_chars", 1200))
             store.save(rel, corpus.to_json_dict())
             async with lock:
-                processed.add(rel)
+                processed[rel] = shard.gen_key
                 report.pages_done += 1
                 report.chunks += len(corpus.chunks)
                 report.input_tokens += stats.input_tokens
@@ -196,11 +236,17 @@ async def run_corpus_compile(
                                             {"source": rel, "errors": stats.errors})
                 done_counter += 1
                 if done_counter % CHECKPOINT_EVERY == 0:
-                    # checkpoint only pages actually processed: an interrupted
-                    # run must leave unprocessed pages "added" for the resume
-                    fm.save_manifest(
-                        {rel: scanned[rel] for rel in processed},
-                        gen_key, gen_parts)
+                    # Checkpoint processed pages MERGED with the existing
+                    # manifest: (a) only actually-processed pages are claimed
+                    # (an interrupted run must leave the rest "added"), and
+                    # (b) entries from earlier partial runs survive.
+                    old = fm.load_manifest()
+                    files_ckpt = {**old.get("files", {}),
+                                  **{rel: scanned[rel] for rel in processed}}
+                    keys_ckpt = {**old.get("page_gen_keys", {}), **processed}
+                    fm.save_manifest(files_ckpt, set_gen_key(shards),
+                                     dict(shards[0].gen_parts),
+                                     page_gen_keys=keys_ckpt)
                 if progress and report.pages_done % 50 == 0:
                     print(f"  [{report.pages_done}/{len(work)}] "
                           f"{time.time() - t0:.0f}s", file=sys.stderr)
@@ -222,11 +268,13 @@ def _empty_page_corpus(rel: str, html_md5: str, gen_key: str) -> tuple[PageCorpu
 
 
 def finalize(fm: FileManager, diff: ManifestDiff, files_state: dict[str, str],
-             gen_key: str, gen_parts: dict, report: CompileReport) -> None:
+             page_gen_keys: dict[str, str], gen_key: str, gen_parts: dict,
+             report: CompileReport) -> None:
     """Prune removed pages and write the final manifest."""
     fm.prune(diff.removed)
     report.pruned = len(diff.removed)
-    fm.save_manifest(files_state, gen_key, gen_parts)
+    fm.save_manifest(files_state, gen_key, gen_parts,
+                     page_gen_keys=page_gen_keys)
 
 
 def print_report(report: CompileReport, out=sys.stdout) -> None:

@@ -108,6 +108,11 @@ class AnthropicClient:
             budget = _EFFORT_BUDGETS.get(effort, 4096)
             budget = min(budget, max(1024, max_tokens - 1))
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        else:
+            # Always say so explicitly: reasoning gateways default to server-side
+            # thinking when the field is absent (measured: 8k output tokens and
+            # ~100s per request on qwen3.8-flash vs ~300 tokens / ~5s when disabled).
+            kwargs["thinking"] = {"type": "disabled"}
 
         try:
             response = await self._client.messages.create(**kwargs)

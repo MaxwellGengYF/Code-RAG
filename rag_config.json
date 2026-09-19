@@ -18,5 +18,6 @@
   "embed_device": "auto",
   "max_input_chars": 24000,
   "max_chunk_chars": 1200,
-  "compile_workers": 8
+  "compile_workers": 4,
+  "llm_timeout": 180
 }

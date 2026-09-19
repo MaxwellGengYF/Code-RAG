@@ -16,13 +16,15 @@ from typing import Any
 from rag import resolve_path
 from rag.cli.compile_cmd import (
     CompileReport,
-    compute_gen_key,
+    ProviderShard,
     estimate_tokens,
     finalize,
+    make_expected_gen_key,
     plan_work,
     print_report,
     report_cost,
     run_corpus_compile,
+    set_gen_key,
 )
 from rag.corpus.prompts import system_prompt
 from rag.llm import ProviderConfig, create_llm
@@ -68,7 +70,7 @@ def run_deps(cfg: dict) -> int:
 
 async def run_corpus_step(
     cfg: dict,
-    provider: str,
+    providers: list[str],
     *,
     workers: int,
     max_files: int | None,
@@ -86,40 +88,46 @@ async def run_corpus_step(
     fm = FileManager(root=root, dirs=dirs, corpus_dir=corpus_dir)
     store = CorpusStore(corpus_dir)
 
-    pcfg = ProviderConfig.from_file(provider)
+    pconfigs = []
+    for provider in providers:
+        pcfg = ProviderConfig.from_file(provider)
+        if no_thinking:
+            # thinking roughly triples per-page latency on reasoning gateways;
+            # corpus chunking does not need it. Disabled by stripping the
+            # capability so clients send thinking.type=disabled explicitly.
+            pcfg = ProviderConfig(
+                model=pcfg.model, type=pcfg.type, base_url=pcfg.base_url,
+                api_key=pcfg.api_key, max_tokens=pcfg.max_tokens,
+                max_context_size=pcfg.max_context_size, thinking_effort=None,
+                capabilities=frozenset(), timeout=pcfg.timeout, env=pcfg.env,
+                path=pcfg.path, raw=pcfg.raw)
+        pconfigs.append(pcfg)
     if no_thinking:
-        # thinking roughly triples per-page latency on reasoning gateways; corpus
-        # chunking does not need it. Disabled by stripping the capability so the
-        # provider clients send thinking.type=disabled.
-        pcfg = ProviderConfig(
-            model=pcfg.model, type=pcfg.type, base_url=pcfg.base_url,
-            api_key=pcfg.api_key, max_tokens=pcfg.max_tokens,
-            max_context_size=pcfg.max_context_size, thinking_effort=None,
-            capabilities=frozenset(), timeout=pcfg.timeout, env=pcfg.env,
-            path=pcfg.path, raw=pcfg.raw)
         print("[corpus] thinking disabled (--no-thinking)", file=sys.stderr)
-    gen_key, gen_parts = compute_gen_key(pcfg.model)
+
     scanned = fm.scan()
     diff = fm.diff(scanned)
-    manifest = fm.load_manifest()
-    old_gen_key = fm.current_gen_key() or manifest.get("gen_key", "")
-    gen_key_changed = bool(old_gen_key) and old_gen_key != gen_key
-    if gen_key_changed:
-        print(f"[corpus] gen_key changed ({old_gen_key} -> {gen_key}); "
-              f"all pages will be regenerated", file=sys.stderr)
 
-    work = plan_work(fm, store, diff, force=force, regen=regen, only=only,
-                     max_files=max_files, gen_key_changed=gen_key_changed)
+    # provisional shards (clients created lazily after the dry-run path)
+    proto_shards = [ProviderShard(None, c.model) for c in pconfigs]  # type: ignore[arg-type]
+    expected = make_expected_gen_key(proto_shards)
+
+    work = plan_work(fm, store, diff, expected_gen_key=expected, force=force,
+                     regen=regen, only=only, max_files=max_files)
+    prov_desc = ", ".join(f"{c.model} [{c.type}]" for c in pconfigs)
+    print(f"[corpus] providers: {prov_desc}", file=sys.stderr)
     print(f"[corpus] scan: {len(scanned)} pages | added={len(diff.added)} "
           f"changed={len(diff.changed)} removed={len(diff.removed)} "
-          f"unchanged={len(diff.unchanged)} | to process: {len(work)}", file=sys.stderr)
+          f"unchanged={len(diff.unchanged)} | to process: {len(work)}",
+          file=sys.stderr)
 
     report = CompileReport(pages_total=len(scanned), pages_planned=len(work),
                            dry_run=dry_run)
     if not work:
         print("[corpus] nothing to do — corpus is up to date", file=sys.stderr)
         if diff.removed:
-            finalize(fm, diff, scanned, gen_key, gen_parts, report)
+            finalize(fm, diff, scanned, {}, set_gen_key(proto_shards),
+                     dict(proto_shards[0].gen_parts), report)
         return report
 
     sys_p = system_prompt(cfg.get("max_chunk_chars", 1200))
@@ -139,12 +147,21 @@ async def run_corpus_step(
         print(report_cost(est_in, est_out, price_in, price_out))
         return report
 
-    client = create_llm(pcfg)
+    shards = []
+    for pcfg in pconfigs:
+        client = create_llm(pcfg, timeout=cfg.get("llm_timeout", 180))
+        shards.append(ProviderShard(client, pcfg.model))
     report = await run_corpus_compile(
-        client, cfg, work=work, scanned=scanned, fm=fm, gen_key=gen_key,
-        gen_parts=gen_parts, workers=workers,
+        shards, cfg, work=work, scanned=scanned, fm=fm,
+        workers_per_provider=max(1, workers // len(shards)),
     )
-    finalize(fm, diff, scanned, gen_key, gen_parts, report)
+    # final page_gen_keys: new keys for processed pages, keep old for the rest
+    manifest = fm.load_manifest()
+    old_page_keys = manifest.get("page_gen_keys", {})
+    processed_keys = {rel: expected(rel) for rel in work}
+    page_gen_keys = {**old_page_keys, **processed_keys}
+    finalize(fm, diff, scanned, page_gen_keys, set_gen_key(shards),
+             dict(shards[0].gen_parts), report)
     print_report(report)
     return report
 
@@ -156,7 +173,7 @@ def run_index_step(cfg: dict) -> int:
 
 def run_compile(
     *,
-    provider: str | None,
+    providers: list[str] | None,
     steps: list[str],
     workers: int = 8,
     max_files: int | None = None,
@@ -182,11 +199,11 @@ def run_compile(
         if run_deps(cfg):
             return 1
     if "corpus" in steps:
-        if not provider:
+        if not providers:
             raise SystemExit("--provider is required for the corpus step")
         print("[compile] step: corpus", file=sys.stderr)
         asyncio.run(run_corpus_step(
-            cfg, provider, workers=workers, max_files=max_files, force=force,
+            cfg, providers, workers=workers, max_files=max_files, force=force,
             regen=regen, only=only, dry_run=dry_run, no_thinking=no_thinking,
             price_in=price_in, price_out=price_out))
     if "index" in steps and not dry_run:

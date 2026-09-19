@@ -20,8 +20,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_compile = sub.add_parser("compile", help="LLM corpus -> indexes -> deps")
-    p_compile.add_argument("--provider", default=None,
-                           help="Provider config JSON (qwen_flash.json / k27.json format)")
+    p_compile.add_argument("--provider", action="append", default=None,
+                           help="Provider config JSON (qwen_flash.json / k27.json format); "
+                                "repeat to shard pages across several providers")
     p_compile.add_argument("--steps", default="deps,corpus,index",
                            help="Comma list: deps,corpus,index (default: all)")
     p_compile.add_argument("--workers", type=int, default=0,
@@ -65,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "compile":
         from rag.compile import run_compile
         return run_compile(
-            provider=args.provider,
+            providers=args.provider,
             steps=[s.strip() for s in args.steps.split(",") if s.strip()],
             workers=args.workers, max_files=args.max_files, force=args.force,
             regen=args.regen, only=args.only, dry_run=args.dry_run,
