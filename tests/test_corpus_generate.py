@@ -173,9 +173,20 @@ def test_index_text_composition():
     ch = CorpusChunk(chunk_uid="u", heading_path=["Rigidbody", "Properties"],
                      text="body text", summary="sum", keywords=["k1"],
                      synonyms=["s1"], qa=[QA(q="question", a="answer")])
-    idx = to_index_text(ch, title="Rigidbody")
-    for part in ("Rigidbody", "Properties", "body text", "sum", "k1", "s1", "question"):
-        assert part in idx
+    # DEFAULT excludes aux: measured better at corpus scale (bm25_aux=false)
+    idx_default = to_index_text(ch, title="Rigidbody")
+    for part in ("Rigidbody", "Properties", "body text"):
+        assert part in idx_default
+    for part in ("sum", "k1", "s1", "question"):
+        assert part not in idx_default, f"aux {part!r} leaked into the default"
+
+    # opt-in aux composition (the ablation path)
+    idx_aux = to_index_text(ch, title="Rigidbody", aux=True)
+    for part in ("Rigidbody", "Properties", "body text", "sum", "k1", "s1",
+                 "question"):
+        assert part in idx_aux
+
+    # dense NEVER takes aux, in either setting
     emb = to_embed_text(ch, title="Rigidbody")
     assert "body text" in emb and "sum" not in emb and "k1" not in emb
     assert "question" not in emb

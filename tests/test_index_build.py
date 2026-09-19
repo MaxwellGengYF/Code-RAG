@@ -104,7 +104,11 @@ def test_dual_write_alignment_bm25_rows_match_dense_rows(corpus, tmp_path):
     chunks = [r.to_corpus_chunk() for r in rows]
 
     tok = WordTokenizer()
-    bm25_side = [doc_tokens(chunks[i], rows[i].source, rows[i].title, tok, 3)
+    # aux=True here exercises the aux-on rendering path explicitly (the shipped
+    # default is aux=False); this test is about row ALIGNMENT between the two
+    # index layers, and about aux staying out of the dense side when enabled.
+    bm25_side = [doc_tokens(chunks[i], rows[i].source, rows[i].title, tok, 3,
+                            aux=True)
                  for i in range(len(rows))]
     dense_side = [to_embed_text(chunks[i], rows[i].title) for i in range(len(rows))]
 
@@ -117,8 +121,8 @@ def test_dual_write_alignment_bm25_rows_match_dense_rows(corpus, tmp_path):
     assert "summary" in " ".join(bm25_side[0])
 
 
-def test_index_text_includes_aux_embed_text_does_not(corpus):
-    """The core design invariant: aux boosts lexical recall, never the vector space."""
+def test_index_text_aux_opt_in_embed_text_never(corpus):
+    """Design invariant: aux enters BM25 only when enabled, NEVER the vector space."""
     from rag.corpus.schema import to_embed_text, to_index_text
 
     store = CorpusStore(corpus)
@@ -126,12 +130,17 @@ def test_index_text_includes_aux_embed_text_does_not(corpus):
     row = rows[0]
     ch = row.to_corpus_chunk()
 
-    idx = to_index_text(ch, row.title)
+    # default (shipped): aux excluded from BM25 too
+    idx_default = to_index_text(ch, row.title)
     emb = to_embed_text(ch, row.title)
-    assert ch.text in idx and ch.text in emb
-    for aux in (ch.summary, *ch.keywords, ch.qa[0].q):
-        assert aux in idx, f"aux {aux!r} missing from BM25 text"
-        assert aux not in emb, f"aux {aux!r} leaked into embed text"
+    assert ch.text in idx_default and ch.text in emb
+    assert ch.summary not in idx_default
+
+    # aux=True (ablation): aux appears in BM25 text but STILL never in embed text
+    idx_aux = to_index_text(ch, row.title, aux=True)
+    for aux_field in (ch.summary, *ch.keywords, ch.qa[0].q):
+        assert aux_field in idx_aux, f"aux {aux_field!r} missing from BM25 text"
+        assert aux_field not in emb, f"aux {aux_field!r} leaked into embed text"
 
 
 def test_empty_corpus_flattens_to_nothing(tmp_path):

@@ -19,9 +19,13 @@ def doc_tokens(
     tok: WordTokenizer,
     path_boost: int = 3,
     *,
-    aux: bool = True,
+    aux: bool = False,
 ) -> list[str]:
-    """Terms for one chunk: index text (aux optional) + path terms x path_boost."""
+    """Terms for one chunk: index text (aux optional) + path terms x path_boost.
+
+    ``aux`` defaults to False, matching the shipped ``bm25_aux`` config default
+    (measured better at corpus scale; see eval_results.md).
+    """
     toks = tok.tokenize(to_index_text(chunk, title, aux=aux))
     if path_boost:
         toks = toks + path_terms(source) * path_boost
@@ -34,7 +38,7 @@ def build_bm25(
     titles: list[str],
     *,
     path_boost: int = 3,
-    aux: bool = True,
+    aux: bool = False,
     verbose: bool = True,
 ) -> tuple[InvertedIndex, Searcher]:
     """Build the word-tokenizer BM25 index; doc ids are positional chunk ids."""

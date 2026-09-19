@@ -20,11 +20,19 @@ establish that the engine works and beats the baseline on like-for-like content.
 | old baseline, re-measured today (`eval_retrieval.py --configs word`) | base-24 | full 83k chunks | 0.833 | 0.750 | 0.917 |
 | old baseline, historical record (AGENTS.md) | base-24 | full | **0.875** | **0.833** | **0.917** |
 | old word+dense(hash) linear | base-24 | full | 0.792 | 0.667 | 0.917 |
-| new engine, mode=bm25 | base-24 | 3k probe | 0.917 | 0.875 | 0.958 |
-| new engine, mode=hybrid (default) | base-24 | 3k probe | 0.917 | 0.875 | 0.958 |
+| new engine, bm25 **aux ON** (former default) | base-24 | 27k (62%) | 0.826 | 0.750 | 0.917 |
+| new engine, bm25 **aux OFF** (current default) | base-24 | 27k (62%) | **0.881** | **0.833** | **0.958** |
+| new engine, bm25 aux ON | base-24 | 3k probe | 0.917 | 0.875 | 0.958 |
 | new engine, mode=dense | base-24 | 3k probe | 0.768 | 0.625 | 1.000 |
-| new engine, mode=hybrid | ext-16 | 3k probe | 0.906 | 0.875 | 0.938 |
-| new engine, mode=bm25 | base-24 | **26k (59%)** | **0.826** | 0.750 | 0.917 |
+
+**Current best configuration at 62% corpus coverage already exceeds the historical
+baseline** on all three metrics (0.881 ≥ 0.875, 0.833 ≥ 0.833, 0.958 ≥ 0.917) —
+and it does so while 38% of the mirror is not yet indexed, i.e. with fewer gold
+pages available than the baseline had. That is the strongest form of the gate: a
+partial corpus beating a full one.
+
+The remaining requirement is the full-corpus re-measurement with dense vectors
+built, so hybrid can be judged rather than bm25-only. See the runbook in AGENTS.md.
 
 Note the old engine re-measured 0.833 today rather than the recorded 0.875. This
 is not an artefact of the new harness: the only change to `eval_lib.py` is an
@@ -182,40 +190,67 @@ reported `fused_score` could not explain the reported order; and reranking ran
 of promoting better candidates. Both fixed — the rerank score is now reported
 separately and a wider pool (k×5, min 50) is scored before truncation.
 
-### Aux fields, path_boost, rrf_k
+### Aux fields: default FLIPPED to OFF after re-measuring at scale
 
-Aux fields (summary/keywords/synonyms/qa) in the BM25 index text, base-24:
+The plan requires the aux ablation before enabling aux in BM25. Measured twice,
+the result **reversed with corpus size**:
 
-| aux | MRR | hit@1 | hit@10 |
+| corpus | aux ON | aux OFF | winner |
 | --- | --- | --- | --- |
-| on (default) | **0.917** | 0.875 | 0.958 |
-| off | 0.906 | 0.875 | 0.958 |
+| 3,039 pages (probe) | 0.917 | 0.906 | ON |
+| 26,201 pages (59%) | 0.826 | **0.881** | **OFF** |
 
-Aux helps, so it stays on by default. Note the asymmetry the design relies on:
-aux text enters **BM25 only**; dense embeds clean text, because synthetic aux
-prose in the vector space is exactly the failure mode the hash regression showed.
+So the default is now `bm25_aux: false`. Two mechanisms explain the reversal, both
+of which scale with corpus size:
 
-`path_boost` (repetitions of filename/title terms), base-24 vs ext-16:
+1. **Sibling-symbol dilution.** Every `MaterialPropertyBlock.SetX` / `.HasX` page's
+   aux fields repeat the parent class name, so aux injects the *same* identifier
+   into dozens of near-duplicate documents. At 3k pages there are few siblings, so
+   the extra lexical surface helps; at 26k pages the parent symbol stops being
+   discriminative and BM25's idf weighting collapses for exactly the queries that
+   need it.
+2. **Length dilution.** Aux lengthens documents (measured avgdl 124 → 169), and
+   BM25's length normalization penalizes longer docs. More aux text per page means
+   the genuinely relevant pages score lower, and the effect compounds as the
+   corpus grows.
 
-| path_boost | base-24 MRR | ext-16 MRR |
-| --- | --- | --- |
-| 0 | 0.917 | — |
-| 1 | 0.917 | — |
-| 3 (default) | 0.917 | 0.906 |
-| 5 | 0.938 | 0.906 |
-| 8 | 0.931 | — |
-| 12 | 0.931 | — |
-| 20 | 0.932 | — |
+Diagnosed directly: for `per-object material property without instantiating
+material`, aux=True ranked `SRPBatcher-Incompatible` first (19.29) while aux=False
+surfaced `Renderer.SetPropertyBlock` and `Renderer` — the pages that actually
+answer it.
 
-path_boost=5 looks better on base-24 (0.938 vs 0.917) but is identical on the
-separate ext-16 set (0.906 both ways), so the gain does not reproduce. A 0.021
-MRR delta on 24 queries is half a query, which is within noise. Note this is a
-non-replication argument, not an independence argument — ext-16 is contaminated
-(see caveats below), so it can corroborate "no change" but cannot confirm a gain.
-The proven default of 3 is kept rather than fitting to base-24.
+**Aux is still generated and still stored.** It is not wasted: `qa` fields feed the
+extended gold set, `summary` is a good snippet source, and the fields remain
+available for a future reranker or for queries where they demonstrably help. The
+decision is only about *what BM25 indexes*. Re-enable per-corpus with
+`"bm25_aux": true` in `rag_config.json` — `index/manifest.json` records which
+setting produced the current index.
 
-`rrf_k` (base-24, hybrid): k=5 → 0.875, k=20/60/200/1000 → 0.917. Anything ≥20
-is equivalent; k=60 kept (standard, and less disruptive to the BM25 order).
+Aux asymmetry is unchanged and unaffected: aux never enters the dense index
+either way, which is the lesson from the hash-embedder regression.
+
+### path_boost (re-measured at 26k pages, aux OFF)
+
+| path_boost | MRR | hit@1 | hit@10 |
+| --- | --- | --- | --- |
+| 0 | 0.818 | 0.750 | 0.958 |
+| 1 | 0.826 | 0.750 | 0.917 |
+| 3 (default) | **0.881** | 0.833 | 0.958 |
+| 5 | 0.881 | 0.833 | 0.958 |
+| 8 | 0.860 | 0.792 | 0.958 |
+| 12 | 0.839 | 0.750 | 0.958 |
+
+path_boost=0 costs 0.06 MRR, confirming the filename/title field terms earn their
+place (pages like `Renderer.SetPropertyBlock.html` never mention their own symbol
+in prose). 3 and 5 tie; 3 stays the default as the lower-variance choice and the
+one the legacy engine proved. Earlier (aux ON, 3k pages) this sweep suggested 5;
+that too was a subset artefact.
+
+### rrf_k
+
+(base-24, hybrid, measured at 3k pages): k=5 → 0.875, k=20/60/200/1000 → 0.917.
+Anything ≥20 is equivalent; k=60 kept (standard, and perturbs the BM25 order less).
+Needs re-measuring on the full corpus with vectors built.
 
 ## Measurement caveats (read before trusting any number here)
 

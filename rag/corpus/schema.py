@@ -117,11 +117,15 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def to_index_text(chunk: CorpusChunk, title: str = "", aux: bool = True) -> str:
-    """BM25 index text: clean text PLUS synthetic aux fields.
+def to_index_text(chunk: CorpusChunk, title: str = "", aux: bool = False) -> str:
+    """BM25 index text: title + heading path + clean text (+ optional aux).
 
-    Aux text (summary/keywords/synonyms/qa) boosts lexical recall; retrieval
-    hits still map back to the clean original chunk.
+    ``aux`` defaults to False to match the shipped ``bm25_aux`` config default.
+    Aux was measured to HURT at corpus scale (0.826 vs 0.881 MRR at 26k pages):
+    every sibling page's aux repeats the parent symbol, destroying its idf, and
+    aux lengthens documents which BM25's length normalization penalizes. It helped
+    on a 3k-page subset, which is why the default is off rather than "tunable but
+    on". See eval_results.md. Pass ``aux=True`` for the ablation.
     """
     parts: list[str] = []
     if title:

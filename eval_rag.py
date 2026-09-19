@@ -132,8 +132,8 @@ def engine_ranker(engine, k: int, mode: str, *, rerank: bool | None = None):
     return rank
 
 
-def table_ranker(rows, cfg, *, mode="hybrid", aux=True, path_boost=3, rrf_k=60,
-                 per_file=1, fusion="rrf", alpha=1.0):
+def table_ranker(rows, cfg, *, mode="hybrid", aux=None, path_boost=None,
+                 rrf_k=60, per_file=1, fusion="rrf", alpha=1.0):
     """In-memory ranker over the chunk table with explicit ablation knobs.
 
     BM25 is rebuilt from *rows* so aux/path_boost can be ablated without touching
@@ -148,6 +148,13 @@ def table_ranker(rows, cfg, *, mode="hybrid", aux=True, path_boost=3, rrf_k=60,
     from rag.index.bm25_index import build_bm25, new_searcher
     from rag.index.vector_index import embed_query
     from rag.index.fuse import rrf_fuse
+
+    # defaults come from the shipped config so a sweep measures a realistic
+    # baseline arm; pass an explicit value to ablate it
+    if aux is None:
+        aux = bool(cfg.get("bm25_aux", False))
+    if path_boost is None:
+        path_boost = int(cfg.get("path_boost", 3))
 
     chunks = [r.to_corpus_chunk() for r in rows]
     sources = [r.source for r in rows]
@@ -254,6 +261,10 @@ def main() -> int:
     ap.add_argument("--sweep-aux", action="store_true")
     ap.add_argument("--sweep-path-boost", default=None, help="e.g. 0,1,3,5")
     ap.add_argument("--sweep-rrf-k", default=None, help="e.g. 20,40,60,120")
+    ap.add_argument("--aux", dest="aux", action="store_true", default=None,
+                    help="force aux fields ON in BM25 index text")
+    ap.add_argument("--no-aux", dest="aux", action="store_false",
+                    help="force aux fields OFF (clean text only)")
     ap.add_argument("--sweep-fusion", action="store_true",
                     help="compare rrf vs linear-alpha fusion on identical scores "
                          "(shows why RRF is the default: BM25 is unbounded, "
@@ -327,14 +338,17 @@ def main() -> int:
                 table_ranker(rows, cfg, mode=args.mode, aux=aux))
         return emit(results, args)
     if args.sweep_path_boost:
+        # --aux/--no-aux applies, so aux x path_boost can be explored jointly
+        aux = True if args.aux is None else args.aux
         for pb in [int(x) for x in args.sweep_path_boost.split(",")]:
-            run(f"table {args.mode} path_boost={pb}",
-                table_ranker(rows, cfg, mode=args.mode, path_boost=pb))
+            run(f"table {args.mode} path_boost={pb} aux={aux}",
+                table_ranker(rows, cfg, mode=args.mode, path_boost=pb, aux=aux))
         return emit(results, args)
     if args.sweep_rrf_k:
+        aux = True if args.aux is None else args.aux
         for k in [int(x) for x in args.sweep_rrf_k.split(",")]:
-            run(f"table {args.mode} rrf_k={k}",
-                table_ranker(rows, cfg, mode=args.mode, rrf_k=k))
+            run(f"table {args.mode} rrf_k={k} aux={aux}",
+                table_ranker(rows, cfg, mode=args.mode, rrf_k=k, aux=aux))
         return emit(results, args)
     if args.sweep_fusion:
         # identical BM25 + BGE-M3 scores, different fusion rules

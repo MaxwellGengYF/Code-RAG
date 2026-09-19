@@ -4,6 +4,7 @@
   "index_dir": "index",
   "tokenizer": "word",
   "path_boost": 3,
+  "bm25_aux": false,
   "fuzziness": 0,
   "min_should_match": 0.6,
   "per_file": 1,

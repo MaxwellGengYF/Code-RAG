@@ -150,9 +150,16 @@ def build_indexes(cfg: dict, *, force: bool = False, skip_dense: bool = False,
     print(f"[index] wrote chunks.msgpack ({time.time() - t0:.0f}s)", file=sys.stderr)
 
     from rag.index.bm25_index import build_bm25
+    # bm25_aux controls whether the synthetic aux fields (summary/keywords/
+    # synonyms/qa.q) are added to the BM25 index text. Default OFF, measured:
+    # at 26k pages aux=False MRR 0.881 vs aux=True 0.826 (base-24). Aux helps on
+    # a small subset (0.906 vs 0.917 flipped at 3k pages) but every sibling page's
+    # aux repeats the parent symbol, and aux lengthens documents (avgdl 124 ->
+    # 169), so the dilution grows with corpus size. See eval_results.md.
+    bm25_aux = bool(cfg.get("bm25_aux", False))
     index, _searcher = build_bm25(chunks, sources, titles,
                                   path_boost=cfg.get("path_boost", 3),
-                                  verbose=verbose)
+                                  aux=bm25_aux, verbose=verbose)
     index.save(str(index_dir / "bm25_word.pkl"))
     print(f"[index] wrote bm25_word.pkl ({time.time() - t0:.0f}s)", file=sys.stderr)
 
@@ -219,7 +226,7 @@ def build_indexes(cfg: dict, *, force: bool = False, skip_dense: bool = False,
         "chunks_sha1_8": _sha1_8(index_dir / "chunks.msgpack"),
         "embed_model": embed_model,
         "bm25": {"tokenizer": "word", "path_boost": cfg.get("path_boost", 3),
-                 "aux": True},
+                 "aux": bm25_aux},
         "wall_s": round(time.time() - t0, 1),
     }
     im_path.write_text(json.dumps(im, indent=2), encoding="utf-8")
