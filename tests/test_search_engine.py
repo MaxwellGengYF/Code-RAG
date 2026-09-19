@@ -1,0 +1,145 @@
+"""Search engine + RRF fusion tests on a tiny tmp index (network-free, BM25-only)."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from rag.corpus.schema import make_chunk_uid
+from rag.index.fuse import linear_fuse, rrf_fuse
+from rag.index.build import ChunkRow
+import msgspec
+
+
+def make_rows():
+    rows = [
+        ChunkRow(chunk_uid=make_chunk_uid("ScriptReference/Rigidbody.html", 0),
+                 source="ScriptReference/Rigidbody.html", title="Rigidbody",
+                 heading_path=["Rigidbody"], text="Controls the position and velocity of a GameObject."),
+        ChunkRow(chunk_uid=make_chunk_uid("ScriptReference/Rigidbody.html", 1),
+                 source="ScriptReference/Rigidbody.html", title="Rigidbody",
+                 heading_path=["Rigidbody", "Properties"],
+                 text="public Vector3 velocity; The velocity of the rigidbody.",
+                 summary="velocity property", keywords=["velocity"],
+                 synonyms=["linearVelocity"], qa=[]),
+        ChunkRow(chunk_uid=make_chunk_uid("Manual/2d-physics.html", 0),
+                 source="Manual/2d-physics.html", title="2D Physics",
+                 heading_path=["2D Physics"],
+                 text="Rigidbody 2D and collider fundamentals for 2D games."),
+    ]
+    # filler docs keep every term's df/N below finalize()'s 0.5 stop threshold
+    fillers = ["Textures and materials for terrain surfaces.",
+               "Audio mixer groups and snapshot automation curves.",
+               "Animation state machine transitions and blend trees.",
+               "UI canvas scalers and anchoring for multiple resolutions."]
+    for i, text in enumerate(fillers):
+        rows.append(ChunkRow(
+            chunk_uid=make_chunk_uid(f"Manual/Filler{i}.html", 0),
+            source=f"Manual/Filler{i}.html", title=f"Filler {i}",
+            heading_path=[f"Filler {i}"], text=text))
+    return rows
+
+
+@pytest.fixture()
+def tiny_index(tmp_path, monkeypatch):
+    """Build a real BM25 index over tmp rows in an isolated index dir."""
+    from rag.index.bm25_index import build_bm25
+    rows = make_rows()
+    cfg = {"index_dir": str(tmp_path / "index"), "min_should_match": 0.6,
+           "bm25_k": 200, "dense_k": 200, "rrf_k": 60, "embed_model": "none",
+           "final_k": 8, "mode": "bm25", "corpus_dir": str(tmp_path / "corpus")}
+    index_dir = Path(cfg["index_dir"])
+    index_dir.mkdir()
+    (index_dir / "chunks.msgpack").write_bytes(
+        msgspec.msgpack.encode([msgspec.to_builtins(r) for r in rows]))
+    chunks = [r.to_corpus_chunk() for r in rows]
+    index, _s = build_bm25(chunks, [r.source for r in rows],
+                           [r.title for r in rows], verbose=False)
+    index.save(str(index_dir / "bm25_word.pkl"))
+    return cfg, rows
+
+
+def test_rrf_fuse_math():
+    bm25 = [(10, 9.0), (20, 8.0), (30, 7.0)]
+    dense = [(30, 0.9), (10, 0.8), (40, 0.7)]
+    fused = dict(rrf_fuse(bm25, dense, k=60))
+    # 10: rank0+rank1  30: rank2+rank0  20: rank1 only  40: rank2 only
+    assert fused[10] > fused[30] > fused[20] > fused[40]
+    assert fused[10] == pytest.approx(1 / 60 + 1 / 61)
+    assert fused[30] == pytest.approx(1 / 62 + 1 / 60)
+    assert fused[20] == pytest.approx(1 / 61)
+    assert fused[40] == pytest.approx(1 / 62)
+
+
+def test_rrf_single_list_equals_ranks():
+    bm25 = [(5, 3.0), (1, 2.0), (9, 1.0)]
+    fused = rrf_fuse(bm25, [], k=60)
+    assert [d for d, _s in fused] == [5, 1, 9]  # order preserved, scores 1/(60+r)
+
+
+def test_linear_fuse_ablation():
+    bm25 = [(10, 9.0), (20, 8.0), (30, 1.0)]
+    dense = [(30, 0.99), (20, 0.90), (10, 0.50)]
+    fused = dict(linear_fuse(bm25, dense, alpha=0.5))
+    # doc 20 is strong in BOTH lists -> wins the blend despite losing BM25
+    assert fused[20] > fused[10]
+    assert fused[20] > fused[30]
+
+
+def test_engine_bm25_query(tiny_index):
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    engine = SearchEngine(cfg)
+    out = engine.search("rigidbody velocity", k=5, mode="bm25")
+    assert out["hits"], "expected hits"
+    top_sources = [h["source"] for h in out["hits"]]
+    assert "ScriptReference/Rigidbody.html" in top_sources[0]
+    # aux text (synonym linearVelocity) is in the BM25 index
+    hit = next(h for h in out["hits"]
+               if h["source"] == "ScriptReference/Rigidbody.html")
+    assert "velocity" in hit["text"].lower()
+
+
+def test_engine_per_file_dedupe(tiny_index):
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    engine = SearchEngine(cfg)
+    out = engine.search("rigidbody", k=5, mode="bm25")
+    srcs = [h["source"] for h in out["hits"]]
+    assert len(srcs) == len(set(srcs)) or srcs.count("ScriptReference/Rigidbody.html") == 1
+
+
+def test_engine_deterministic(tiny_index):
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    a = SearchEngine(cfg).search("rigidbody velocity", k=5, mode="bm25")
+    b = SearchEngine(cfg).search("rigidbody velocity", k=5, mode="bm25")
+    assert [(h["source"], h["fused_score"]) for h in a["hits"]] == \
+           [(h["source"], h["fused_score"]) for h in b["hits"]]
+
+
+def test_engine_explain(tiny_index):
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    out = SearchEngine(cfg).search("rigidbody velocity", k=3, mode="bm25",
+                                   explain=True)
+    terms = {t["term"]: t["in_index"] for t in out["explain"]}
+    assert terms.get("rigidbody") is True
+    assert out["hits"][0]["explain_scores"]["bm25"] > 0
+
+
+def test_engine_mentions(tiny_index):
+    from rag.search.engine import SearchEngine
+    cfg, rows = tiny_index
+    res = SearchEngine(cfg).mentions("velocity")
+    srcs = {r["source"]: r["count"] for r in res}
+    assert srcs.get("ScriptReference/Rigidbody.html", 0) >= 2
+
+
+def test_engine_missing_index_errors_cleanly(tmp_path):
+    from rag.search.engine import SearchEngine
+    engine = SearchEngine({"index_dir": str(tmp_path / "nope")})
+    with pytest.raises(FileNotFoundError) as exc:
+        engine.search("x")
+    assert "rag.py compile" in str(exc.value)
