@@ -212,14 +212,20 @@ def run_compile(
         print("[compile] step: deps", file=sys.stderr)
         if run_deps(cfg):
             return 1
+    corpus_report = None
     if "corpus" in steps:
         if not providers:
             raise SystemExit("--provider is required for the corpus step")
         print("[compile] step: corpus", file=sys.stderr)
-        asyncio.run(run_corpus_step(
+        corpus_report = asyncio.run(run_corpus_step(
             cfg, providers, workers=workers, max_files=max_files, force=force,
             regen=regen, only=only, dry_run=dry_run, no_thinking=no_thinking,
             price_in=price_in, price_out=price_out))
+        if corpus_report.aborted_all_providers_down:
+            # Non-zero exit: the run stopped because every provider's quota was
+            # exhausted, so pages remain ungenerated. Exiting 0 here would make an
+            # auto-resume wrapper print COMPILE COMPLETE and never retry.
+            return 3
     if "index" in steps and not dry_run:
         print("[compile] step: index", file=sys.stderr)
         return run_index_step(cfg, force=force, skip_dense=skip_dense)

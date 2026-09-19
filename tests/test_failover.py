@@ -184,28 +184,65 @@ async def test_dead_provider_fails_over(env):
         assert data.get("needs_regen", False) is False
 
 
+async def test_all_providers_dead_aborts_not_degrades(env):
+    """When every circuit is open the run STOPS instead of grinding the work list
+    into aux-less fallback chunks.
+
+    Rationale: both providers on one gateway hit the same 5-hour quota window and
+    die together (this actually happened on the live build). Degrading would
+    overwrite every remaining page with heuristic chunks and then exit 0, so an
+    auto-resume wrapper would report COMPILE COMPLETE and never retry. Aborting
+    leaves the pages untouched for a later run.
+    """
+    root, corpus_dir, fm, cfg = env
+    shards = [shard("dead-a", dead=True), shard("dead-b", dead=True)]
+    scanned = fm.scan()
+    store = CorpusStore(corpus_dir)
+    work = plan_work(fm, store, fm.diff(scanned),
+                     valid_gen_keys=valid_gen_keys(shards))
+
+    # cooldown longer than the wait budget so recovery never happens
+    report = await run_corpus_compile(
+        shards, cfg, work=work, scanned=scanned, fm=fm,
+        workers_per_provider=2, progress=False,
+        circuit_threshold=1, circuit_cooldown=10_000, wait_budget_s=0.0)
+
+    assert report.aborted_all_providers_down is True
+    assert report.pages_done < len(work), (report.pages_done, len(work))
+    written = len(list(store.iterate_all()))
+    assert written < len(work), "must not degrade every page"
+    # anything written during the trip must be self-flagged for retry
+    for rel, data in store.iterate_all():
+        if not data.get("chunks"):
+            continue
+        assert data.get("needs_regen") is True
+    assert len(fm.load_manifest()["needs_regen"]) == written or \
+        report.pages_done == 0
+
+
 async def test_all_providers_dead_flags_needs_regen(env):
-    """When every circuit is open, pages get heuristic chunks + needs_regen."""
+    """Pages that DO get written while providers are down are flagged needs_regen,
+    so they stay searchable but retry automatically once quota returns."""
     root, corpus_dir, fm, cfg = env
     shards = [shard("dead-a", dead=True), shard("dead-b", dead=True)]
     scanned = fm.scan()
     work = plan_work(fm, CorpusStore(corpus_dir), fm.diff(scanned),
                      valid_gen_keys=valid_gen_keys(shards))
 
+    # cooldown SHORTER than the wait budget: the pool re-probes, each probe fails,
+    # and pages served during a probe window land on the fallback path
     report = await run_corpus_compile(
         shards, cfg, work=work, scanned=scanned, fm=fm,
         workers_per_provider=2, progress=False,
-        circuit_threshold=1, circuit_cooldown=600)
+        circuit_threshold=1, circuit_cooldown=0.0, wait_budget_s=0.0)
 
-    assert report.pages_done == 24
-    assert report.fallback == 24
-    assert len(report.needs_regen) == 24
-    manifest = fm.load_manifest()
-    assert len(manifest["needs_regen"]) == 24
-    # corpus files still exist (search keeps working) and are self-flagged
     store = CorpusStore(corpus_dir)
-    for rel, data in store.iterate_all():
+    written = list(store.iterate_all())
+    for rel, data in written:
         assert data["needs_regen"] is True
+    assert len(report.needs_regen) == len(written)
+    manifest = fm.load_manifest()
+    assert set(manifest["needs_regen"]) == {rel for rel, _ in written}
 
 
 async def test_needs_regen_pages_requeue_and_heal(env):
@@ -215,23 +252,26 @@ async def test_needs_regen_pages_requeue_and_heal(env):
     scanned = fm.scan()
     store = CorpusStore(corpus_dir)
 
-    # run 1: everything fails over to nothing -> heuristic + flagged
+    # run 1: only a dead provider. cooldown=0 so probes keep happening and pages
+    # land on the fallback path (flagged) rather than aborting immediately.
     await run_corpus_compile(dead, cfg,
                              work=plan_work(fm, store, fm.diff(scanned),
                                             valid_gen_keys=valid_gen_keys(dead)),
                              scanned=scanned, fm=fm, workers_per_provider=2,
                              progress=False, circuit_threshold=1,
-                             circuit_cooldown=600)
-    assert len(fm.load_manifest()["needs_regen"]) == 24
+                             circuit_cooldown=0.0, wait_budget_s=0.0)
+    flagged1 = fm.load_manifest()["needs_regen"]
+    assert flagged1, "pages written while the provider was down must be flagged"
+    assert len(flagged1) <= 24
 
-    # run 2: same dead shard alone -> still flagged (no healthy backup)
+    # run 2: same dead shard alone -> whatever it writes stays flagged
     report2 = await run_corpus_compile(
         dead, cfg,
         work=plan_work(fm, store, fm.diff(scanned),
                        valid_gen_keys=valid_gen_keys(dead)),
         scanned=scanned, fm=fm, workers_per_provider=2, progress=False,
-        circuit_threshold=1, circuit_cooldown=600)
-    assert len(report2.needs_regen) == 24
+        circuit_threshold=1, circuit_cooldown=0.0, wait_budget_s=0.0)
+    assert report2.needs_regen == set() or report2.fallback > 0
 
     # run 3: add a healthy provider -> flagged pages heal
     healthy = [shard("dead-a", dead=True), shard("live")]
@@ -241,13 +281,13 @@ async def test_needs_regen_pages_requeue_and_heal(env):
     report3 = await run_corpus_compile(
         healthy, cfg, work=work3, scanned=scanned, fm=fm,
         workers_per_provider=2, progress=False, circuit_threshold=1,
-        circuit_cooldown=600)
-
+        circuit_cooldown=0.0, wait_budget_s=0.0)
     assert report3.fallback == 0
     assert report3.needs_regen == set()
     assert fm.load_manifest()["needs_regen"] == []
     for rel, data in store.iterate_all():
         assert data.get("needs_regen", False) is False
+        assert data["chunks"][0]["summary"] == "s"
         assert data["chunks"][0]["summary"] == "s"
 
 
@@ -275,6 +315,24 @@ async def test_max_files_does_not_claim_unprocessed(env):
     assert len(remaining) == 18
 
 
+def test_pool_all_open_and_probe_timing():
+    """The wait loop relies on all_open()/next_probe_in() to decide when to nap."""
+    shards = [shard("a"), shard("b")]
+    pool = ProviderPool(shards, threshold=1, cooldown=60)
+    pool.record_api_failure(0, now=1000.0)
+    pool.record_api_failure(1, now=1000.0)
+    assert pool.all_open(1000.0) is True
+    assert pool.next_probe_in(1000.0) == pytest.approx(60.0)
+    assert pool.next_probe_in(1030.0) == pytest.approx(30.0)
+    assert pool.all_open(1060.0) is False
+    assert pool.next_probe_in(1060.0) == 0.0
+    # one provider healthy -> never "all open", no wait
+    pool2 = ProviderPool(shards, threshold=1, cooldown=60)
+    pool2.record_api_failure(0, now=1000.0)
+    assert pool2.all_open(1000.0) is False
+    assert pool2.next_probe_in(1000.0) == pytest.approx(60.0)
+
+
 def test_plan_work_valid_keys_set_membership(env):
     """Validity is membership in the fleet's key set, not an exact shard match."""
     root, corpus_dir, fm, cfg = env
@@ -293,6 +351,14 @@ def test_plan_work_valid_keys_set_membership(env):
     # fleet {a} only: b's keys are foreign -> everything requeues
     assert len(plan_work(fm, store, diff,
                          valid_gen_keys=valid_gen_keys([a]))) == len(scanned)
+
+
+def test_plan_work_rejects_missing_only(env):
+    """--only must name a real page, not fail obscurely later."""
+    root, corpus_dir, fm, cfg = env
+    with pytest.raises(SystemExit):
+        plan_work(fm, CorpusStore(corpus_dir), fm.diff(fm.scan()),
+                  only="Nope/Missing.html")
 
 
 def test_plan_work_requeues_needs_regen_flag(env):

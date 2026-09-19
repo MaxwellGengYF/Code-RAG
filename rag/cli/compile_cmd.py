@@ -66,6 +66,8 @@ class CompileReport:
     needs_regen: set[str] = field(default_factory=set)
     #: pages the final manifest claims as processed (set by finalize)
     pages_claimed: int = 0
+    #: set when the run stopped early because every provider circuit was open
+    aborted_all_providers_down: bool = False
 
     def to_dict(self) -> dict:
         out = dict(self.__dict__)
@@ -135,6 +137,12 @@ CIRCUIT_THRESHOLD = 12
 #: 5-hour quota window is better re-probed every few minutes (one wasted request
 #: per probe) than assumed dead for the rest of the run.
 CIRCUIT_COOLDOWN = 180.0
+#: when EVERY circuit is open (shared quota window exhausted), wait this long for
+#: recovery before aborting the run. Waiting is strictly better than degrading:
+#: aborting leaves the remaining pages untouched for a later run, whereas
+#: proceeding would overwrite ~37k pages with aux-less heuristic chunks and then
+#: exit 0, so the resume loop would report COMPILE COMPLETE and never retry.
+ALL_DOWN_WAIT_BUDGET = 5400.0
 
 
 class ProviderPool:
@@ -235,6 +243,19 @@ class ProviderPool:
             parts.append(f"{s.model}: served={self.served[i]} trips={self.trips[i]} "
                          f"state={state}")
         return " | ".join(parts)
+
+    def all_open(self, now: float | None = None) -> bool:
+        """True when no provider can serve a request right now."""
+        return not self.healthy_indices(now)
+
+    def next_probe_in(self, now: float | None = None) -> float:
+        """Seconds until the soonest tripped provider may be probed again."""
+        now = time.time() if now is None else now
+        ready = [self.opened_at[i] + self.cooldown for i in range(len(self.shards))
+                 if self.opened_at[i] is not None]
+        if not ready:
+            return 0.0
+        return max(0.0, min(ready) - now)
 
 
 # --------------------------------------------------------------------------------------
@@ -340,6 +361,7 @@ async def run_corpus_compile(
     progress: bool = True,
     circuit_threshold: int = CIRCUIT_THRESHOLD,
     circuit_cooldown: float = CIRCUIT_COOLDOWN,
+    wait_budget_s: float = ALL_DOWN_WAIT_BUDGET,
 ) -> CompileReport:
     store = CorpusStore(fm.corpus_dir)
     report = CompileReport(pages_total=len(scanned), pages_planned=len(work))
@@ -351,6 +373,7 @@ async def run_corpus_compile(
     sems = [asyncio.Semaphore(workers_per_provider) for _ in shards]
     done_counter = 0
     lock = asyncio.Lock()
+    aborted = {"v": False}
     max_chunk_chars = cfg.get("max_chunk_chars", 1200)
     max_input_chars = cfg.get("max_input_chars", 24_000)
 
@@ -381,7 +404,9 @@ async def run_corpus_compile(
             needs_regen=still_flagged,
         )
 
-    async def one(rel: str) -> None:
+    async def one(rel: str) -> bool:
+        """Generate one page. Returns False when it could not be served and the
+        caller should stop the run (every provider down past the wait budget)."""
         nonlocal done_counter
         page = await asyncio.to_thread(extract_page, fm.root / rel, root=fm.root,
                                        max_chars=max_input_chars)
@@ -397,7 +422,34 @@ async def run_corpus_compile(
             # Walk the healthy candidate list; on a hard API failure move to the
             # next provider (its gen_key is recorded, which keeps the per-page
             # key registry honest under failover).
-            for idx in pool.order(preferred):
+            candidates = pool.order(preferred)
+            if not candidates:
+                # Every circuit is open — typically the shared quota window is
+                # exhausted (observed: token-plan 5-hour limit, kimi 5-hour limit).
+                # Burning the work list into heuristic fallback chunks would write
+                # ~37k aux-less pages and then report success, so WAIT for a
+                # provider to come back instead. Bounded by wait_budget_s.
+                waited = 0.0
+                while not candidates and waited < wait_budget_s:
+                    nap = min(max(pool.next_probe_in(), 15.0), 120.0)
+                    if progress and int(waited) % 300 < int(nap):
+                        print(f"  [paused] all provider circuits open "
+                              f"({pool.summary()}); waiting {nap:.0f}s for quota "
+                              f"recovery — {waited:.0f}s/{wait_budget_s:.0f}s budget",
+                              file=sys.stderr)
+                    await asyncio.sleep(nap)
+                    waited += nap
+                    candidates = pool.order(preferred)
+                if not candidates:
+                    if progress:
+                        print(f"  [abort] provider wait budget exhausted "
+                              f"({wait_budget_s:.0f}s); stopping the run with "
+                              f"{len(work) - report.pages_done} pages unprocessed. "
+                              f"Rerun when quota resets — nothing was degraded.",
+                              file=sys.stderr)
+                    report.aborted_all_providers_down = True
+                    return False
+            for idx in candidates:
                 shard = shards[idx]
                 async with sems[idx]:
                     corpus, stats = await generate_page_corpus(
@@ -409,7 +461,7 @@ async def run_corpus_compile(
                     continue
                 pool.record_success(idx)
                 break
-            if corpus is None:  # every provider tripped open
+            if corpus is None:  # candidates exhausted by fresh API failures
                 corpus, stats = _all_providers_down(page, scanned[rel],
                                                     shards[preferred].gen_key)
 
@@ -445,6 +497,7 @@ async def run_corpus_compile(
             if progress and report.pages_done % 50 == 0:
                 print(f"  [{report.pages_done}/{len(work)}] "
                       f"{time.time() - t0:.0f}s", file=sys.stderr)
+        return True
 
     # Bounded worker pool: keeps memory flat on a 44k-page work list instead of
     # materialising one coroutine per page up front.
@@ -454,13 +507,17 @@ async def run_corpus_compile(
     n_workers = max(1, workers_per_provider * len(shards))
 
     async def worker() -> None:
-        while True:
+        while not aborted["v"]:
             try:
                 rel = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return  # queue is pre-filled; empty means the run is over
             try:
-                await one(rel)
+                if await one(rel) is False:
+                    # every provider is down past the wait budget: stop the whole
+                    # run so the remaining pages stay untouched for a later retry
+                    aborted["v"] = True
+                    return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # never let one page kill the run
@@ -556,6 +613,11 @@ def print_report(report: CompileReport, out=sys.stdout) -> None:
     if report.needs_regen:
         print(f"needs_regen: {len(report.needs_regen)} pages fell back to "
               f"heuristic chunks — rerun compile to retry them", file=out)
+    if report.aborted_all_providers_down:
+        print(f"ABORTED: every provider circuit stayed open past the wait budget "
+              f"(quota exhausted). {report.pages_planned - report.pages_done} pages "
+              f"were left untouched rather than degraded to heuristic chunks — "
+              f"rerun when the quota window resets.", file=out)
     if report.failures:
         print(f"pages with errors/fallback: {len(report.failures)} (see "
               f"corpus/failures.jsonl)", file=out)
