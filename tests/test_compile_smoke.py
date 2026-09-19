@@ -249,3 +249,80 @@ def test_shard_index_deterministic():
 
 
 from rag.corpus.schema import PageCorpus, now_iso  # noqa: E402  (used by flaky)
+
+
+# --------------------------------------------------------------------------------------
+# cost estimator calibration (SA-4: dry-run estimate within 20% of actual)
+# --------------------------------------------------------------------------------------
+
+
+def test_estimate_tokens_matches_measured_gateway_usage():
+    """The --dry-run estimate must land within 20% of real gateway usage.
+
+    Calibrated against a measured 24-page run: actual input 9,569 / output 19,482
+    tokens for 29,373 chars of page markdown. The pre-calibration estimator
+    over-shot by +217% because it billed the system prompt per page, when these
+    gateways prompt-cache the identical system prompt across requests.
+    """
+    from rag.cli.compile_cmd import estimate_tokens
+
+    class FakePage:
+        def __init__(self, n):
+            self.markdown = "x" * n
+            self.char_len = n
+
+    # 24 pages totalling the same markdown volume as the measured run
+    pages = [FakePage(29_373 // 24)] * 24
+    sys_prompt = "S" * 1862  # the real system prompt is ~1862 chars
+
+    est_in, est_out = estimate_tokens(pages, sys_prompt, thinking=False)
+    act_in, act_out = 9_569, 19_482
+    assert abs(est_in - act_in) / act_in <= 0.20, \
+        f"input estimate {est_in} vs actual {act_in} exceeds 20%"
+    assert abs(est_out - act_out) / act_out <= 0.20, \
+        f"output estimate {est_out} vs actual {act_out} exceeds 20%"
+
+
+def test_estimate_excludes_cached_system_prompt():
+    """The system prompt must not be billed per page (it is prompt-cached)."""
+    from rag.cli.compile_cmd import estimate_tokens
+
+    class FakePage:
+        markdown = "x" * 3000
+        char_len = 3000
+
+    pages = [FakePage()]
+    sys_prompt = "S" * 10_000  # huge: if billed, the estimate explodes
+
+    cached_in, _ = estimate_tokens(pages, sys_prompt, thinking=False)
+    billed_in, _ = estimate_tokens(pages, sys_prompt, thinking=False,
+                                   system_prompt_billed=True)
+    assert cached_in == pytest.approx(3000 / 3.07 + 16, rel=0.01)
+    assert billed_in > cached_in * 3, "system prompt should dominate when billed"
+
+
+def test_estimate_uses_capped_markdown_not_pre_cap_length():
+    """Long pages are truncated before sending; estimate the SENT size."""
+    from rag.cli.compile_cmd import estimate_tokens
+
+    class FakePage:
+        def __init__(self, sent, declared):
+            self.markdown = "x" * sent
+            self.char_len = declared
+
+    page = FakePage(sent=24_000, declared=500_000)  # capped at 24k
+    est_in, _ = estimate_tokens([page], "", thinking=False)
+    assert est_in == pytest.approx(24_000 / 3.07 + 16, rel=0.01)
+    assert est_in < 24_000 / 3.07 * 2, "must not use the 500k pre-cap length"
+
+
+def test_estimate_thinking_ratio_is_higher():
+    from rag.cli.compile_cmd import estimate_tokens
+
+    class FakePage:
+        markdown = "x" * 3000
+        char_len = 3000
+
+    _in_plain, out_plain = estimate_tokens([FakePage()], "", thinking=False)
+    _in_think, out_think = estimate_tokens([FakePage()], "", thinking=True)
+    assert out_think > out_plain, "thinking must estimate more output tokens"

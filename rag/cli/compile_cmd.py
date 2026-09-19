@@ -37,12 +37,20 @@ from rag.store import CorpusStore, FileManager, ManifestDiff
 log = logging.getLogger(__name__)
 
 CHECKPOINT_EVERY = 25
-#: empirical output/input token ratios (20-page SA-2 samples): thinking burns
-#: ~3x the input tokens on reasoning gateways; without it output ~= input
-EST_OUTPUT_INPUT_RATIO_THINKING = 3.0
-EST_OUTPUT_INPUT_RATIO_NO_THINKING = 1.0
-#: chars-per-token for rough estimation
-CHARS_PER_TOKEN = 4
+#: Token-estimator constants, CALIBRATED against real gateway usage counters
+#: (measured on a 24-page sample: estimate was +217% off before this).
+#:
+#: The system prompt is NOT billed: these gateways apply prompt caching, and the
+#: corpus build sends an identical system prompt on every request, so it is cached
+#: after the first. Counting it (~620 tokens/page) tripled the estimate. Only the
+#: per-page markdown is charged, at ~3.07 chars/token for this corpus (English
+#: prose + C# identifiers + markdown tables).
+CHARS_PER_TOKEN = 3.07
+#: output/input ratio, measured 2.04 (no-thinking); thinking adds reasoning tokens
+EST_OUTPUT_INPUT_RATIO_THINKING = 2.2
+EST_OUTPUT_INPUT_RATIO_NO_THINKING = 2.04
+#: fixed per-request token overhead (roles, formatting)
+EST_REQUEST_OVERHEAD_TOKENS = 16
 
 
 @dataclass
@@ -321,20 +329,37 @@ def plan_work(
 
 
 def estimate_tokens(pages: list, sys_prompt: str, *,
-                    thinking: bool = True) -> tuple[int, int]:
-    """(input, output) token estimates for a list of PageInputs."""
+                    thinking: bool = False,
+                    system_prompt_billed: bool = False) -> tuple[int, int]:
+    """(input, output) token estimates for a list of PageInputs.
+
+    The system prompt is EXCLUDED by default: every request in a corpus build
+    carries the identical prompt, so provider prompt caching bills it once at most.
+    Counting it per page inflated the estimate ~3x (measured +217% error). Pass
+    ``system_prompt_billed=True`` for a provider without caching.
+
+    Sizes on ``len(page.markdown)`` — the CAPPED text actually sent — not
+    ``page.char_len``, which is the pre-cap length and would overestimate on the
+    long pages that hit the 24k input cap.
+    """
+    sys_chars = len(sys_prompt) if system_prompt_billed else 0
     est_in = 0
     for p in pages:
-        est_in += (len(sys_prompt) + p.char_len) // CHARS_PER_TOKEN + 32
+        sent = len(getattr(p, "markdown", "") or "") or p.char_len
+        est_in += int((sys_chars + sent) / CHARS_PER_TOKEN
+                      + EST_REQUEST_OVERHEAD_TOKENS)
     ratio = (EST_OUTPUT_INPUT_RATIO_THINKING if thinking
              else EST_OUTPUT_INPUT_RATIO_NO_THINKING)
-    est_out = int(est_in * ratio)
-    return est_in, est_out
+    return est_in, int(est_in * ratio)
 
 
 def report_cost(est_in: int, est_out: int, price_in: float | None,
                 price_out: float | None) -> str:
-    lines = [f"estimated tokens: input={est_in:,} output={est_out:,}"]
+    lines = [f"estimated tokens: input={est_in:,} output={est_out:,}",
+             f"  (input counts page text only at {CHARS_PER_TOKEN} chars/token; the "
+             f"identical system prompt is prompt-cached and not billed per page. "
+             f"output = input x {EST_OUTPUT_INPUT_RATIO_NO_THINKING}). Calibrated "
+             f"against real gateway usage; expect +-20%, not exact."]
     if price_in and price_out:
         cost = (est_in * price_in + est_out * price_out) / 1e6
         lines.append(f"estimated cost: {cost:.2f} (price_in={price_in}/M, "
