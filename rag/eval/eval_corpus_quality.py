@@ -19,7 +19,6 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from rag import ROOT
 from rag.cli.compile_cmd import ProviderShard, run_corpus_compile, set_gen_key

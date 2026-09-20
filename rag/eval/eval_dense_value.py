@@ -12,9 +12,8 @@ lexical matches for their gold page, and reports BM25 hits vs hybrid hits.
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from rag.compile import load_rag_config
+from rag.config import load_settings
 from rag.search.engine import SearchEngine
 
 # (query, substring the correct source must contain)
@@ -35,7 +34,7 @@ CASES = [
 
 
 def main():
-    cfg = load_rag_config("rag_probe_config.json")
+    cfg = load_settings("rag_probe_config.json")
     engine = SearchEngine(cfg)
     engine.load()
     print(f"chunks={engine.n_chunks} dense={engine.has_dense}\n")

@@ -1,7 +1,7 @@
 # llama.cpp local inference build (Windows, CUDA + Vulkan)
 
 Pre-built **Release** binaries of [llama.cpp](https://github.com/ggml-org/llama.cpp)
-for local inference with Unity-manual RAG. Built natively on Windows (no WSL).
+for local inference with the RAG pipeline. Built natively on Windows (no WSL).
 
 ## Build provenance
 
@@ -41,8 +41,9 @@ model load ≈ 3 s, generation ≈ **100–105 tokens/s**.
 ## Quick start
 
 ## Quick start
-Commands below assume the repo root as CWD; relative paths also work from
-anywhere (the `llama` provider anchors them at the repo root).
+Commands below assume the repo root as CWD. In the RAG provider config,
+relative `server_bin` / `model_path` values anchor at the config file's
+directory, so the config ships next to its binary and just works from any CWD.
 ### One-shot chat
 ```bat
 llama-cli.exe -m models\Qwen3.5-9B\Qwen3.5-9B-Q4_K_M.gguf ^
@@ -99,8 +100,8 @@ A ready provider config ships here: [`provider-qwen35-local.json`](provider-qwen
 RAG corpus compile with the local model:
 RAG corpus compile with the local model:
 ```bat
-cd <repo root>
-.venv\Scripts\python.exe rag.py compile --provider llama_cpp/provider-qwen35-local.json
+  cd <repo root>
+  .venv\Scripts\python.exe -m rag compile --config config.json --config llama_cpp/provider-qwen35-local.json
 ```
 
 Minimal Python usage (pure conversation: prompt in → answer out):
@@ -111,7 +112,7 @@ from rag.llm import create_llm
 from rag.llm.config import ProviderConfig
 
   client = create_llm(ProviderConfig.from_file(
-      "llama_cpp/provider-qwen35-local.json"))  # relative paths anchor at the repo root
+      "llama_cpp/provider-qwen35-local.json"))  # relative paths anchor at the config
 async def main():
     res = await client.generate("You are a helpful assistant.",
                                 "In one sentence: what is a Rigidbody?")

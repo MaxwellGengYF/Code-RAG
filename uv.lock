@@ -167,6 +167,54 @@ nvtx = [
 ]
 
 [[package]]
+name = "doc-rag"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "anthropic" },
+    { name = "beautifulsoup4" },
+    { name = "httpx" },
+    { name = "json-repair" },
+    { name = "lxml" },
+    { name = "msgspec" },
+    { name = "numpy" },
+    { name = "ollama" },
+    { name = "openai" },
+    { name = "regex" },
+    { name = "sentence-transformers" },
+    { name = "torch" },
+    { name = "tqdm" },
+    { name = "xxhash" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anthropic", specifier = ">=0.60.0" },
+    { name = "beautifulsoup4", specifier = ">=4.12.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
+    { name = "json-repair", specifier = ">=0.59.10" },
+    { name = "lxml", specifier = ">=5.0.0" },
+    { name = "msgspec", specifier = ">=0.19.0" },
+    { name = "numpy", specifier = ">=1.26.0" },
+    { name = "ollama", specifier = ">=0.4.0" },
+    { name = "openai", specifier = ">=1.60.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
+    { name = "regex", specifier = ">=2024.0.0" },
+    { name = "sentence-transformers", specifier = ">=3.0.0" },
+    { name = "torch", specifier = ">=2.13.0", index = "https://download.pytorch.org/whl/cu126" },
+    { name = "tqdm", specifier = ">=4.66.0" },
+    { name = "xxhash", specifier = ">=3.4.0" },
+]
+provides-extras = ["dev"]
+
+[[package]]
 name = "docstring-parser"
 version = "0.18.0"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
@@ -448,6 +496,15 @@ dependencies = [
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/d5/1d/537ab090f302b838943a1b56497dd53059b9a9b46a074936470173a2e207/joblib-1.6.0.tar.gz", hash = "sha256:2ccc96785b12046c08fd6d55839c12857831b54a3c1673ffadd2f04bfc4eda03" }
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/18/53/84099323c2ec4be98d935f63c033ac4151ee83836ca1050ede3b3aadf155/joblib-1.6.0-py3-none-any.whl", hash = "sha256:3dbbf9f6e4b592a2357b854608e980fe6390d131d7a82f011a377ef2ebef7aba" },
+]
+
+[[package]]
+name = "json-repair"
+version = "0.63.4"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/62/72/4ec122befe7c2091ba7370d985cf0a3d4dbeccc2f832898ddb7921b4ab94/json_repair-0.63.4.tar.gz", hash = "sha256:77aa642193d62b02b889e8ce0df33898d3ea87282f0b9d8653f8ce8772c642b4" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/a1/ea/1a7b47196b0d03f59a80f5218b2a34160587c84ca8b0bcb56cb4ee93834e/json_repair-0.63.4-py3-none-any.whl", hash = "sha256:0f374f3eee21454aef0a5d72c06b8689b660a1788f80ab392639e3f7d5c5d458" },
 ]
 
 [[package]]
@@ -1641,52 +1698,6 @@ sdist = { url = "https://mirrors.aliyun.com/pypi/packages/a3/26/b09b8010994eccc3
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/67/81/4add07e5172b7ac40d8ed5ff580409a7801a4fe26d529bdd915401dabfbe/typing_inspection-0.4.4-py3-none-any.whl", hash = "sha256:65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147" },
 ]
-
-[[package]]
-name = "unity-manual-rag"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "anthropic" },
-    { name = "beautifulsoup4" },
-    { name = "httpx" },
-    { name = "lxml" },
-    { name = "msgspec" },
-    { name = "numpy" },
-    { name = "ollama" },
-    { name = "openai" },
-    { name = "regex" },
-    { name = "sentence-transformers" },
-    { name = "torch" },
-    { name = "tqdm" },
-    { name = "xxhash" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "anthropic", specifier = ">=0.60.0" },
-    { name = "beautifulsoup4", specifier = ">=4.12.0" },
-    { name = "httpx", specifier = ">=0.27.0" },
-    { name = "lxml", specifier = ">=5.0.0" },
-    { name = "msgspec", specifier = ">=0.19.0" },
-    { name = "numpy", specifier = ">=1.26.0" },
-    { name = "ollama", specifier = ">=0.4.0" },
-    { name = "openai", specifier = ">=1.60.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
-    { name = "regex", specifier = ">=2024.0.0" },
-    { name = "sentence-transformers", specifier = ">=3.0.0" },
-    { name = "torch", specifier = ">=2.13.0", index = "https://download.pytorch.org/whl/cu126" },
-    { name = "tqdm", specifier = ">=4.66.0" },
-    { name = "xxhash", specifier = ">=3.4.0" },
-]
-provides-extras = ["dev"]
 
 [[package]]
 name = "xxhash"

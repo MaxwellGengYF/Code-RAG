@@ -8,7 +8,7 @@
 /corpus_probe/
 /index_probe/
 /corpus/failures.jsonl
-/eval_gold_probe.json
+/rag/eval/eval_gold_probe.json
 /eval_results_latest.md
 /rag_probe_config.json
 /rag_probe_rerank.json
@@ -33,3 +33,4 @@ __pycache__/
 # USAGE.md and provider-qwen35-local.json in llama_cpp/ stay tracked.
 /models/
 llama_cpp/*.exe
+/agent.py

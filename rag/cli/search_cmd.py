@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from rag.compile import load_rag_config
+from rag.config import load_settings
 
 
 def _read_queries(queries: list[str] | None, query_file: str | None) -> list[str]:
@@ -37,15 +37,15 @@ def run_search(
     legacy: bool = False,
     out: str | None = None,
     snippet_width: int = 500,
-    config_path: str = "rag_config.json",
+    config_path: str | None = None,
 ) -> int:
-    cfg = load_rag_config(config_path)
+    cfg = load_settings(config_path)
     k = k if k is not None else int(cfg.get("final_k", 8))
     mode = mode or cfg.get("mode", "hybrid")
 
     if legacy:
         # Preserve the old engine (and its legacy artefacts) behind an explicit flag.
-        import hybrid_retrieve
+        from rag.legacy import hybrid_retrieve
         argv: list[str] = []
         for q in queries or []:
             argv += ["--query", q]
@@ -76,11 +76,10 @@ def run_search(
         # `git clone`, not an internal error.
         print(str(exc), file=sys.stderr)
         print("\nnothing has been built in this checkout yet. To build:", file=sys.stderr)
-        print("  1. uv run python rag.py compile --provider "
-              "llama_cpp/provider-qwen35-local.json # LLM corpus (slow, resumable)",
+        print("  1. python -m rag compile --config <provider.json> "
+              "# LLM corpus (slow, resumable)", file=sys.stderr)
+        print("  2. python -m rag compile --steps index    # BM25 + dense indexes",
               file=sys.stderr)
-        print("  2. uv run python rag.py compile --steps index                "
-              "                  # BM25 + dense indexes", file=sys.stderr)
         print("see AGENTS.md for the full workflow.", file=sys.stderr)
         return 1
 

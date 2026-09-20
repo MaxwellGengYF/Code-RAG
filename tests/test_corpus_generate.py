@@ -6,6 +6,8 @@ import json
 import pytest
 
 from rag.corpus.generate import (
+    CorpusGenerationError,
+    MAX_JSON_REPAIR_SESSIONS,
     chunk_text,
     extract_json_object,
     generate_page_corpus,
@@ -106,6 +108,40 @@ async def test_malformed_json_then_repair(page):
     assert "failed validation" in client.prompts[1][1]
 
 
+async def test_json_repair_salvages_broken_json_first_try(page):
+    # strict-invalid JSON (trailing comma + stray closers) that json_repair
+    # fixes on the INITIAL output — no self-repair session is spent
+    text = "Controls the position and velocity of a GameObject through physics simulation."
+    broken = ('{"chunks": [{"heading_path": ["Rigidbody"], "text": "'
+              + text + '", }],}}')
+    client = FakeClient([broken])
+    corpus, stats = await generate_page_corpus(
+        client, page, gen_key="gk", html_md5="md5")
+    assert stats.first_try_valid and not stats.fallback
+    assert stats.attempts == 1 and len(client.prompts) == 1
+    assert len(corpus.chunks) == 1
+
+
+async def test_self_repair_succeeds_on_last_allowed_session(page):
+    client = FakeClient(["bad one", "bad two", "bad three", good_json()])
+    corpus, stats = await generate_page_corpus(
+        client, page, gen_key="gk", html_md5="md5")
+    assert stats.repaired and not stats.fallback
+    # initial generation + all 3 self-repair sessions were spent
+    assert stats.attempts == 1 + MAX_JSON_REPAIR_SESSIONS
+    assert len(client.prompts) == 1 + MAX_JSON_REPAIR_SESSIONS
+    assert norm_ws(corpus.chunks[0].text) in norm_ws(page.markdown)
+
+
+async def test_self_repair_raises_after_max_sessions(page):
+    # a 5th (valid) response must never be requested: the cap is hit first
+    client = FakeClient(["bad one", "bad two", "bad three", "bad four",
+                         good_json()])
+    with pytest.raises(CorpusGenerationError):
+        await generate_page_corpus(client, page, gen_key="gk", html_md5="md5")
+    assert len(client.prompts) == 1 + MAX_JSON_REPAIR_SESSIONS
+
+
 async def test_non_substring_text_repairs(page):
     bad = json.dumps({"chunks": [{"heading_path": [], "text": "Completely made up prose that appears nowhere in the page."}]})
     client = FakeClient([bad, good_json()])
@@ -133,12 +169,16 @@ async def test_api_failure_falls_back(page):
     assert norm_ws(corpus.chunks[0].text) in norm_ws(page.markdown)
 
 
-async def test_persisted_failure_falls_back(page):
-    # both attempts return invalid output
-    client = FakeClient(["no json here", "still not json"])
-    corpus, stats = await generate_page_corpus(
-        client, page, gen_key="gk", html_md5="md5")
-    assert stats.fallback and stats.attempts == 2
+async def test_persisted_invalid_json_raises(page):
+    # initial generation + MAX_JSON_REPAIR_SESSIONS fresh sessions, all
+    # unparseable -> hard error (the compile loop catches it per page)
+    client = FakeClient(["no json here", "still not json", "nope", "never"])
+    with pytest.raises(CorpusGenerationError) as exc_info:
+        await generate_page_corpus(client, page, gen_key="gk", html_md5="md5")
+    assert page.source in str(exc_info.value)
+    assert len(client.prompts) == 1 + MAX_JSON_REPAIR_SESSIONS
+    # each repair session echoes the failure of the previous output
+    assert all("failed validation" in p[1] for p in client.prompts[1:])
 
 
 def test_chunk_text_port():
@@ -169,13 +209,19 @@ def test_extract_json_object_truncated_trailing_closers():
     assert extract_json_object('```json\n{"a": {"b": [1, 2\n```') == {
         "a": {"b": [1, 2]},
     }
-    # non-truncation problems must still fail
+
+
+def test_extract_json_object_json_repair():
+    # hallucinated breakage strict decoding rejects but json_repair salvages
+    assert extract_json_object('{"a": }') == {"a": ""}
+    assert extract_json_object('{"a": "unterminated') == {"a": "unterminated"}
+    assert extract_json_object('{"a": 1]}') == {"a": 1}
+    assert extract_json_object('{"chunks": [{"text": "x", }],}') == {
+        "chunks": [{"text": "x"}],
+    }
+    # json_repair yielding a non-object (a list) is not an object either
     with pytest.raises(ValueError):
-        extract_json_object('{"a": }')
-    with pytest.raises(ValueError):
-        extract_json_object('{"a": "unterminated')
-    with pytest.raises(ValueError):
-        extract_json_object('{"a": 1]}')
+        extract_json_object("blah { blah")
 
 
 def test_validate_caps_qa(page):

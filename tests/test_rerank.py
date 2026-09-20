@@ -213,7 +213,7 @@ def test_run_search_legacy_forwards_mentions_flags(monkeypatch):
             captured["argv"] = argv
             return 0
 
-    monkeypatch.setitem(__import__("sys").modules, "hybrid_retrieve", FakeLegacy())
+    monkeypatch.setattr("rag.legacy.hybrid_retrieve.main", FakeLegacy.main)
     sc.run_search(mentions="Foo", mentions_limit=5, mentions_context=80,
                   legacy=True, snippet_width=300)
     argv = captured["argv"]

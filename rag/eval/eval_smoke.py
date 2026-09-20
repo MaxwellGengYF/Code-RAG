@@ -21,9 +21,8 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from rag.compile import load_rag_config
+from rag.config import load_settings
 from rag.search.engine import SearchEngine
 
 # (query, substring the correct source must contain, why this case exists)
@@ -63,12 +62,12 @@ DENSE_ONLY = [
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="rag_config.json")
+    ap.add_argument("--config", default=None)
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--k", type=int, default=5)
     args = ap.parse_args()
 
-    cfg = load_rag_config(args.config)
+    cfg = load_settings(args.config)
     t0 = time.time()
     engine = SearchEngine(cfg)
     try:
@@ -117,7 +116,7 @@ def main() -> int:
 
     print("\n== dense-dependent queries (BM25 returns nothing) ==")
     if not engine.has_dense:
-        print("  SKIP: no vectors.f32 — build with `rag.py compile --steps index`")
+        print("  SKIP: no vectors.f32 — build with `python -m rag compile --steps index`")
     else:
         for q, gold, why in DENSE_ONLY:
             if not gold_is_indexed(gold):

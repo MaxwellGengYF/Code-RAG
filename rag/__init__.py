@@ -1,8 +1,8 @@
-"""LLM-built RAG corpus + hybrid retrieval for the Unity Manual mirror.
+"""LLM-built RAG corpus + hybrid retrieval over any document set.
 
 Two-command system:
-    rag.py compile  -- LLM-generated corpus -> indexes -> deps (md5-incremental)
-    rag.py search   -- query -> ranked results (BM25 + dense, RRF-fused)
+    python -m rag compile  -- LLM-generated corpus -> indexes -> deps (md5-incremental)
+    python -m rag search   -- query -> ranked results (BM25 + dense, RRF-fused)
 
 Subpackages:
     rag.llm     -- vendored, tool-free LLM backend (openai_legacy / openai_responses /

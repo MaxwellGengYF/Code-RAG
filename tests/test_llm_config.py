@@ -85,7 +85,7 @@ def test_env_application(tmp_path, monkeypatch):
 
 
 def test_from_file_relative_path_anchors_at_root():
-    # The documented `--provider llama_cpp/provider-qwen35-local.json` must
+    # The llama_cpp/provider-qwen35-local.json provider config must
     # resolve no matter which CWD the process was started from.
     cfg = ProviderConfig.from_file("llama_cpp/provider-qwen35-local.json")
     assert cfg.path == ROOT / "llama_cpp" / "provider-qwen35-local.json"

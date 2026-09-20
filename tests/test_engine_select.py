@@ -259,21 +259,16 @@ def test_estimate_pending_scales_from_sample(tmp_path):
             "<p>" + ("Documentation body words. " * 40) + "</p>"
             "</div></div></body></html>", encoding="utf-8")
 
-    import rag.cli.status_cmd as sc
-    old = sc.resolve_path
-    sc.resolve_path = lambda p, *a, **k: (root / p) if p == "." else old(p, *a, **k)
-    try:
-        rels = [f"Manual/p{i}.html" for i in range(6)]
-        text = estimate_pending(6, rels, {"max_input_chars": 24000,
-                                          "max_chunk_chars": 1200})
-        assert "6 pages pending" in text
-        assert "M input" in text or "input" in text
-        # zero pending -> nothing to estimate
-        assert "nothing pending" in estimate_pending(0, rels, {})
-        # no sample available -> says so rather than crashing
-        assert "no pages available" in estimate_pending(5, [], {})
-    finally:
-        sc.resolve_path = old
+    rels = [f"Manual/p{i}.html" for i in range(6)]
+    text = estimate_pending(6, rels, {"max_input_chars": 24000,
+                                      "max_chunk_chars": 1200,
+                                      "_base_dir": str(root)})
+    assert "6 pages pending" in text
+    assert "M input" in text or "input" in text
+    # zero pending -> nothing to estimate
+    assert "nothing pending" in estimate_pending(0, rels, {})
+    # no sample available -> says so rather than crashing
+    assert "no pages available" in estimate_pending(5, [], {})
 
 
 def test_estimate_pending_is_deterministic(tmp_path):
@@ -286,13 +281,8 @@ def test_estimate_pending_is_deterministic(tmp_path):
             "<html><body><div id='content-wrap'><div class='section'>"
             "<p>Some documentation content here for sampling.</p>"
             "</div></div></body></html>", encoding="utf-8")
-    import rag.cli.status_cmd as sc
-    old = sc.resolve_path
-    sc.resolve_path = lambda p, *a, **k: (root / p) if p == "." else old(p, *a, **k)
-    try:
-        rels = [f"Manual/q{i}.html" for i in range(4)]
-        a = estimate_pending(4, rels, {})
-        b = estimate_pending(4, rels, {})
-        assert a == b, "status output must be stable across runs"
-    finally:
-        sc.resolve_path = old
+    rels = [f"Manual/q{i}.html" for i in range(4)]
+    cfg = {"_base_dir": str(root)}
+    a = estimate_pending(4, rels, cfg)
+    b = estimate_pending(4, rels, cfg)
+    assert a == b, "status output must be stable across runs"

@@ -15,7 +15,6 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from rag.store import CorpusStore
 
@@ -51,7 +50,7 @@ def main():
         page = store.load(rel)
         if page is None:
             print(f"{i:>2}. MISSING FROM CORPUS: {rel}  (regenerate: "
-                  f"rag.py compile --only {rel} --provider <cfg>)")
+                  f"python -m rag compile --only {rel} --config <cfg>)")
             n_missing += 1
             continue
         blob = " ".join(c["text"] for c in page.get("chunks") or [])

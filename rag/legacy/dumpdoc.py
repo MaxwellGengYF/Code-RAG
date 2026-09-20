@@ -6,7 +6,7 @@ import sys, re, io, argparse
 from pathlib import Path
 from bs4 import BeautifulSoup
 
-from doc_clean import BOILER, content_root, is_boiler_line
+from .doc_clean import BOILER, content_root, is_boiler_line
 
 CONTAINERS = {"div", "section", "article", "main", "header", "footer", "nav", "ul", "ol",
               "table", "thead", "tbody", "tr", "pre", "h1", "h2", "h3", "h4", "h5", "h6",

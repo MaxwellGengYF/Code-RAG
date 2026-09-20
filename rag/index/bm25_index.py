@@ -7,8 +7,8 @@ min_should_match=0.6.
 """
 from __future__ import annotations
 
-from retrieval import InvertedIndex, Searcher
-from unity_tokenizer import WordTokenizer, path_terms
+from rag.legacy.retrieval import InvertedIndex, Searcher
+from rag.legacy.unity_tokenizer import WordTokenizer, path_terms
 from rag.corpus.schema import CorpusChunk, to_index_text
 
 

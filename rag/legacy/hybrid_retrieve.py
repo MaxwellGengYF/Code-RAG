@@ -35,9 +35,9 @@ import xxhash
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-from retrieval import BM25Scorer, InvertedIndex, NgramTokenizer, Searcher
-from unity_tokenizer import WordTokenizer, path_terms
-from doc_clean import content_root, page_title, strip_boiler
+from .retrieval import BM25Scorer, InvertedIndex, NgramTokenizer, Searcher
+from .unity_tokenizer import WordTokenizer, path_terms
+from .doc_clean import content_root, page_title, strip_boiler
 
 # --------------------------------------------------------------------------------------
 # Paths: everything resolves against the repo root (this file's folder), optionally
@@ -45,7 +45,7 @@ from doc_clean import content_root, page_title, strip_boiler
 # --------------------------------------------------------------------------------------
 
 ROOT = Path(os.environ.get("UNITY_DOCS_ROOT", "")).resolve() \
-    if os.environ.get("UNITY_DOCS_ROOT") else Path(__file__).resolve().parent
+    if os.environ.get("UNITY_DOCS_ROOT") else Path(__file__).resolve().parents[2]
 
 MANIFEST_PATH = "manifest.json"
 SCHEMA_VERSION = 2
@@ -586,7 +586,7 @@ def check_manifest(
         print(f"[manifest] WARNING: {w}", file=sys.stderr)
 
 
-DEFAULT_CONFIG_PATH = "retriever_config.json"
+DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().parents[2] / "retriever_config.json")
 
 # Defaults applied when retriever_config.json omits a key.
 DEFAULTS: dict = {
@@ -766,7 +766,7 @@ class Session:
             "text": snippet,
             "snippet_truncated": truncated,
             "page_text_chars": sum(len(self.chunks[i].text) for i in ids),
-            "read_more": f"uv run python dumpdoc.py {src}",
+            "read_more": f"python -m rag.legacy.dumpdoc {src}",
         }
         if context and ids:
             lo = max(0, chunk_index - context)
@@ -785,7 +785,7 @@ class Session:
 
     def _attach_dumps(self, hits: list[dict], dump: int) -> None:
         """Inline full page markdown (dumpdoc.py) for the top *dump* distinct sources."""
-        import dumpdoc
+        from . import dumpdoc
         seen: set[str] = set()
         for h in hits:
             if len(seen) >= dump:
@@ -809,7 +809,7 @@ class Session:
 
     def read(self, source: str, max_chars: int | None = None) -> dict:
         """Full markdown for one doc page (the 'read_more' action)."""
-        import dumpdoc
+        from . import dumpdoc
         path = resolve_path(source)
         if not path.exists():
             return {"source": source, "error": f"not found: {path}"}
@@ -915,7 +915,7 @@ def main(argv: list[str] | None = None) -> int:
         # REPL is engine-aware too: once the RAG index covers the mirror, the
         # persistent session should serve from it, not from chunks.pkl. The
         # protocol is identical (see rag/cli/repl_cmd.py) so clients are unaffected.
-        from rag.compile import load_rag_config
+        from rag.config import load_settings as load_rag_config
         from rag.search.engine_select import choose_engine
         engine_name, status = choose_engine(
             load_rag_config(), prefer="rag" if getattr(args, "rag", False) else None)
@@ -928,11 +928,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.legacy and not args.build and not args.repl:
         # Default path: delegate to the RAG engine, but only once its index is
-        # built AND covers essentially the whole mirror. While `rag.py compile`
+        # built AND covers essentially the whole mirror. While `python -m rag compile`
         # is still working through the corpus, the legacy artefacts below cover
         # every page and the RAG index would silently retrieve from a subset.
         # --legacy forces this file's original engine; --rag forces the new one.
-        from rag.compile import load_rag_config
+        from rag.config import load_settings as load_rag_config
         from rag.search.engine_select import choose_engine
         rag_cfg = load_rag_config()
         engine_name, status = choose_engine(
@@ -942,12 +942,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[engine] no index built in this checkout: RAG index "
                       f"{status['reason']}; legacy missing "
                       f"{', '.join(status['legacy']['missing'])}. Build with "
-                      f"`rag.py compile --provider <cfg> --no-thinking`, or "
+                      f"`python -m rag compile --config <cfg> --no-thinking`, or "
                       f"`hybrid_retrieve.py --build --force` for the legacy index.",
                       file=sys.stderr)
             else:
                 print(f"[engine] using LEGACY index: RAG index {status['reason']}. "
-                      f"Rebuild with `rag.py compile` (then --steps index) to switch.",
+                      f"Rebuild with `python -m rag compile` (then --steps index) to switch.",
                       file=sys.stderr)
         else:
             from rag.cli.search_cmd import run_search

@@ -17,16 +17,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from hybrid_retrieve import (
+from rag.legacy.hybrid_retrieve import (
     Chunk,
     HashEmbedder,
     cosine_scores,
     dedupe_by_source,
     minmax_normalize,
 )
-from retrieval import Searcher
+from rag.legacy.retrieval import Searcher
 
-CONFIG_PATH = "retriever_config.json"
+CONFIG_PATH = str(Path(__file__).resolve().parents[2] / "retriever_config.json")
 
 # (query, [acceptable gold source paths as substrings])
 GOLD: list[tuple[str, list[str]]] = [

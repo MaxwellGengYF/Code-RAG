@@ -12,10 +12,10 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 
-from doc_clean import BOILER, content_root, page_title
+from rag.legacy.doc_clean import BOILER, content_root, page_title
 from rag import rel_source
 
-import dumpdoc
+from rag.legacy import dumpdoc
 
 TRUNCATION_MARKER = "\n\n[... page truncated: {n} more chars not shown ...]\n"
 

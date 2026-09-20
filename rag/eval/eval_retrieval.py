@@ -13,12 +13,12 @@ import json
 import sys
 from pathlib import Path
 
-from retrieval import InvertedIndex, Searcher
+from rag.legacy.retrieval import InvertedIndex, Searcher
 
-import eval_lib as L
-from hybrid_retrieve import HashEmbedder, get_tokenizer, load_chunks_pickle
+from . import eval_lib as L
+from rag.legacy.hybrid_retrieve import HashEmbedder, get_tokenizer, load_chunks_pickle
 
-CONFIG_PATH = "retriever_config.json"
+CONFIG_PATH = str(Path(__file__).resolve().parents[2] / "retriever_config.json")
 
 # name -> (index file, tokenizer, fuzziness, min_should_match, alpha, per_file)
 CONFIGS: dict[str, tuple] = {
@@ -36,7 +36,7 @@ HDR = (f"{'config':<14}{'index':<20}{'tok':<6}{'fz':<6}{'smm':<6}"
 
 
 def load_cfg() -> dict:
-    from hybrid_retrieve import load_config
+    from rag.legacy.hybrid_retrieve import load_config
     cfg, _ = load_config(CONFIG_PATH)
     return cfg
 

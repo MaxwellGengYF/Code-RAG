@@ -97,7 +97,7 @@ def test_dual_write_alignment_bm25_rows_match_dense_rows(corpus, tmp_path):
     """
     from rag.corpus.schema import to_embed_text, to_index_text
     from rag.index.bm25_index import doc_tokens
-    from unity_tokenizer import WordTokenizer
+    from rag.legacy.unity_tokenizer import WordTokenizer
 
     store = CorpusStore(corpus)
     rows, _ = flatten_corpus(store)

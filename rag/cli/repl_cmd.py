@@ -19,15 +19,17 @@ from __future__ import annotations
 
 import json
 import sys
-from rag import resolve_path
-from rag.compile import load_rag_config
+from pathlib import Path
+
+from rag import ROOT
+from rag.config import config_dir, load_settings
 
 
-def _read_page(source: str, max_chars: int | None) -> dict:
+def _read_page(source: str, max_chars: int | None, base: Path | None = None) -> dict:
     """Full markdown for one doc page (the 'read_more' action)."""
-    import dumpdoc
+    from rag.legacy import dumpdoc
 
-    path = resolve_path(source)
+    path = (base or ROOT) / source
     if not path.exists():
         return {"source": source, "error": f"not found: {path}"}
     md = dumpdoc.dump(str(path), heading=False)
@@ -72,11 +74,11 @@ def _attach_context(pages: dict[str, list], hit: dict, n: int,
     return out
 
 
-def repl_loop(*, config_path: str = "rag_config.json",
+def repl_loop(*, config_path: str | None = None,
               mode: str | None = None) -> int:
     from rag.search.engine import SearchEngine
 
-    cfg = load_rag_config(config_path)
+    cfg = load_settings(config_path)
     if mode:
         cfg["mode"] = mode
     engine = SearchEngine(cfg)
@@ -86,6 +88,7 @@ def repl_loop(*, config_path: str = "rag_config.json",
         print(str(exc), file=sys.stderr)
         return 1
 
+    base = config_dir(cfg)
     print(f"[repl] ready (rag engine) — {engine.n_chunks} chunks, "
           f"dense={engine.has_dense}; JSON requests on stdin, one JSON response "
           f"per line", file=sys.stderr, flush=True)
@@ -128,7 +131,7 @@ def repl_loop(*, config_path: str = "rag_config.json",
                             continue
                         seen.add(src)
                         try:
-                            hit["page_markdown"] = _read_page(src, None)["markdown"]
+                            hit["page_markdown"] = _read_page(src, None, base)["markdown"]
                         except Exception as exc:
                             hit["page_markdown_error"] = str(exc)
                 resp["_meta"] = {"schema": 2, "engine": "rag.search"}
@@ -140,7 +143,7 @@ def repl_loop(*, config_path: str = "rag_config.json",
                     context=int(req.get("context", 0)),
                     dirs=tuple(str(d) for d in dirs) if dirs else None)}
             elif "read" in req:
-                resp = _read_page(str(req["read"]), req.get("max_chars"))
+                resp = _read_page(str(req["read"]), req.get("max_chars"), base)
             else:
                 resp = {"error": "request must contain one of: query, mentions, read"}
         except Exception as exc:  # keep the session alive on per-request failures
@@ -153,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--config", default="rag_config.json")
+    ap.add_argument("--config", default=None, metavar="CFG.json")
     ap.add_argument("--mode", choices=["hybrid", "bm25", "dense"], default=None)
     args = ap.parse_args(argv)
     return repl_loop(config_path=args.config, mode=args.mode)

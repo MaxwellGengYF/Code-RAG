@@ -1,12 +1,19 @@
-"""rag.py — LLM-built RAG corpus + hybrid retrieval for the Unity Manual mirror.
+"""python -m rag — LLM-built RAG corpus + hybrid retrieval over any document set.
 
 Commands:
-          rag.py compile --provider llama_cpp/provider-qwen35-local.json [--steps corpus,index,deps]
-                   [--workers 8] [--max-files N] [--force] [--regen]
-                   [--only REL] [--dry-run]
-    rag.py search  --query "Rigidbody.AddForce" [--k 10] [--mode hybrid|bm25|dense]
-                   [--query-file q.txt] [--mentions TERM] [--explain] [--no-rerank]
-    rag.py status
+    python -m rag compile [--config cfg.json ...] [--steps corpus,index,deps]
+             [--workers 8] [--max-files N] [--force] [--regen]
+             [--only REL] [--dry-run]
+    python -m rag search --query "..." [--k 10] [--mode hybrid|bm25|dense]
+             [--query-file q.txt] [--mentions TERM] [--explain] [--no-rerank]
+    python -m rag status
+    python -m rag repl
+    python -m rag audit-corpus
+
+The config JSON is BOTH the provider config and the corpus config: provider
+keys (model/type/url/api_key/...), input/output locations (dirs, corpus_dir,
+index_dir) and engine tuning live in one file. With no --config, ./config.json
+in the current working directory is used when present.
 """
 from __future__ import annotations
 
@@ -14,14 +21,17 @@ import argparse
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="rag.py", description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        prog="python -m rag", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_compile = sub.add_parser("compile", help="LLM corpus -> indexes -> deps")
-    p_compile.add_argument("--provider", action="append", default=None,
-                           help="Provider config JSON (qwen_flash.json / k27.json format); "
-                                "repeat to shard pages across several providers")
+    p_compile.add_argument("--config", action="append", default=None,
+                           metavar="CFG.json",
+                           help="Combined provider+corpus config JSON (repeat to "
+                                "shard pages across several providers; default: "
+                                "./config.json when present)")
     p_compile.add_argument("--steps", default="deps,corpus,index",
                            help="Comma list: deps,corpus,index (default: all)")
     p_compile.add_argument("--workers", type=int, default=0,
@@ -32,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     p_compile.add_argument("--regen", action="store_true",
                            help="Ignore the manifest and regenerate everything")
     p_compile.add_argument("--only", default=None,
-                           help="Regenerate exactly one page (ROOT-relative path)")
+                           help="Regenerate exactly one page (root-relative path)")
     p_compile.add_argument("--dry-run", action="store_true",
                            help="Print page counts + token/cost estimate, no LLM calls")
     p_compile.add_argument("--no-thinking", action="store_true",
@@ -50,7 +60,6 @@ def main(argv: list[str] | None = None) -> int:
                            help="With --steps index: build BM25 only (minutes "
                                 "instead of hours); dense stays absent so hybrid "
                                 "search degrades to BM25")
-    p_compile.add_argument("--config", default="rag_config.json")
 
     p_search = sub.add_parser("search", help="query -> ranked results")
     p_search.add_argument("--query", action="append", default=None)
@@ -71,36 +80,38 @@ def main(argv: list[str] | None = None) -> int:
     p_search.add_argument("--no-rerank", action="store_true")
     p_search.add_argument("--text", action="store_true", help="Compact human output")
     p_search.add_argument("--legacy", action="store_true",
-                          help="Use the legacy hybrid_retrieve engine")
-    p_search.add_argument("--config", default="rag_config.json")
+                          help="Use the legacy engine (rag.legacy.hybrid_retrieve)")
+    p_search.add_argument("--config", default=None, metavar="CFG.json",
+                          help="Config JSON (default: ./config.json when present)")
 
     p_repl = sub.add_parser(
         "repl", help="persistent JSONL session (query/mentions/read), index loads once")
     p_repl.add_argument("--mode", choices=["hybrid", "bm25", "dense"], default=None)
-    p_repl.add_argument("--config", default="rag_config.json")
+    p_repl.add_argument("--config", default=None, metavar="CFG.json",
+                        help="Config JSON (default: ./config.json when present)")
 
     p_status = sub.add_parser("status", help="corpus/index freshness + counts")
-    p_status.add_argument("--config", default="rag_config.json")
+    p_status.add_argument("--config", default=None, metavar="CFG.json",
+                          help="Config JSON (default: ./config.json when present)")
 
     p_audit = sub.add_parser(
         "audit-corpus",
         help="repair manifest entries claiming pages with no corpus file "
              "(run only when no compile is active)")
-    p_audit.add_argument("--config", default="rag_config.json")
+    p_audit.add_argument("--config", default=None, metavar="CFG.json",
+                         help="Config JSON (default: ./config.json when present)")
 
     args = parser.parse_args(argv)
-
     if args.command == "compile":
         from rag.compile import run_compile
         return run_compile(
-            providers=args.provider,
+            configs=args.config,
             steps=[s.strip() for s in args.steps.split(",") if s.strip()],
             workers=args.workers, max_files=args.max_files, force=args.force,
             regen=args.regen, only=args.only, dry_run=args.dry_run,
             no_thinking=args.no_thinking, price_in=args.price_in,
             price_out=args.price_out, skip_dense=args.skip_dense,
             install_embed_model=args.install_embed_model,
-            config_path=args.config,
         )
     if args.command == "search":
         from rag.cli.search_cmd import run_search

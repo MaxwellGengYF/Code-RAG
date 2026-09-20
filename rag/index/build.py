@@ -22,7 +22,7 @@ from pathlib import Path
 
 import msgspec
 
-from rag import resolve_path
+from rag.config import config_dir, data_path
 from rag.corpus.schema import CorpusChunk, QA
 from rag.store import CorpusStore, FileManager
 
@@ -103,12 +103,13 @@ def _sha1_8(path: Path) -> str:
 def build_indexes(cfg: dict, *, force: bool = False, skip_dense: bool = False,
                   verbose: bool = True) -> int:
     t0 = time.time()
-    corpus_dir = resolve_path(cfg.get("corpus_dir", "corpus"))
-    index_dir = resolve_path(cfg.get("index_dir", "index"))
+    base = config_dir(cfg)
+    corpus_dir = data_path(cfg, "corpus_dir", "corpus", base=base)
+    index_dir = data_path(cfg, "index_dir", "index", base=base)
     index_dir.mkdir(parents=True, exist_ok=True)
     store = CorpusStore(corpus_dir)
 
-    fm = FileManager(root=resolve_path("."), dirs=cfg.get("dirs", []),
+    fm = FileManager(root=base, dirs=cfg.get("dirs", []),
                      corpus_dir=corpus_dir)
     corpus_manifest = fm.load_manifest()
     gen_key = corpus_manifest.get("gen_key", "")

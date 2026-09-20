@@ -22,7 +22,6 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # (typo query, substring the intended page must contain)
 TYPO_CASES = [
@@ -39,8 +38,8 @@ TYPO_CASES = [
 
 def score_legacy(index_path: str, tokenizer_name: str, fuzziness, label: str):
     """Legacy engine (hybrid_retrieve) on its own artefacts."""
-    from retrieval import InvertedIndex, Searcher
-    from hybrid_retrieve import (dedupe_by_source,
+    from rag.legacy.retrieval import InvertedIndex, Searcher
+    from rag.legacy.hybrid_retrieve import (dedupe_by_source,
                                  get_tokenizer, load_chunks_pickle)
 
     t0 = time.time()
@@ -65,11 +64,11 @@ def score_legacy(index_path: str, tokenizer_name: str, fuzziness, label: str):
     return found
 
 
-def score_new(mode: str, label: str, config: str = "rag_config.json"):
-    from rag.compile import load_rag_config
+def score_new(mode: str, label: str, config: str | None = None):
+    from rag.config import load_settings
     from rag.search.engine import SearchEngine
 
-    engine = SearchEngine(load_rag_config(config))
+    engine = SearchEngine(load_settings(config))
     engine.load()
     print(f"  [{label}] {engine.n_chunks} chunks, dense={engine.has_dense}",
           file=sys.stderr)
@@ -102,10 +101,10 @@ def main():
     results["new bm25"] = score_new("bm25", "new-bm25")
 
     # hybrid needs vectors; use the probe index when the production one is BM25-only
-    from rag.compile import load_rag_config
+    from rag.config import load_settings
     from rag.search.engine_select import rag_index_status
-    cfg_name = "rag_config.json"
-    if not rag_index_status(load_rag_config(cfg_name))["has_dense"]:
+    cfg_name = config
+    if not rag_index_status(load_settings(cfg_name))["has_dense"]:
         probe = Path("rag_probe_config.json")
         if probe.exists():
             cfg_name = "rag_probe_config.json"

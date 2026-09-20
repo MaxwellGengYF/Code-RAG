@@ -41,7 +41,7 @@ class SearchEngine:
         if self._loaded:
             return
         from rag.index.bm25_index import new_searcher
-        from retrieval import InvertedIndex
+        from rag.legacy.retrieval import InvertedIndex
 
         chunks_path = self.index_dir / "chunks.msgpack"
         bm25_path = self.index_dir / "bm25_word.pkl"
@@ -51,7 +51,7 @@ class SearchEngine:
         if missing:
             raise FileNotFoundError(
                 "index artefacts not found: " + ", ".join(str(m) for m in missing)
-                + "\n  build them with: uv run python rag.py compile --steps index")
+                + "\n  build them with: python -m rag compile --steps index")
         # Decode with the type so nested QA structs come back as objects, not
         # dicts — ChunkRow(**r) would leave qa as dicts and to_index_text would
         # then raise AttributeError on q.q.
@@ -75,7 +75,7 @@ class SearchEngine:
                     f"index/vectors.f32 has {count} rows but chunks.msgpack has "
                     f"{n_rows}: the dense index was built from a different chunk "
                     f"table, so every dense score would be attributed to the wrong "
-                    f"chunk. Rebuild with: uv run python rag.py compile "
+                    f"chunk. Rebuild with: python -m rag compile "
                     f"--steps index --force")
             stamp_path = Path(str(vecs_path) + ".progress")
             if stamp_path.exists():
@@ -89,8 +89,7 @@ class SearchEngine:
                         f"index/vectors.f32 is only {done}/{n_rows} rows embedded "
                         f"(an interrupted build): the remaining rows are "
                         f"pre-allocated zeros, so dense search would return "
-                        f"garbage for them. Rebuild with: uv run python rag.py "
-                        f"compile --steps index --force")
+                        f"garbage for them. Rebuild with: python -m rag compile --steps index --force")
             self.vectors = load_vectors(
                 vecs_path, dim=int(self.vector_meta["dim"]), count=count)
         self._check_param_drift()
@@ -120,7 +119,7 @@ class SearchEngine:
             print(f"[search] WARNING: index was built with bm25 aux={got_aux} "
                   f"path_boost={got_pb} but config asks for aux={want_aux} "
                   f"path_boost={want_pb} — results reflect the OLD settings. "
-                  f"Rebuild with: uv run python rag.py compile --steps index "
+                  f"Rebuild with: python -m rag compile --steps index "
                   f"--force", file=sys.stderr)
 
     @property
@@ -157,7 +156,7 @@ class SearchEngine:
         self._warned_dense = True
         print(f"[search] mode={mode} requested but no dense vectors are built — "
               f"falling back to BM25-only, which returns 0 hits for typo and "
-              f"paraphrase queries. Build them with: uv run python rag.py compile "
+              f"paraphrase queries. Build them with: python -m rag compile "
               f"--steps index", file=sys.stderr)
 
     def search(
@@ -257,7 +256,7 @@ class SearchEngine:
             out["explain"] = self._explain_terms(terms)
         if not hits:
             out["hint"] = ("0 results. Try --explain to see which query terms are "
-                           "indexed, or 'rag.py search --mentions TERM' to enumerate "
+                           "indexed, or 'python -m rag search --mentions TERM' to enumerate "
                            "literal occurrences.")
         return out
 

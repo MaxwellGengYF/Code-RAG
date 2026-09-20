@@ -11,29 +11,35 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+
 from rag import resolve_path
+from rag.config import config_dir, data_path
 
 #: fraction of mirrored pages that must have corpus coverage before the RAG index
 #: is considered a drop-in replacement for the full-corpus legacy index
 COMPLETENESS_FRACTION = 0.95
 
 
-def count_html_pages(dirs: list[str]) -> int:
-    """Fast *.html count under *dirs* (no hashing, unlike FileManager.scan)."""
+def count_html_pages(dirs: list[str], base: Path | None = None) -> int:
+    """Fast *.html count under *dirs* (no hashing, unlike FileManager.scan).
+    Relative dirs anchor at *base* (the config's directory by default)."""
     total = 0
+    root = base or config_dir({})
     for d in dirs:
-        base = resolve_path(d)
-        if not base.is_dir():
+        dbase = root / d
+        if not dbase.is_dir():
             continue
-        for _dirpath, _dirnames, filenames in os.walk(base):
+        for _dirpath, _dirnames, filenames in os.walk(dbase):
             total += sum(1 for f in filenames if f.endswith(".html"))
     return total
 
 
 def rag_index_status(cfg: dict) -> dict:
     """Describe the RAG index: built? complete? how many chunks/pages?"""
-    index_dir = resolve_path(cfg.get("index_dir", "index"))
-    corpus_dir = resolve_path(cfg.get("corpus_dir", "corpus"))
+    base = config_dir(cfg)
+    index_dir = data_path(cfg, "index_dir", "index", base=base)
+    corpus_dir = data_path(cfg, "corpus_dir", "corpus", base=base)
     manifest_path = index_dir / "manifest.json"
     out = {
         "built": False, "complete": False, "n_chunks": 0, "n_pages": 0,
@@ -52,7 +58,7 @@ def rag_index_status(cfg: dict) -> dict:
     out["n_chunks"] = int(im.get("n_chunks", 0))
     out["n_pages"] = int(im.get("n_pages", 0))
     out["has_dense"] = (index_dir / "vectors.f32").exists()
-    html_pages = count_html_pages(cfg.get("dirs", ["Manual", "ScriptReference"]))
+    html_pages = count_html_pages(cfg.get("dirs", []), base)
     out["html_pages"] = html_pages
     if html_pages:
         out["coverage"] = out["n_pages"] / html_pages

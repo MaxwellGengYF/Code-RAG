@@ -26,6 +26,7 @@ from typing import Any, Callable, Sequence
 from rag.corpus import (
     EXTRACTOR_VERSION,
     SCHEMA_VERSION,
+    CorpusGenerationError,
     PageCorpus,
     extract_page,
     generate_page_corpus,
@@ -477,9 +478,19 @@ async def run_corpus_compile(
             for idx in candidates:
                 shard = shards[idx]
                 async with sems[idx]:
-                    corpus, stats = await generate_page_corpus(
-                        shard.client, page, gen_key=shard.gen_key,
-                        html_md5=scanned[rel], max_chunk_chars=max_chunk_chars)
+                    try:
+                        corpus, stats = await generate_page_corpus(
+                            shard.client, page, gen_key=shard.gen_key,
+                            html_md5=scanned[rel], max_chunk_chars=max_chunk_chars)
+                    except CorpusGenerationError as exc:
+                        # The model's JSON survived json_repair AND every
+                        # self-repair session. The API itself is healthy (no
+                        # failover — a sibling provider would face the same
+                        # page), so degrade THIS page to heuristic chunks and
+                        # flag it for a later run; one pathological page must
+                        # never wedge a 44k-page build.
+                        corpus, stats = _unrepairable_output(
+                            page, scanned[rel], shard.gen_key, exc)
                 if stats.api_failed:
                     pool.record_api_failure(idx)
                     corpus = stats = None
@@ -575,6 +586,27 @@ def _all_providers_down(page, html_md5: str, gen_key: str):
     stats.fallback = True
     stats.api_failed = True
     stats.errors.append("fallback: all providers unavailable (circuits open)")
+    corpus = _fallback_corpus(page, gen_key)
+    corpus.html_md5 = html_md5
+    return corpus, stats
+
+
+def _unrepairable_output(page, html_md5: str, gen_key: str,
+                         exc: CorpusGenerationError) -> tuple[PageCorpus, Any]:
+    """Heuristic corpus for a page whose model output survived every recovery
+    step (strict decode, truncated-closer repair, json_repair, and all
+    self-repair sessions).
+
+    Same contract as the API-failure fallback: flagged needs_regen so a later
+    run retries the page (a model or prompt update may un-stick it). The
+    generation stats attached to the exception (attempts, tokens, error list)
+    are preserved so the report reflects the spent generations.
+    """
+    from rag.corpus.generate import PageGenStats, _fallback_corpus
+
+    stats = exc.stats if exc.stats is not None else PageGenStats(source=page.source)
+    stats.fallback = True
+    stats.errors.append(f"fallback: {exc}")
     corpus = _fallback_corpus(page, gen_key)
     corpus.html_md5 = html_md5
     return corpus, stats

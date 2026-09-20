@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import json
 import sys
-from rag import resolve_path
-from rag.compile import load_rag_config
+from pathlib import Path
+
+from rag.config import config_dir, data_path, load_settings
 
 
-def run_audit_corpus(*, config_path: str = "rag_config.json") -> int:
+def run_audit_corpus(*, config_path: str | None = None) -> int:
     """Repair manifest entries that claim pages with no corpus file.
 
     Safe only when no compile is running (it rewrites corpus/manifest.json, which
@@ -15,12 +16,13 @@ def run_audit_corpus(*, config_path: str = "rag_config.json") -> int:
     """
     from rag.store import FileManager
 
-    cfg = load_rag_config(config_path)
-    fm = FileManager(root=resolve_path("."), dirs=cfg.get("dirs", []),
-                     corpus_dir=resolve_path(cfg.get("corpus_dir", "corpus")))
+    cfg = load_settings(config_path)
+    base = config_dir(cfg)
+    fm = FileManager(root=base, dirs=cfg.get("dirs", []),
+                     corpus_dir=data_path(cfg, "corpus_dir", "corpus", base=base))
     running = _compile_running()
     if running:
-        print("REFUSING: a `rag.py compile` process appears to be running and owns "
+        print("REFUSING: a `python -m rag compile` process appears to be running and owns "
               "corpus/manifest.json. Wait for it to finish (or stop it) and rerun.",
               file=sys.stderr)
         return 1
@@ -49,7 +51,7 @@ def _compile_running() -> bool:
                 capture_output=True, text=True, timeout=60).stdout
             pids = {int(x) for x in out.split() if x.strip().isdigit()}
             return bool(pids - {me})
-        out = subprocess.run(["pgrep", "-f", "rag.py compile"],
+        out = subprocess.run(["pgrep", "-f", "rag compile"],
                              capture_output=True, text=True, timeout=60).stdout
         pids = {int(x) for x in out.split() if x.strip().isdigit()}
         return bool(pids - {me, os.getppid()})
@@ -79,7 +81,7 @@ def estimate_pending(pending: int, sampled_rels: list[str], cfg: dict) -> str:
 
     rng = random.Random(0)
     sample = rng.sample(sampled_rels, min(40, len(sampled_rels)))
-    root = resolve_path(".")
+    root = config_dir(cfg)
     pages = []
     for rel in sample:
         p = extract_page(root / rel, root=root,
@@ -102,13 +104,14 @@ def estimate_pending(pending: int, sampled_rels: list[str], cfg: dict) -> str:
     return "\n".join(lines)
 
 
-def run_status(*, config_path: str = "rag_config.json") -> int:
-    cfg = load_rag_config(config_path)
-    corpus_dir = resolve_path(cfg.get("corpus_dir", "corpus"))
-    index_dir = resolve_path(cfg.get("index_dir", "index"))
+def run_status(*, config_path: str | None = None) -> int:
+    cfg = load_settings(config_path)
+    base = config_dir(cfg)
+    corpus_dir = data_path(cfg, "corpus_dir", "corpus", base=base)
+    index_dir = data_path(cfg, "index_dir", "index", base=base)
 
     from rag.store import CorpusStore, FileManager
-    fm = FileManager(root=resolve_path("."), dirs=cfg.get("dirs", []),
+    fm = FileManager(root=base, dirs=cfg.get("dirs", []),
                      corpus_dir=corpus_dir)
     scanned = fm.scan()
     diff = fm.diff(scanned)
@@ -127,11 +130,11 @@ def run_status(*, config_path: str = "rag_config.json") -> int:
         # exist (scar of an earlier bug where a run claimed the whole scan). They
         # do NOT break planning — plan_work verifies the filesystem, so those
         # pages still requeue — but they overstate progress here. Repair with
-        # `rag.py audit-corpus` when no compile is running.
+        # `python -m rag audit-corpus` when no compile is running.
         print(f"             WARNING: manifest claims {n_claimed} pages but only "
               f"{n_corpus_files} corpus files exist ({n_claimed - n_corpus_files} "
               f"phantom). Coverage/diff below use the FILESYSTEM, so planning is "
-              f"still correct. Repair when idle: rag.py audit-corpus")
+              f"still correct. Repair when idle: python -m rag audit-corpus")
     print(f"coverage   : {n_corpus_files}/{len(scanned)} pages "
           f"({(n_corpus_files / len(scanned) if scanned else 0):.1%}) have a corpus file")
     n_flagged = len(manifest.get("needs_regen", []))
@@ -170,7 +173,7 @@ def run_status(*, config_path: str = "rag_config.json") -> int:
             if p.exists():
                 print(f"             {f}: {p.stat().st_size / 1e6:.1f} MB")
     else:
-        print("index      : NOT BUILT — run: uv run python rag.py compile --steps index")
+        print("index      : NOT BUILT — run: python -m rag compile --steps index")
 
     # Which engine a query would actually use, and why. The RAG index only
     # replaces the legacy full-corpus index once it covers the mirror.
@@ -180,8 +183,8 @@ def run_status(*, config_path: str = "rag_config.json") -> int:
         print("engine     : NEITHER engine is built in this checkout")
         print(f"             RAG index: {st['reason']}")
         print(f"             legacy:    missing {', '.join(st['legacy']['missing'])}")
-        print("             build with: uv run python rag.py compile "
-              "--provider <cfg> --no-thinking  (then --steps index)")
+        print(" build with: python -m rag compile "
+                "--config <cfg> --no-thinking  (then --steps index)")
     else:
         print(f"engine     : {engine.upper()} would serve `hybrid_retrieve.py --query ...`")
         print(f"             {st['reason']}")

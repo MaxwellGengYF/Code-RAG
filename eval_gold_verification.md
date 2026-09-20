@@ -50,5 +50,5 @@ separately from base-24 and do not decide the gate.
 
 ## Reproducing
 
-    uv run python eval_rag.py --show-gold --gold-set ext   # list the queries
+    uv run python -m rag.eval.eval_rag --show-gold --gold-set ext   # list the queries
     uv run python eval_gold_verify.py                      # re-run the verification

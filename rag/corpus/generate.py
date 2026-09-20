@@ -1,17 +1,23 @@
-"""LLM corpus generation for one page: strict JSON -> validation -> repair -> fallback.
-
-Never hard-fails: every page yields a usable PageCorpus. Failures are reported
-via :class:`PageGenStats` for the caller to log to failures.jsonl.
+"""LLM corpus generation for one page: strict JSON -> json_repair salvage -> self-repair sessions.
 
 Pipeline per page:
   1. LLM call (system + user prompt only — no tools).
-  2. Strict JSON extraction (strip fences, take the outermost object).
+  2. JSON extraction by an escalating recovery ladder: strict decode, then
+     truncated-closer repair (local models sometimes emit EOS right after the
+     last chunk object, dropping the trailing ``]}``), then ``json_repair``
+     (trailing commas, unterminated strings, stray closers — the
+     hallucinated-JSON salvage).
   3. msgspec validation + page-level invariants, including the verbatim
      assertion: whitespace-collapsed chunk text must be a substring of the
      whitespace-collapsed source markdown.
-  4. On validation errors: ONE repair retry with the error list echoed back.
-  5. On repair failure / API failure: heuristic fallback (a port of the
-     original fixed-size ``chunk_text``) with empty aux fields.
+  4. On parse/validation errors: up to ``MAX_JSON_REPAIR_SESSIONS`` fresh LLM
+     sessions (each call is a new session — this backend keeps no history),
+     each echoing the error list back so the model fixes its own JSON.
+  5. Still unrepairable after all sessions: raise :class:`CorpusGenerationError`
+     (hard fail).
+  6. API failure (provider down even after transient retries): heuristic
+     fallback (a port of the original fixed-size ``chunk_text``) with empty
+     aux fields, flagged ``needs_regen`` by the compile loop.
 """
 from __future__ import annotations
 
@@ -19,6 +25,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
+import json_repair
 import msgspec
 
 from rag.llm.base import LLMClient, with_retry
@@ -33,9 +40,29 @@ from rag.corpus.schema import (
     now_iso,
 )
 
-MAX_RETRIES = 4  # transient API retries per attempt (429/5xx/timeout)
+MAX_RETRIES = 4  # transient API retries per LLM call (429/5xx/timeout)
 MAX_QA_PER_CHUNK = 3
 MAX_CHUNKS_PER_PAGE = 40  # sanity cap against runaway generations
+#: fresh LLM sessions allowed for the model to fix its own broken JSON after
+#: the initial generation; exceeding this raises CorpusGenerationError
+MAX_JSON_REPAIR_SESSIONS = 3
+
+
+class CorpusGenerationError(Exception):
+    """A page's LLM output stayed broken after every recovery step.
+
+    Raised only for persistently unrepairable MODEL OUTPUT (bad JSON that
+    survives ``json_repair`` plus every self-repair session). Provider/API
+    failures are a different failure mode and demote to the heuristic
+    fallback instead.
+
+    ``stats`` carries the spent generation stats (attempts, tokens, errors)
+    so callers degrading the page to a fallback keep honest accounting.
+    """
+
+    def __init__(self, message: str, *, stats: PageGenStats | None = None):
+        super().__init__(message)
+        self.stats = stats
 
 
 @dataclass
@@ -101,9 +128,15 @@ def _close_truncated_containers(s: str) -> str | None:
 def extract_json_object(text: str) -> dict:
     """Return the first balanced {...} object in *text* as a parsed dict.
 
-    Tolerates markdown fences and leading/trailing commentary, and output
-    truncated only in its trailing container closers (``]}`` cut early).
-    Raises ValueError when no parseable object exists.
+    Escalating recovery ladder for hallucinated output:
+      1. strict decode — markdown fences and leading/trailing commentary are
+         tolerated, nothing else;
+      2. truncated-closer repair — output cut early only in its trailing
+         ``]}`` (exact, never alters content);
+      3. ``json_repair`` — trailing commas, unterminated strings, mismatched
+         closers, and similar breakage a hallucinating model produces.
+
+    Raises ValueError when no step yields a JSON object.
     """
     cleaned = text.strip()
     # strip a whole-output ```json ... ``` wrapper if present (anchored, so inner
@@ -126,10 +159,18 @@ def extract_json_object(text: str) -> dict:
             try:
                 obj, _end = decoder.raw_decode(repaired)
             except json.JSONDecodeError:
-                pass  # not repairable this way — report the original error
+                pass  # not repairable this way — fall through to json_repair
             else:
                 if isinstance(obj, dict):
                     return obj
+        # json_repair never raises by contract, but stay defensive: a repair
+        # failure here means the output is declared broken, full stop.
+        try:
+            obj = json_repair.repair_json(candidate, return_objects=True)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            return obj
         raise ValueError(f"invalid JSON: {exc}") from exc
     if not isinstance(obj, dict):
         raise ValueError("top-level JSON value is not an object")
@@ -216,7 +257,13 @@ async def generate_page_corpus(
     max_chunk_chars: int = 1200,
     retries: int = MAX_RETRIES,
 ) -> tuple[PageCorpus, PageGenStats]:
-    """Generate the corpus for one page; always returns a usable PageCorpus."""
+    """Generate the corpus for one page.
+
+    Returns a usable PageCorpus on success (first try or after self-repair
+    sessions) and on API failure (heuristic fallback). Raises
+    :class:`CorpusGenerationError` when the model's JSON stays broken after
+    ``MAX_JSON_REPAIR_SESSIONS`` self-repair sessions.
+    """
     stats = PageGenStats(source=page.source)
     sys_prompt = prompts.system_prompt(max_chunk_chars)
     user_prompt = prompts.build_user_prompt(
@@ -232,39 +279,64 @@ async def generate_page_corpus(
         stats.output_tokens += result.output_tokens
         return result
 
-    # Track the best attempt: valid chunks are kept even when some siblings failed,
-    # so a single bad chunk never demotes the whole page to heuristic fallback.
-    best: tuple[list, int] | None = None  # (chunks, attempt)
-
-    for attempt in (1, 2):
+    def parse_and_validate(text: str) -> tuple[list, list[str]]:
+        """Extraction ladder + validation; never raises."""
         try:
-            result = await call(user_prompt)
-        except Exception as exc:  # API failed even after retries
-            stats.api_failed = True
-            stats.errors.append(f"api error (attempt {attempt}): {exc}")
-            if attempt == 1:
-                # give the provider one more shot (it may have been a blip);
-                # if it fails again we fall through to the heuristic fallback
-                continue
-            break
-        try:
-            obj = extract_json_object(result.text)
+            obj = extract_json_object(text)
             chunks, errors = validate_llm_output(obj, page, max_chunk_chars)
         except ValueError as exc:
             chunks, errors = [], [str(exc)]
+        return chunks, errors
+
+    # --- initial generation: one extra shot on an API blip, then fallback ---
+    for api_shot in (1, 2):
+        try:
+            result = await call(user_prompt)
+            break
+        except Exception as exc:  # API failed even after transient retries
+            stats.api_failed = True
+            stats.errors.append(f"api error (shot {api_shot}): {exc}")
+    else:
+        # Provider is down — not the model's fault. Degrade to heuristic
+        # chunks (flagged needs_regen by the compile loop for a later retry).
+        stats.fallback = True
+        corpus = _fallback_corpus(page, gen_key)
+        corpus.html_md5 = html_md5
+        return corpus, stats
+
+    # --- initial output + up to MAX_JSON_REPAIR_SESSIONS fresh sessions ---
+    # Each session is a brand-new generate() call (this backend keeps no
+    # history) whose repair prompt echoes the parse/validation errors back, so
+    # the model fixes its own JSON. Track the best output: valid chunks are
+    # kept even when some siblings failed, so a single bad chunk never
+    # demotes the whole page.
+    best: tuple[list, int] | None = None  # (chunks, attempt)
+    attempt = 0
+    sessions_used = 0
+    while True:
+        attempt += 1
+        chunks, errors = parse_and_validate(result.text)
         stats.errors.extend(f"attempt {attempt}: {e}" for e in errors[:8])
         stats.dropped_chunks += len(errors)
         if chunks and (best is None or len(chunks) > len(best[0])):
             best = (chunks, attempt)
         if chunks and not errors:
-            break  # fully valid — no need for the repair attempt
-        if attempt == 1:
-            user_prompt = prompts.build_repair_prompt(user_prompt, errors[:8])
+            break  # fully valid — stop spending sessions
+        if sessions_used >= MAX_JSON_REPAIR_SESSIONS:
+            break  # out of sessions — the caller decides below
+        sessions_used += 1
+        try:
+            result = await call(
+                prompts.build_repair_prompt(user_prompt, errors[:8]))
+        except Exception as exc:  # provider died mid-repair
+            stats.api_failed = True
+            stats.errors.append(f"api error (repair session {sessions_used}): {exc}")
+            break
 
     if best is not None:
         chunks, attempt = best
         stats.first_try_valid = attempt == 1
-        stats.repaired = attempt == 2
+        stats.repaired = attempt > 1
         corpus = PageCorpus(
             source=page.source, title=page.title, html_md5=html_md5,
             gen_key=gen_key, generated_at=now_iso(),
@@ -277,7 +349,16 @@ async def generate_page_corpus(
         )
         return corpus, stats
 
-    stats.fallback = True
-    corpus = _fallback_corpus(page, gen_key)
-    corpus.html_md5 = html_md5
-    return corpus, stats
+    if stats.api_failed:
+        # Provider died mid-repair and nothing usable was salvaged — degrade
+        # to heuristic chunks (retried next run via needs_regen).
+        stats.fallback = True
+        corpus = _fallback_corpus(page, gen_key)
+        corpus.html_md5 = html_md5
+        return corpus, stats
+
+    raise CorpusGenerationError(
+        f"{page.source}: LLM output unrepairable after "
+        f"{sessions_used} self-repair session(s) ({stats.attempts} "
+        f"generation(s)): " + " | ".join(stats.errors[-4:]),
+        stats=stats)

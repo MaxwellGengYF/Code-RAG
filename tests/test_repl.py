@@ -110,24 +110,22 @@ def test_attach_context_unknown_chunk(engine):
 
 def test_read_page_missing_file_reports_error(tmp_path, monkeypatch):
     import rag.cli.repl_cmd as rc
-    monkeypatch.setattr(rc, "resolve_path", lambda p: tmp_path / p)
-    out = _read_page("ScriptReference/Nope.html", None)
+    out = _read_page("ScriptReference/Nope.html", None, base=tmp_path)
     assert out["source"] == "ScriptReference/Nope.html"
     assert "error" in out and "not found" in out["error"]
 
 
 def test_read_page_truncates(tmp_path, monkeypatch):
     import rag.cli.repl_cmd as rc
-    monkeypatch.setattr(rc, "resolve_path", lambda p: tmp_path / p)
     f = tmp_path / "page.html"
     f.write_text("<html><body><div id='content-wrap'>"
                  "<p>" + ("word " * 500) + "</p></div></body></html>",
                  encoding="utf-8")
-    out = _read_page("page.html", 200)
+    out = _read_page("page.html", 200, base=tmp_path)
     assert out["truncated"] is True
     assert len(out["markdown"]) == 200
     assert out["chars"] > 200
-    full = _read_page("page.html", None)
+    full = _read_page("page.html", None, base=tmp_path)
     assert "truncated" not in full
 
 
@@ -137,7 +135,7 @@ def test_repl_session_handles_bad_requests(engine, monkeypatch, capsys):
 
     import rag.cli.repl_cmd as rc
 
-    monkeypatch.setattr(rc, "load_rag_config", lambda *a, **k: engine.cfg)
+    monkeypatch.setattr(rc, "load_settings", lambda *a, **k: engine.cfg)
     monkeypatch.setattr("rag.search.engine.SearchEngine", lambda cfg: engine)
 
     requests = "\n".join([
@@ -167,11 +165,11 @@ def test_repl_query_supports_context_and_dump(engine, monkeypatch, capsys,
 
     import rag.cli.repl_cmd as rc
 
-    monkeypatch.setattr(rc, "load_rag_config", lambda *a, **k: engine.cfg)
+    monkeypatch.setattr(rc, "load_settings", lambda *a, **k: engine.cfg)
     monkeypatch.setattr("rag.search.engine.SearchEngine", lambda cfg: engine)
     # dump reads the page markdown via dumpdoc; stub it so no HTML file is needed
     monkeypatch.setattr(rc, "_read_page",
-                        lambda src, mc: {"markdown": f"# {src} stubbed page"})
+                        lambda src, mc, base=None: {"markdown": f"# {src} stubbed page"})
 
     req = json.dumps({"query": "rigidbody velocity", "k": 1, "context": 1,
                       "dump": 1})
@@ -188,7 +186,7 @@ def test_repl_mentions_accepts_dirs_filter(engine, monkeypatch, capsys):
 
     import rag.cli.repl_cmd as rc
 
-    monkeypatch.setattr(rc, "load_rag_config", lambda *a, **k: engine.cfg)
+    monkeypatch.setattr(rc, "load_settings", lambda *a, **k: engine.cfg)
     monkeypatch.setattr("rag.search.engine.SearchEngine", lambda cfg: engine)
     req = json.dumps({"mentions": "rigidbody", "limit": 10,
                       "dirs": ["ScriptReference"]})

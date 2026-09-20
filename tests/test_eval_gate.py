@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import eval_rag
+from rag.eval import eval_rag
 
 
 @pytest.fixture()
@@ -35,8 +35,8 @@ def cap(tmp_path, monkeypatch):
 
     monkeypatch.setattr("rag.store.CorpusStore", FakeCorpusStore)
     monkeypatch.setattr("rag.search.engine_select.count_html_pages",
-                        lambda dirs: state["total_pages"])
-    monkeypatch.setattr("rag.compile.load_rag_config",
+                        lambda dirs, base=None: state["total_pages"])
+    monkeypatch.setattr("rag.eval.eval_rag.load_settings",
                         lambda *a, **k: {"dirs": ["Manual"], "corpus_dir": "corpus"})
     monkeypatch.setattr("rag.resolve_path", lambda p, *a, **k: tmp_path / str(p))
 
@@ -57,7 +57,7 @@ def test_partial_corpus_defers_gate(cap):
     """6.9% coverage must DEFER even when MRR clears the threshold."""
     cap.state["coverage_pages"] = 3000
     cap.state["total_pages"] = 43938
-    rc = eval_rag.emit(_rows(0.917), SimpleNamespace(config="rag_config.json"))
+    rc = eval_rag.emit(_rows(0.917), SimpleNamespace(config=None))
     assert rc == 0
     joined = "\n".join(cap.lines)
     assert "DEFERRED" in joined
@@ -68,7 +68,7 @@ def test_partial_corpus_defers_gate(cap):
 def test_full_corpus_passes_when_metrics_clear(cap):
     cap.state["coverage_pages"] = 43000
     cap.state["total_pages"] = 43938  # 97.9% >= 95%
-    rc = eval_rag.emit(_rows(0.90), SimpleNamespace(config="rag_config.json"))
+    rc = eval_rag.emit(_rows(0.90), SimpleNamespace(config=None))
     assert rc == 0
     joined = "\n".join(cap.lines)
     assert "GATE PASS" in joined
@@ -78,7 +78,7 @@ def test_full_corpus_passes_when_metrics_clear(cap):
 def test_full_corpus_fails_when_metrics_short(cap):
     cap.state["coverage_pages"] = 43000
     cap.state["total_pages"] = 43938
-    rc = eval_rag.emit(_rows(0.70), SimpleNamespace(config="rag_config.json"))
+    rc = eval_rag.emit(_rows(0.70), SimpleNamespace(config=None))
     assert rc == 0
     joined = "\n".join(cap.lines)
     assert "GATE FAIL" in joined
@@ -89,7 +89,7 @@ def test_contaminated_gold_set_never_verdicts(cap):
     cap.state["coverage_pages"] = 43000
     cap.state["total_pages"] = 43938
     rc = eval_rag.emit(_rows(0.99, gold="ext-16"),
-                       SimpleNamespace(config="rag_config.json"))
+                       SimpleNamespace(config=None))
     assert rc == 0
     joined = "\n".join(cap.lines)
     assert "contaminated" in joined
@@ -100,7 +100,7 @@ def test_contaminated_gold_set_never_verdicts(cap):
 def test_exactly_95_percent_coverage_is_not_deferred(cap):
     cap.state["coverage_pages"] = 9500
     cap.state["total_pages"] = 10000  # exactly 95%
-    eval_rag.emit(_rows(0.90), SimpleNamespace(config="rag_config.json"))
+    eval_rag.emit(_rows(0.90), SimpleNamespace(config=None))
     joined = "\n".join(cap.lines)
     assert "DEFERRED" not in joined
 
@@ -118,6 +118,6 @@ def test_writes_latest_file_not_curated(cap, monkeypatch):
         return real_write(self, text, **k)
 
     monkeypatch.setattr(eval_rag.Path, "write_text", spy)
-    eval_rag.emit(_rows(0.90), SimpleNamespace(config="rag_config.json"))
+    eval_rag.emit(_rows(0.90), SimpleNamespace(config=None))
     assert "eval_results_latest.md" in written_names
     assert "eval_results.md" not in written_names

@@ -142,7 +142,7 @@ def test_engine_missing_index_errors_cleanly(tmp_path):
     engine = SearchEngine({"index_dir": str(tmp_path / "nope")})
     with pytest.raises(FileNotFoundError) as exc:
         engine.search("x")
-    assert "rag.py compile" in str(exc.value)
+    assert "python -m rag compile" in str(exc.value)
 
 
 # --------------------------------------------------------------------------------------

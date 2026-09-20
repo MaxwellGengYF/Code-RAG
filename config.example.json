@@ -1,0 +1,21 @@
+{
+  "_comment": "One file = provider + corpus config. Copy to config.json next to your documents and adjust. Provider keys: model/type/url/api_key/max_tokens/capabilities/thinking_effort/env/timeout. Corpus keys: dirs (input dirs, relative to THIS file), corpus_dir, index_dir. Engine tuning: mode/rrf_k/bm25_k/dense_k/final_k/path_boost/bm25_aux/embed_model/rerank/compile_workers/accept_legacy_models/llm_timeout/provider_wait_budget_s. Extra provider shards for multi-provider sharding go in 'providers'. With no --config flag, ./config.json in the CWD is used.",
+
+  "model": "your-model-name",
+  "type": "openai_legacy",
+  "url": "https://your-gateway.example.com/v1",
+  "api_key": "sk-...",
+
+  "dirs": ["docs"],
+  "corpus_dir": "corpus",
+  "index_dir": "index",
+
+  "mode": "bm25",
+  "rrf_k": 60,
+  "embed_model": "BAAI/bge-m3",
+  "max_input_chars": 24000,
+  "max_chunk_chars": 1200,
+  "compile_workers": 4,
+
+  "providers": []
+}

@@ -1,7 +1,9 @@
-# Agent Usage: Unity Manual RAG (LLM-built corpus + hybrid retrieval)
+# Agent Usage: doc-rag (LLM-built corpus + hybrid retrieval over any document set)
 
-A two-command RAG system over `Manual/` + `ScriptReference/` (43,938 HTML pages,
-Unity 6.x era):
+A two-command RAG system that compiles and searches ANY set of HTML
+documents — this checkout hosts the Unity 6.x offline-mirror deployment
+(`Manual/` + `ScriptReference/`, 43,938 pages). The same commands work on any
+other document set: point `dirs` in the config at your HTML and go.
 
 - `compile` — LLM-generated corpus (semantic chunks + aux fields per page) →
   BM25 + dense indexes. md5-incremental, checkpointed, resumable.
@@ -10,11 +12,14 @@ Unity 6.x era):
 
 ## Project structure
 
-- `Manual/`, `ScriptReference/` — the offline Unity 6.x docs mirror (~44k HTML
-  pages); the RAG corpus source. Read-only input.
-- `rag.py` — CLI entry point: `compile` / `search` / `repl` / `status` /
-  `audit-corpus`.
-- `rag/` — the RAG package:
+- `Manual/`, `ScriptReference/` — this deployment's input: the offline Unity
+  6.x docs mirror (~44k HTML pages). Read-only input; any other HTML tree works.
+- `python -m rag` — CLI entry point (rag/__main__.py): `compile` / `search` /
+  `repl` / `status` / `audit-corpus`.
+- `rag/` — the RAG package (ALL Python code lives under here):
+  - `__main__.py` — the CLI (compile / search / repl / status / audit-corpus).
+  - `config.py` — the unified config loader: one JSON = provider + corpus
+    settings (see "Provider configs").
   - `compile.py` — pipeline orchestration (deps → corpus → index).
   - `cli/` — command implementations (compile / search / status / repl).
   - `corpus/` — page→markdown extraction, LLM chunk generation, prompts +
@@ -28,19 +33,24 @@ Unity 6.x era):
     openai_legacy / openai_responses; retry + circuit breaking in `base.py`).
   - `store/` — corpus store + md5 file manager behind the incremental build
     (`corpus_store.py`, `fileman.py`).
-- `rag_config.json` — active config (paths, embed model, `rrf_k`, mode,
-  `rerank`); `rag_probe_config.json` / `rag_probe_rerank.json` are small-corpus
-  probe variants.
+- `config.json` — THIS deployment's active config (input/output
+  paths, embed model, `rrf_k`, mode, `rerank` — settings only, no
+  provider). The generic self-contained template is
+  `config.example.json`; `rag_probe_config.json` /
+  `rag_probe_rerank.json` are small-corpus probe variants.
+- `rag/legacy/` — the old BM25-only retriever, kept only for
+  baseline reproduction (`hybrid_retrieve.py`, `retrieval.py`,
+  `unity_tokenizer.py`, `doc_clean.py`, `dumpdoc.py`,
+  `build_word_index.py`).
+- `rag/eval/` — retrieval-quality harnesses + gold sets
+  (`eval_rag.py`, `eval_retrieval.py`, `eval_lib.py`, ...).
 - `corpus/`, `index/` — generated artefacts (gitignored; layout in the table
   below). `corpus_probe/`, `index_probe/` — probe-corpus variants.
 - `tests/` — pytest suite, network-free.
-- `eval_*.py`, `eval_gold*.json`, `eval_results*.md` — retrieval-quality
-  harnesses, gold sets, measured results.
-- `.kimix_cache/` — build cache; `run_full_compile.sh` is the auto-resume loop
-  for the full-corpus compile.
-- Legacy BM25-only retriever (non-RAG, kept only for baseline reproduction):
-  `hybrid_retrieve.py`, `retrieval.py`, `unity_tokenizer.py`, `doc_clean.py`,
-  `dumpdoc.py`, `build_word_index.py`, `chunks.pkl`, `index_word.pkl`,
+- `eval_results.md`, `eval_results_latest.md` — curated + raw
+  retrieval-quality results (the harnesses live in `rag/eval/`).
+- Legacy generated artefacts (baseline reproduction,
+  gitignored): `chunks.pkl`, `index_word.pkl`,
   `retriever_config.json`.
 
 ## Usage
@@ -48,22 +58,22 @@ Unity 6.x era):
 ### Build (compile)
 
 ```bash
-# full pipeline (deps -> corpus -> index), local model, no quota, no gateway:
-uv run python rag.py compile --provider llama_cpp/provider-qwen35-local.json
-# same, on API gateways: one --provider per DISTINCT quota pool (see gateway
-# facts below), --no-thinking is ~3x faster per page, 4 workers per provider.
-# Provider configs are user-specific JSON files (model/type/url/api_key — see
-# "Provider configs" below); <pool-a.json> etc. are placeholders for yours:
-uv run python rag.py compile --provider <pool-a.json> --provider <pool-b.json> \
-    --no-thinking --workers 8
+# full pipeline (deps -> corpus -> index), local model, no quota, no gateway.
+# The SAME file family is both provider and corpus config: config.json carries
+# this deployment's dirs/paths/tuning; the provider config adds model+keys.
+# With no --config at all, ./config.json in the CWD is used when present.
+uv run python -m rag compile --config config.json --config llama_cpp/provider-qwen35-local.json
+# same, on API gateways: one provider config per DISTINCT quota pool (see
+# gateway facts below), --no-thinking is ~3x faster per page, 4 workers per provider:
+uv run python -m rag compile --config config.json --config <pool-a.json> --config <pool-b.json> \n    --no-thinking --workers 8
 # preview before spending anything (page counts, token/cost estimate):
-uv run python rag.py compile --provider llama_cpp/provider-qwen35-local.json --dry-run
+uv run python -m rag compile --config llama_cpp/provider-qwen35-local.json --config config.json --dry-run
 # maintenance after the full build exists:
-uv run python rag.py compile --provider llama_cpp/provider-qwen35-local.json   # incremental: md5 diff, changed pages only, no-op when clean
-uv run python rag.py compile --provider ... --only Manual/foo.html            # regenerate exactly one page
-uv run python rag.py compile --steps index                                    # rebuild search indexes from corpus (BM25 ~10 s; dense ~7 min on GPU, resumable)
-uv run python rag.py compile --steps index --skip-dense                       # BM25 only, minutes
-uv run python rag.py status                                                   # freshness, coverage, pending pages, index stats
+uv run python -m rag compile --config config.json --config llama_cpp/provider-qwen35-local.json # incremental: md5 diff, changed pages only, no-op when clean
+uv run python -m rag compile --config config.json --config ... --only Manual/foo.html # regenerate exactly one page
+uv run python -m rag compile --steps index # rebuild search indexes from corpus (BM25 ~10 s; dense ~7 min on GPU, resumable)
+uv run python -m rag compile --steps index --skip-dense # BM25 only, minutes
+uv run python -m rag status # freshness, coverage, pending pages
 ```
 
 Compile is md5-incremental, checkpointed, and safe to interrupt — kill it any
@@ -76,15 +86,15 @@ corpus`.
 ### Search
 
 ```bash
-uv run python rag.py search --query "Rigidbody.AddForce"            # top-k with snippets (default mode from config: bm25)
-uv run python rag.py search --query "..." --mode hybrid --k 10      # dense+RRF fusion — escape hatch for typos/paraphrase (measured: loses to bm25 on exact API names)
-uv run python rag.py search --query-file q.txt --k 10               # batch, one index load
-uv run python rag.py search --mentions MaterialPropertyBlock        # literal term enumeration across docs, with counts + context
-uv run python rag.py search --query "..." --explain                 # per-hit BM25/dense scores + ranks + RRF breakdown, term df table
-uv run python rag.py search --query "..." --out hits.json           # JSON output for scripts
+uv run python -m rag search --query "Rigidbody.AddForce"            # top-k with snippets (default mode from config: bm25)
+uv run python -m rag search --query "..." --mode hybrid --k 10      # dense+RRF fusion — escape hatch for typos/paraphrase (measured: loses to bm25 on exact API names)
+uv run python -m rag search --query-file q.txt --k 10               # batch, one index load
+uv run python -m rag search --mentions MaterialPropertyBlock        # literal term enumeration across docs, with counts + context
+uv run python -m rag search --query "..." --explain                 # per-hit BM25/dense scores + ranks + RRF breakdown, term df table
+uv run python -m rag search --query "..." --out hits.json           # JSON output for scripts
 ```
 
-Defaults come from `rag_config.json`: `corpus_dir`, `index_dir`, `embed_model`,
+Defaults come from `config.json` (or the `--config` you passed): `corpus_dir`, `index_dir`, `embed_model`,
 `rrf_k`, `mode` (bm25 — see the gate numbers below), `dense_k`, `rerank` (off).
 
 ## How compile works (and why it is safe to interrupt)
@@ -95,18 +105,22 @@ Defaults come from `rag_config.json`: `corpus_dir`, `index_dir`, `embed_model`,
    schema_version). A bump of any component (or a page moving to a different
    provider shard) requeues that page. Per-page keys live in
    `manifest.page_gen_keys`.
-3. **Generation** (tool-free, system+user prompt only): strict JSON → msgspec
-   validation (chunk text MUST be a verbatim excerpt of the page markdown,
-   checked whitespace/punctuation/quote-insensitively) → one repair retry with
-   the validation errors echoed → heuristic fallback (fixed-size chunker, empty
-   aux fields). Acceptance measured on 40 sampled pages with the shipped config:
-   **98% first-try valid, 100% usable, 2.20 chunks/page, 0 verbatim violations**
-   (`eval_corpus_quality.py`).
+3. Generation (tool-free, system+user prompt only): strict JSON →
+   truncated-closer repair → json_repair salvage (hallucinated breakage:
+   trailing commas, unterminated strings, stray closers) → msgspec validation
+   (chunk text MUST be a verbatim excerpt of the page markdown, checked
+   whitespace/punctuation/quote-insensitively) → up to 3 fresh self-repair
+   sessions with the error list echoed back → CorpusGenerationError if still
+   unrepairable (caught per page by the compile loop → heuristic fallback,
+   fixed-size chunker with empty aux fields, flagged needs_regen). The
+   heuristic fallback now covers API failure only. Acceptance measured on 40
+   sampled pages with the shipped config: 98% first-try valid, 100% usable,
+   2.20 chunks/page, 0 verbatim violations (eval_corpus_quality.py).
 4. **Checkpointing**: every 25 pages the manifest is atomically rewritten,
    merging prior entries. Kill the process any time; rerunning `compile`
    continues exactly where it left off. `corpus/failures.jsonl` logs pages that
    needed repair/fallback.
-5. **Multi-provider sharding**: with several `--provider` flags, pages are
+5. **Multi-provider sharding**: with several `--config` flags (or a `"providers"` list inside one config), pages are
    assigned deterministically (`md5(rel) % n_providers`), each provider gets
    `workers/n` concurrency. Adding a provider later rekeys every page once
    (expected-key mismatch), then settles.
@@ -161,7 +175,8 @@ The index build refuses to mix generations: when the corpus gen_key changes,
 ## Measured retrieval quality
 
 The 24-query gold set lives in `eval_lib.py` / `eval_gold_extended.json`; the
-RAG harness is `eval_rag.py` (ablation flags, gate check). Results table:
+RAG harness is `rag/eval/eval_rag.py` (ablation flags, gate check; run it as
+`python -m rag.eval.eval_rag`). Results table:
 `eval_results.md`; raw rows per run go to `eval_results_latest.md`, which
 `emit()` writes so it can never clobber the curated findings.
 
@@ -170,7 +185,7 @@ hit@1 ≥ 0.833 / hit@10 ≥ 0.917, or a documented hit@10 win without MRR loss.
 
 **FINAL (2026-09-20, full corpus 43,938/43,938 pages, 83,098 chunks): bm25
 MRR 0.880 / hit@1 0.833 / hit@5 0.958 / hit@10 0.958 — GATE PASS** (gate:
-0.875 / 0.833 / 0.917). `mode` in rag_config.json is `"bm25"` and has been
+0.875 / 0.833 / 0.917). `mode` in config.json is `"bm25"` and has been
 since that measurement. Full table, per-query forensics, and the typo-rescue
 analysis: `eval_results.md` → "Full-corpus final (2026-09-20)".
 
@@ -196,20 +211,29 @@ second-decimal differences as noise.
 
 Run the evals:
 ```
-uv run python eval_rag.py --gold-set base --mode bm25   # the gate (now the default mode)
-uv run python eval_rag.py --gold-set base --mode hybrid # reference: documents the MRR loss at scale
-uv run python eval_rag.py --sweep-aux / --sweep-path-boost 0,1,3,5 / --sweep-rrf-k 20,60,120
+uv run python -m rag.eval.eval_rag --gold-set base --mode bm25   # the gate (now the default mode)
+uv run python -m rag.eval.eval_rag --gold-set base --mode hybrid # reference: documents the MRR loss at scale
+uv run python -m rag.eval.eval_rag --sweep-aux / --sweep-path-boost 0,1,3,5 / --sweep-rrf-k 20,60,120
 ```
 ```
 
 ## Provider configs
 
-`--provider` takes the kosong/kimi-cli provider JSON format (see
+`--config` takes ONE JSON file that is BOTH the provider config and the
+corpus config: the kosong/kimi-cli provider format (see
+the fields below): `model`, `type`
 the fields below): `model`, `type`
 (`anthropic|kimi|openai_legacy|openai_responses`), `url` (→ base_url), `api_key`,
 `max_tokens`, `capabilities` (`thinking`…), `thinking_effort`, `env`; unknown
-keys are ignored with a warning. Vendored tool-free clients live in `rag/llm/`.
-
+keys are ignored with a warning) PLUS the corpus settings in the same
+object: `dirs` (input dirs, relative to the config file — required for
+the corpus step), `corpus_dir` (default `corpus`), `index_dir`
+(default `index`) and the engine tuning (`mode`, `rrf_k`, `embed_model`,
+`compile_workers`, `accept_legacy_models`, …). Extra provider shards go
+in a top-level `"providers"` list. Relative `corpus_dir`/`index_dir`
+anchor at the config file's directory, so config + documents form a
+relocatable unit. `config.example.json` is the annotated template.
+Vendored tool-free clients live in `rag/llm/`.
 Hard-won gateway facts (measured 2026-09):
 
 - **Always pass `--no-thinking` for corpus builds.** Anthropic-type gateways
@@ -234,13 +258,14 @@ Hard-won gateway facts (measured 2026-09):
   for the window to reset instead of grinding the work list into heuristic
   chunks. If the budget expires it aborts, leaves those pages untouched, and
   exits 3 so an auto-resume wrapper retries rather than reporting success.
-  Check rag.py status → needs_regen for pages that did degrade.
+  Check `python -m rag status` → needs_regen for pages that did degrade.
 
 Local inference (llama.cpp Qwen3.5-9B)
 
 A local provider (`"type": "llama"`) serves corpus builds without any
 gateway. `llama_cpp/` ships prebuilt CUDA binaries (gitignored, multi-100MB)
-plus a ready config: `llama_cpp/provider-qwen35-local.json`. Managed mode:
+plus a ready config: `llama_cpp/provider-qwen35-local.json` (relative paths
+anchor at the config file's directory). Managed mode:
 `rag/llm/llama.py` spawns `llama-server.exe` with the GGUF from `models/`
 (also gitignored), waits for `/health`, reuses the one warm server for every
 page, and kills it on shutdown — atexit + finalizer, so a crashed run leaves
@@ -257,11 +282,13 @@ Config keys + rebuild-from-source: `llama_cpp/USAGE.md`.
   this model — its reasoning is emitted inside regular content, not as a
   separate segment.
 - Known quirk: non-thinking Qwen3.5 sometimes emits EOS right after the last
-  chunk object, dropping the JSON's trailing `]}`. `extract_json_object`
-  repairs exactly that (missing container closers only).
+  chunk object, dropping the JSON's trailing ]}. extract_json_object
+  repairs exactly that (missing container closers only); json_repair then
+  salvages broader hallucinated breakage (trailing commas, unterminated
+  strings) before a self-repair session is spent.
 - Fleet-switch safety: compile accepts a page only when its recorded
-  `page_gen_key` matches a `--provider` on the command line or a model in
-  `rag_config.json → accept_legacy_models`. Before pointing the build at the
+  `page_gen_key` matches a `--config` on the command line or a model in
+  `config.json → accept_legacy_models`. Before pointing the build at the
   local model, add the outgoing fleet there first (currently includes
   `qwen3.8-flash` / `deepseek-v4.1-flash`) or ~40k pages look stale and a
   mass regeneration starts. Always `--dry-run` first and check
@@ -289,9 +316,9 @@ Troubleshooting
   the *next* manual run. Only the all-providers-down abort exits **3**, which is the
   case where retrying genuinely helps (quota window resets). That split is
   deliberate: a permanently unchunkable page must not wedge the whole build.
-  Check `rag.py status` → `needs_regen` for the backlog, and
+  Check `python -m rag status` → `needs_regen` for the backlog, and
   `eval_corpus_quality.py` to confirm the first-try rate is healthy.
-- A page's corpus looks wrong → `compile --only Manual/foo.html --provider ...`
+- A page's corpus looks wrong → `python -m rag compile --config config.json --config ... --only Manual/foo.html`
   regenerates exactly one page.
 - Deleting corpus: `rm -rf corpus index` is safe; everything regenerates.
 
@@ -314,7 +341,7 @@ contamination caveats: `eval_results.md` → "Full-corpus final (2026-09-20)".
 
 ## Testing
 
-`uv run --extra dev python -m pytest tests/ -q` — **190 tests, all pass**.
+`uv run --extra dev python -m pytest tests/ -q` — **217 tests, all pass**.
 pytest is a dev extra, so plain `uv run python -m pytest` fails; always use
 `--extra dev`. Tests are network-free by design (httpx MockTransport for the
 LLM wire format, scripted fake clients for corpus generation, tmpdir mirrors

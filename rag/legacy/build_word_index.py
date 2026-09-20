@@ -16,14 +16,14 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from hybrid_retrieve import Chunk, doc_tokens, load_chunks_pickle
-from retrieval import InvertedIndex, Searcher
-from unity_tokenizer import WordTokenizer, path_terms
+from .hybrid_retrieve import Chunk, doc_tokens, load_chunks_pickle
+from .retrieval import InvertedIndex, Searcher
+from .unity_tokenizer import WordTokenizer, path_terms
 
 
 def chunk_tokens(text, source, wt, path_boost):
     """Deprecated shim: tokenization now lives in hybrid_retrieve.doc_tokens."""
-    from hybrid_retrieve import Chunk as _C
+    from .hybrid_retrieve import Chunk as _C
     return doc_tokens(_C(0, source, text), wt, path_boost)
 
 
@@ -43,7 +43,7 @@ def main() -> int:
     chunks_path = a.chunks_path or cfg["chunks_path"]
 
     if a.rebuild_chunks:
-        from hybrid_retrieve import load_chunks
+        from .hybrid_retrieve import load_chunks
         chunks = load_chunks(cfg["dirs"])
         with open(chunks_path, "wb") as f:
             pickle.dump(chunks, f)

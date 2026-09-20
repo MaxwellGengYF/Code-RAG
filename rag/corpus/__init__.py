@@ -11,10 +11,15 @@ from rag.corpus.schema import (
     to_index_text,
     snippet,
 )
-from rag.corpus.generate import generate_page_corpus, PageGenStats
+from rag.corpus.generate import (
+    CorpusGenerationError,
+    generate_page_corpus,
+    PageGenStats,
+)
 
 __all__ = [
-    "SCHEMA_VERSION", "EXTRACTOR_VERSION", "CorpusChunk", "PageCorpus", "PageInput",
-    "PageGenStats", "QA", "extract_page", "generate_page_corpus", "make_chunk_uid",
-    "render_markdown", "snippet", "to_embed_text", "to_index_text",
+    "SCHEMA_VERSION", "EXTRACTOR_VERSION", "CorpusChunk", "CorpusGenerationError",
+    "PageCorpus", "PageInput", "PageGenStats", "QA", "extract_page",
+    "generate_page_corpus", "make_chunk_uid", "render_markdown", "snippet",
+    "to_embed_text", "to_index_text",
 ]

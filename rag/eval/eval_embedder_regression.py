@@ -21,11 +21,10 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from eval_lib import evaluate
-from eval_rag import engine_index_dir, load_gold, _assert_vector_alignment
-from rag.compile import load_rag_config
+from .eval_lib import evaluate
+from .eval_rag import engine_index_dir, load_gold, _assert_vector_alignment
+from rag.config import load_settings
 from rag.index.build import flatten_corpus
 from rag.index.bm25_index import build_bm25, new_searcher
 from rag.index.fuse import linear_fuse, rrf_fuse
@@ -39,7 +38,7 @@ GOLD_SET = sys.argv[1] if len(sys.argv) > 1 else "base"
 def hash_embed(texts: list[str], dim: int = 1024) -> np.ndarray:
     """The old offline HashEmbedder: character-trigram signature, NOT semantic."""
     import xxhash
-    from retrieval import NgramTokenizer
+    from rag.legacy.retrieval import NgramTokenizer
 
     out = np.zeros((len(texts), dim), dtype=np.float32)
     tok = NgramTokenizer(n=3)
@@ -57,7 +56,7 @@ def hash_embed(texts: list[str], dim: int = 1024) -> np.ndarray:
 
 
 def main():
-    cfg = load_rag_config("rag_probe_config.json")
+    cfg = load_settings("rag_probe_config.json")
     gold, gold_name = load_gold(GOLD_SET)
     rows, n_pages = flatten_corpus(CorpusStore(resolve_path(cfg["corpus_dir"])))
     print(f"[probe] {len(rows)} chunks / {n_pages} pages | gold={gold_name}")

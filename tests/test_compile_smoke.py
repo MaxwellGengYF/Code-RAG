@@ -61,7 +61,7 @@ def make_site(tmp_path: Path, n: int) -> Path:
 @pytest.fixture()
 def env(tmp_path):
     root = make_site(tmp_path / "site", 40)
-    corpus_dir = root / "corpus"   # matches cfg + the monkeypatched resolve_path
+    corpus_dir = root / "corpus"   # matches cfg (anchors at _base_dir)
     fm = FileManager(root=root, dirs=["ScriptReference"], corpus_dir=corpus_dir)
     cfg = {"max_input_chars": 24000, "max_chunk_chars": 1200}
     return root, corpus_dir, fm, cfg
@@ -333,16 +333,15 @@ def test_estimate_thinking_ratio_is_higher():
 # --------------------------------------------------------------------------------------
 
 
-def _write_provider(tmp_path, model="dry-model"):
-    """A provider config pointing at a host that cannot resolve, so any accidental
+def _make_provider(model="dry-model"):
+    """A provider pointing at a host that cannot resolve, so any accidental
     LLM call would fail loudly rather than silently succeed."""
-    p = tmp_path / "prov.json"
-    p.write_text(json.dumps({
+    from rag.llm.config import ProviderConfig
+    return ProviderConfig.from_dict({
         "model": model, "type": "openai_legacy", "api_key": "sk-test",
         "url": "http://127.0.0.1:1/v1",  # closed port: connection refused
         "max_tokens": 1000,
-    }), encoding="utf-8")
-    return p
+    })
 
 
 async def test_dry_run_never_calls_llm(tmp_path, monkeypatch):
@@ -350,13 +349,10 @@ async def test_dry_run_never_calls_llm(tmp_path, monkeypatch):
 
     root = make_site(tmp_path / "site", 30)
     corpus_dir = tmp_path / "corpus"
-    prov = _write_provider(tmp_path)
-    cfg = {"corpus_dir": str(corpus_dir),
+    prov = _make_provider()
+    cfg = {"corpus_dir": str(corpus_dir), "_base_dir": str(root),
            "dirs": [str(root / "ScriptReference")],
            "max_input_chars": 24000, "max_chunk_chars": 1200}
-    # FileManager resolves dirs against root; point rag's resolve_path at tmp root
-    import rag.compile as rc
-    monkeypatch.setattr(rc, "resolve_path", lambda p=".", *a, **k: (root if str(p) == "." else root / str(p)))
 
     calls = {"n": 0}
 
@@ -366,7 +362,7 @@ async def test_dry_run_never_calls_llm(tmp_path, monkeypatch):
 
     monkeypatch.setattr("rag.llm.create_llm", lambda *a, **k: no_llm)
 
-    report = await run_corpus_step(cfg, [str(prov)], workers=2, max_files=None,
+    report = await run_corpus_step(cfg, [prov], workers=2, max_files=None,
                                    force=False, regen=False, only=None,
                                    dry_run=True, no_thinking=True,
                                    price_in=None, price_out=None)
@@ -383,16 +379,15 @@ async def test_dry_run_samples_large_work_lists(tmp_path, monkeypatch):
     n = 600
     root = make_site(tmp_path / "site", n)
     corpus_dir = tmp_path / "corpus"
-    prov = _write_provider(tmp_path)
-    cfg = {"corpus_dir": str(corpus_dir),
+    prov = _make_provider()
+    cfg = {"corpus_dir": str(corpus_dir), "_base_dir": str(root),
            "dirs": [str(root / "ScriptReference")],
            "max_input_chars": 24000, "max_chunk_chars": 1200}
-    import rag.compile as rc
-    monkeypatch.setattr(rc, "resolve_path", lambda p=".", *a, **k: (root if str(p) == "." else root / str(p)))
     monkeypatch.setattr("rag.llm.create_llm",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM in dry-run")))
 
     extracted = {"n": 0}
+    import rag.compile as rc
     import rag.corpus.extract as ex
     real_extract = ex.extract_page
 
@@ -403,7 +398,7 @@ async def test_dry_run_samples_large_work_lists(tmp_path, monkeypatch):
     monkeypatch.setattr(rc, "extract_page", counting_extract, raising=False)
     monkeypatch.setattr("rag.corpus.extract_page", counting_extract)
 
-    report = await run_corpus_step(cfg, [str(prov)], workers=2, max_files=None,
+    report = await run_corpus_step(cfg, [prov], workers=2, max_files=None,
                                    force=False, regen=False, only=None,
                                    dry_run=True, no_thinking=True,
                                    price_in=None, price_out=None)
@@ -425,25 +420,23 @@ async def _run_corpus_step(root, tmp_path, monkeypatch, *, dry_run: bool,
     """Drive run_corpus_step against a tmp mirror with a fake provider."""
     from rag.compile import run_corpus_step
 
-    prov = tmp_path / "prov.json"
-    prov.write_text(json.dumps({
+    from rag.llm.config import ProviderConfig
+    prov = ProviderConfig.from_dict({
         "model": "fake-model", "type": "openai_legacy", "api_key": "sk-test",
         "url": "http://127.0.0.1:1/v1", "max_tokens": 1000,
-    }), encoding="utf-8")
+    })
 
-    # corpus_dir is RELATIVE on purpose: the monkeypatched resolve_path rebases
-    # non-"." paths under root, so an absolute tmp path would land somewhere else
-    # than the helper below writes to.
-    cfg = {"corpus_dir": "corpus",
+    # corpus_dir is RELATIVE on purpose: it anchors at _base_dir (the tmp site
+    # root), exactly like a config-file-relative corpus_dir anchors at the
+    # config's directory in production.
+    cfg = {"corpus_dir": "corpus", "_base_dir": str(root),
            "dirs": [str(root / "ScriptReference")],
            "max_input_chars": 24000, "max_chunk_chars": 1200}
     import rag.compile as rc
-    monkeypatch.setattr(rc, "resolve_path",
-                        lambda p=".", *a, **k: (root if str(p) == "." else root / str(p)))
     if client is None:
         client = FakeClient()
     monkeypatch.setattr(rc, "create_llm", lambda *a, **k: client)
-    return await run_corpus_step(cfg, [str(prov)], workers=2, max_files=None,
+    return await run_corpus_step(cfg, [prov], workers=2, max_files=None,
                                  force=False, regen=False, only=None,
                                  dry_run=dry_run, no_thinking=True,
                                  price_in=None, price_out=None)
@@ -453,7 +446,7 @@ def _plant_phantoms(root, tmp_path, n_real: int, n_phantom: int):
     """Write a manifest claiming more pages than have corpus files."""
     from rag.store import CorpusStore, FileManager
 
-    corpus_dir = root / "corpus"   # matches cfg + the monkeypatched resolve_path
+    corpus_dir = root / "corpus"   # matches cfg (anchors at _base_dir)
     fm = FileManager(root=root, dirs=["ScriptReference"], corpus_dir=corpus_dir)
     store = CorpusStore(corpus_dir)
     scanned = fm.scan()
