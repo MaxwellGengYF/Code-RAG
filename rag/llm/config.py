@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import resolve_path
+
 log = logging.getLogger(__name__)
 
 #: accepted ``type`` values -> canonical provider names
@@ -76,7 +78,9 @@ class ProviderConfig:
 
     @classmethod
     def from_file(cls, path: str | Path) -> "ProviderConfig":
-        p = Path(path)
+        # Relative provider paths anchor at the repo root, so documented
+        # commands work from any CWD.
+        p = resolve_path(path)
         if not p.exists():
             raise FileNotFoundError(f"provider config not found: {p}")
         try:

@@ -40,10 +40,12 @@ model load ≈ 3 s, generation ≈ **100–105 tokens/s**.
 
 ## Quick start
 
+## Quick start
+Commands below assume the repo root as CWD; relative paths also work from
+anywhere (the `llama` provider anchors them at the repo root).
 ### One-shot chat
-
 ```bat
-llama-cli.exe -m D:\unity_manual\models\Qwen3.5-9B\Qwen3.5-9B-Q4_K_M.gguf ^
+llama-cli.exe -m models\Qwen3.5-9B\Qwen3.5-9B-Q4_K_M.gguf ^
     -ngl 99 -c 8192 -n 256 --single-turn ^
     -p "In one sentence: what is Unity?"
 ```
@@ -53,7 +55,7 @@ llama-cli.exe -m D:\unity_manual\models\Qwen3.5-9B\Qwen3.5-9B-Q4_K_M.gguf ^
 ### HTTP server
 
 ```bat
-llama-server.exe -m D:\unity_manual\models\Qwen3.5-9B\Qwen3.5-9B-Q4_K_M.gguf ^
+llama-server.exe -m models\Qwen3.5-9B\Qwen3.5-9B-Q4_K_M.gguf ^
     -ngl 99 -c 8192 --port 8080
 ```
 
@@ -84,7 +86,7 @@ Qwen3.5-9B is a **hybrid thinking model**: by default it emits a long
 
 ## Using with the RAG pipeline (`rag.llm` provider `type: "llama"`)
 
-`D:\unity_manual\rag\llm\llama.py` implements the tool-free `LLMClient`
+`rag/llm/llama.py` implements the tool-free `LLMClient`
 protocol against `llama-server`. Two modes:
 
 * **Managed** (no `base_url`): the client spawns `llama-server.exe` on first
@@ -95,10 +97,10 @@ protocol against `llama-server`. Two modes:
 A ready provider config ships here: [`provider-qwen35-local.json`](provider-qwen35-local.json)
 
 RAG corpus compile with the local model:
-
+RAG corpus compile with the local model:
 ```bat
-cd D:\unity_manual
-.venv\Scripts\python.exe rag.py compile --provider D:\unity_manual\llama_cpp\provider-qwen35-local.json
+cd <repo root>
+.venv\Scripts\python.exe rag.py compile --provider llama_cpp/provider-qwen35-local.json
 ```
 
 Minimal Python usage (pure conversation: prompt in → answer out):
@@ -108,8 +110,8 @@ import asyncio
 from rag.llm import create_llm
 from rag.llm.config import ProviderConfig
 
-client = create_llm(ProviderConfig.from_file(
-    r"D:\unity_manual\llama_cpp\provider-qwen35-local.json"))
+  client = create_llm(ProviderConfig.from_file(
+      "llama_cpp/provider-qwen35-local.json"))  # relative paths anchor at the repo root
 async def main():
     res = await client.generate("You are a helpful assistant.",
                                 "In one sentence: what is a Rigidbody?")

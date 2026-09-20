@@ -1,7 +1,7 @@
 """rag.py — LLM-built RAG corpus + hybrid retrieval for the Unity Manual mirror.
 
 Commands:
-    rag.py compile --provider D:/qwen_flash.json [--steps corpus,index,deps]
+          rag.py compile --provider llama_cpp/provider-qwen35-local.json [--steps corpus,index,deps]
                    [--workers 8] [--max-files N] [--force] [--regen]
                    [--only REL] [--dry-run]
     rag.py search  --query "Rigidbody.AddForce" [--k 10] [--mode hybrid|bm25|dense]

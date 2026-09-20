@@ -51,8 +51,10 @@ Unity 6.x era):
 # full pipeline (deps -> corpus -> index), local model, no quota, no gateway:
 uv run python rag.py compile --provider llama_cpp/provider-qwen35-local.json
 # same, on API gateways: one --provider per DISTINCT quota pool (see gateway
-# facts below), --no-thinking is ~3x faster per page, 4 workers per provider:
-uv run python rag.py compile --provider D:/qwen_flash.json --provider D:/glm.json \
+# facts below), --no-thinking is ~3x faster per page, 4 workers per provider.
+# Provider configs are user-specific JSON files (model/type/url/api_key — see
+# "Provider configs" below); <pool-a.json> etc. are placeholders for yours:
+uv run python rag.py compile --provider <pool-a.json> --provider <pool-b.json> \
     --no-thinking --workers 8
 # preview before spending anything (page counts, token/cost estimate):
 uv run python rag.py compile --provider llama_cpp/provider-qwen35-local.json --dry-run
@@ -203,7 +205,7 @@ uv run python eval_rag.py --sweep-aux / --sweep-path-boost 0,1,3,5 / --sweep-rrf
 ## Provider configs
 
 `--provider` takes the kosong/kimi-cli provider JSON format (see
-`D:/qwen_flash.json`, `D:/k27.json`): `model`, `type`
+the fields below): `model`, `type`
 (`anthropic|kimi|openai_legacy|openai_responses`), `url` (→ base_url), `api_key`,
 `max_tokens`, `capabilities` (`thinking`…), `thinking_effort`, `env`; unknown
 keys are ignored with a warning. Vendored tool-free clients live in `rag/llm/`.

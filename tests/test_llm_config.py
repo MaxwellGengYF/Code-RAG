@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 
+from rag import ROOT
 from rag.llm.config import ProviderConfig
 
 QWEN_FLASH = {
@@ -81,6 +82,21 @@ def test_env_application(tmp_path, monkeypatch):
     assert cfg.env == {"RAG_TEST_ENV_VAR": "hello"}
     import os
     assert os.environ["RAG_TEST_ENV_VAR"] == "hello"
+
+
+def test_from_file_relative_path_anchors_at_root():
+    # The documented `--provider llama_cpp/provider-qwen35-local.json` must
+    # resolve no matter which CWD the process was started from.
+    cfg = ProviderConfig.from_file("llama_cpp/provider-qwen35-local.json")
+    assert cfg.path == ROOT / "llama_cpp" / "provider-qwen35-local.json"
+    assert cfg.type == "llama"
+
+
+def test_from_file_absolute_path_untouched(tmp_path):
+    p = tmp_path / "abs.json"
+    p.write_text('{"model": "m", "type": "llama"}', encoding="utf-8")
+    cfg = ProviderConfig.from_file(p)
+    assert cfg.path == p
 
 
 def test_type_aliases():

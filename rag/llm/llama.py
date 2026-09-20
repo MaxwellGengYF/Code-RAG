@@ -17,17 +17,20 @@ circuit-breaker machinery keeps working unchanged.
 Stripped: tools, streaming, multi-turn history (the RAG compile step needs
 single turns only, same contract as the other vendored providers).
 
-Config extras (read from the provider-config JSON, i.e. ``ProviderConfig.raw``)::
+Config extras (read from the provider-config JSON, i.e. ``ProviderConfig.raw``).
+Relative ``server_bin`` / ``model_path`` values anchor at the repo root, so a
+config can ship in-repo and run on any machine (bare ``server_bin`` names like
+``llama-server`` are still resolved via PATH)::
 
     {
       "type": "llama",
       "model": "Qwen3.5-9B-Q4_K_M.gguf",   # managed: GGUF path (or model_path);
                                             # external: served model name
-      "server_bin": "D:/unity_manual/llama_cpp/llama-server.exe",
+      "server_bin": "llama_cpp/llama-server.exe",
       "server_cmd": null,         # optional full argv template; replaces the
                                    # default -m/-host/-port/-ngl/-c invocation,
                                    # "{model}" / "{host}" / "{port}" substituted
-      "model_path": "D:/unity_manual/models/Qwen3.5-9B/Qwen3.5-9B-Q4_K_M.gguf",
+      "model_path": "models/Qwen3.5-9B/Qwen3.5-9B-Q4_K_M.gguf",
       "host": "127.0.0.1",
       "port": 0,               # 0 = pick a free port (managed mode)
       "ngl": 99,               # GPU layers to offload
@@ -54,6 +57,7 @@ from typing import Any
 
 import httpx
 
+from .. import resolve_path
 from ._openai_shared import clamp_max_tokens
 from .base import (
     APIConnectionError,
@@ -136,9 +140,13 @@ class LlamaClient:
         self._managed = config.base_url is None
         self._host = str(raw.get("host") or "127.0.0.1")
         self._port = int(raw.get("port") or 0)
-        self._server_bin = str(raw.get("server_bin") or "llama-server")
+        server_bin = str(raw.get("server_bin") or "llama-server")
+        # Path-like values anchor at the repo root (portable configs); bare
+        # names keep PATH lookup at spawn time.
+        self._server_bin = (str(resolve_path(server_bin))
+                            if Path(server_bin).name != server_bin else server_bin)
         self._server_cmd = [str(a) for a in raw.get("server_cmd") or []]
-        self._model_path = str(raw.get("model_path") or config.model)
+        self._model_path = str(resolve_path(str(raw.get("model_path") or config.model)))
         self._ngl = int(raw.get("ngl", 99))
         self._ctx_size = int(raw.get("ctx_size", 8192))
         self._extra_args = [str(a) for a in raw.get("extra_args") or []]

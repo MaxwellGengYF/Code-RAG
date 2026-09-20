@@ -28,7 +28,9 @@ from rag.llm import ProviderConfig, create_llm
 from rag.store import CorpusStore, FileManager
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 40
-PROVIDERS = ["D:/ds_ali.json", "D:/qwen_flash.json"]
+# Provider configs are user-specific; pass your own as extra args:
+#   uv run python eval_corpus_quality.py 40 provider-a.json provider-b.json
+PROVIDERS = sys.argv[2:] or ["D:/ds_ali.json", "D:/qwen_flash.json"]
 SCRATCH = "manifest_quality_probe.json"
 
 

@@ -25,8 +25,9 @@ Total: ~46,200 files, ~1.03 GB.
 
 How it was downloaded
 
-D:/unity_docs_downloader.py — resumable, polite concurrent crawler (8 workers,
-random 0.15–0.35 s delay, retries). Seed list from Manual/docdata/toc.js and
+`unity_docs_downloader.py` (the crawler used for this mirror; not part of this
+repo) — resumable, polite concurrent crawler (8 workers, random 0.15–0.35 s
+delay, retries). Seed list from Manual/docdata/toc.js and
 ScriptReference/docdata/toc.js; assets discovered by parsing HTML/CSS references.
 
 RAG retrieval over the mirror
@@ -34,7 +35,7 @@ RAG retrieval over the mirror
 The mirror is indexed by an LLM-built RAG system (AGENTS.md is the full
 operational manual):
 
-    uv run python rag.py compile --provider D:/qwen_flash.json --no-thinking
+    uv run python rag.py compile --provider llama_cpp/provider-qwen35-local.json
     uv run python rag.py search --query "Rigidbody.AddForce"
     uv run python rag.py status     # coverage, pending pages, est. cost, engine
     uv run python eval_rag.py --gold-set base --mode bm25   # the quality gate

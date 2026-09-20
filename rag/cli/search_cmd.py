@@ -76,8 +76,9 @@ def run_search(
         # `git clone`, not an internal error.
         print(str(exc), file=sys.stderr)
         print("\nnothing has been built in this checkout yet. To build:", file=sys.stderr)
-        print("  1. uv run python rag.py compile --provider D:/qwen_flash.json "
-              "--no-thinking   # LLM corpus (slow, resumable)", file=sys.stderr)
+        print("  1. uv run python rag.py compile --provider "
+              "llama_cpp/provider-qwen35-local.json # LLM corpus (slow, resumable)",
+              file=sys.stderr)
         print("  2. uv run python rag.py compile --steps index                "
               "                  # BM25 + dense indexes", file=sys.stderr)
         print("see AGENTS.md for the full workflow.", file=sys.stderr)

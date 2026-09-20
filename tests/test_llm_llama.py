@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from rag import ROOT
 from rag.llm import create_llm
 from rag.llm.base import (
     APIConnectionError,
@@ -181,6 +182,37 @@ def test_llama_config_extras_kept_in_raw():
     assert cfg.raw["extra_args"] == ["--reasoning-format", "none"]
 
 
+def test_llama_relative_paths_anchor_at_root():
+    # Provider configs ship in-repo with relative paths; they must resolve
+    # against the repo root on any machine/CWD.
+    cfg = ProviderConfig.from_dict({
+        "model": "m.gguf", "type": "llama",
+        "server_bin": "llama_cpp/llama-server.exe",
+        "model_path": "models/m.gguf",
+    })
+    client = create_llm(cfg)
+    assert client._server_bin == str(ROOT / "llama_cpp" / "llama-server.exe")
+    assert client._model_path == str(ROOT / "models" / "m.gguf")
+
+
+def test_llama_absolute_paths_untouched(tmp_path: Path):
+    bin_abs = tmp_path / "bin" / "llama-server"
+    model_abs = tmp_path / "m.gguf"
+    cfg = ProviderConfig.from_dict({
+        "model": "m.gguf", "type": "llama",
+        "server_bin": str(bin_abs), "model_path": str(model_abs),
+    })
+    client = create_llm(cfg)
+    assert client._server_bin == str(bin_abs)
+    assert client._model_path == str(model_abs)
+
+
+def test_llama_bare_server_bin_kept_for_path_lookup():
+    # No separator -> a command name, resolved via PATH at spawn time.
+    cfg = ProviderConfig.from_dict({"model": "m.gguf", "type": "llama"})
+    assert create_llm(cfg)._server_bin == "llama-server"
+
+
 # ---------------------------------------------------------------------------
 # managed mode (no base_url): spawn a fake llama-server with sys.executable
 # ---------------------------------------------------------------------------
@@ -235,3 +267,15 @@ async def test_llama_managed_missing_model_raises(tmp_path: Path):
     })
     with pytest.raises(LLMError, match="GGUF model not found"):
         await create_llm(cfg).generate("s", "u")
+
+
+@pytest.mark.asyncio
+async def test_llama_managed_missing_relative_model_names_resolved_path():
+    cfg = ProviderConfig.from_dict({
+        "model": "ghost.gguf", "type": "llama",
+        "model_path": "models/ghost.gguf",
+    })
+    with pytest.raises(LLMError, match="GGUF model not found") as ei:
+        await create_llm(cfg).generate("s", "u")
+    # the error must show the resolved absolute path, not the raw relative one
+    assert str(ROOT / "models" / "ghost.gguf") in str(ei.value)
