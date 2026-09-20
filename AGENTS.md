@@ -43,42 +43,47 @@ Unity 6.x era):
   `dumpdoc.py`, `build_word_index.py`, `chunks.pkl`, `index_word.pkl`,
   `retriever_config.json`.
 
-## Daily use
+## Usage
 
-Build (first run takes ~1 day on this corpus; afterwards it is incremental):
+### Build (compile)
 
-```
-# single provider
-uv run python rag.py compile --provider D:/qwen_flash.json --no-thinking --workers 4
-
-# several providers: pass --provider once per DISTINCT quota pool (see the gateway
-# facts below). This roughly doubles throughput only when the pools are independent;
-# two configs sharing one host+api_key are one pool and add no redundancy.
+```bash
+# full pipeline (deps -> corpus -> index), local model, no quota, no gateway:
+uv run python rag.py compile --provider llama_cpp/provider-qwen35-local.json
+# same, on API gateways: one --provider per DISTINCT quota pool (see gateway
+# facts below), --no-thinking is ~3x faster per page, 4 workers per provider:
 uv run python rag.py compile --provider D:/qwen_flash.json --provider D:/glm.json \
-    --steps corpus --no-thinking --workers 8
-
-# cost/plan preview before spending anything
-uv run python rag.py compile --provider D:/qwen_flash.json --dry-run
+    --no-thinking --workers 8
+# preview before spending anything (page counts, token/cost estimate):
+uv run python rag.py compile --provider llama_cpp/provider-qwen35-local.json --dry-run
+# maintenance after the full build exists:
+uv run python rag.py compile --provider llama_cpp/provider-qwen35-local.json   # incremental: md5 diff, changed pages only, no-op when clean
+uv run python rag.py compile --provider ... --only Manual/foo.html            # regenerate exactly one page
+uv run python rag.py compile --steps index                                    # rebuild search indexes from corpus (BM25 ~10 s; dense ~7 min on GPU, resumable)
+uv run python rag.py compile --steps index --skip-dense                       # BM25 only, minutes
+uv run python rag.py status                                                   # freshness, coverage, pending pages, index stats
 ```
 
-The full build is driven by `.kimix_cache/run_full_compile.sh`, an auto-resume
-loop around `compile --steps corpus`.
+Compile is md5-incremental, checkpointed, and safe to interrupt — kill it any
+time and rerun the same command; it continues where it left off. First full
+build of the 44k-page corpus takes ~1 day with a gateway fleet, longer on the
+local 9B; every later run is minutes. A full unattended build is driven by
+`.kimix_cache/run_full_compile.sh`, an auto-resume loop around `compile --steps
+corpus`.
 
-Search:
+### Search
 
+```bash
+uv run python rag.py search --query "Rigidbody.AddForce"            # top-k with snippets (default mode from config: bm25)
+uv run python rag.py search --query "..." --mode hybrid --k 10      # dense+RRF fusion — escape hatch for typos/paraphrase (measured: loses to bm25 on exact API names)
+uv run python rag.py search --query-file q.txt --k 10               # batch, one index load
+uv run python rag.py search --mentions MaterialPropertyBlock        # literal term enumeration across docs, with counts + context
+uv run python rag.py search --query "..." --explain                 # per-hit BM25/dense scores + ranks + RRF breakdown, term df table
+uv run python rag.py search --query "..." --out hits.json           # JSON output for scripts
 ```
-uv run python rag.py search --query "Rigidbody.AddForce"
-uv run python rag.py search --query-file q.txt --k 10          # batch (one load)
-uv run python rag.py search --mentions MaterialPropertyBlock   # literal enumeration
-uv run python rag.py search --query "..." --explain            # term df + RRF breakdown
-uv run python rag.py status                                    # freshness + counts
-```
-
-`--explain` shows which query terms the index knows (with document frequencies)
-and, per hit, the BM25 score/rank, dense score/rank, and RRF contributions.
 
 Defaults come from `rag_config.json`: `corpus_dir`, `index_dir`, `embed_model`,
-`rrf_k`, `mode`, `dense_k`, `rerank`.
+`rrf_k`, `mode` (bm25 — see the gate numbers below), `dense_k`, `rerank` (off).
 
 ## How compile works (and why it is safe to interrupt)
 
@@ -265,8 +270,8 @@ Troubleshooting
 - `search` says artefacts not found → run `compile` (corpus step, then index).
 - Index "refusing to build / gen_key changed" → corpus was regenerated after
   the index; rerun `compile --steps index` (it rebuilds everything from the
-  current corpus — BM25 ~10 s, dense ~1.1 h idle / ~8 h if a corpus build is
-  running concurrently, so stop the build first).
+  current corpus — BM25 ~10 s, dense ~7 min on GPU / a few hours on CPU, so
+  stop any corpus build first to keep the CPU free).
 - Slow compile → check `corpus/failures.jsonl` for the error mix. `429
   Throttling` means lower `--workers`; `403 ... usage limit` / `AccessDenied`
   means a provider's quota window or subscription is exhausted (see the gateway
