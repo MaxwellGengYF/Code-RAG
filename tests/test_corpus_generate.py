@@ -158,6 +158,26 @@ def test_extract_json_object():
         extract_json_object("[1, 2]")
 
 
+def test_extract_json_object_truncated_trailing_closers():
+    # Qwen3.5-9B (non-thinking) sometimes emits EOS right after the last chunk
+    # object, dropping the final "]}" — the exact failure this guards against.
+    out = extract_json_object(
+        '{"chunks": [{"text": "x", "qa": [{"q": "a", "a": "b"}]}'
+    )
+    assert out == {"chunks": [{"text": "x", "qa": [{"q": "a", "a": "b"}]}]}
+    # markdown-fenced + truncated
+    assert extract_json_object('```json\n{"a": {"b": [1, 2\n```') == {
+        "a": {"b": [1, 2]},
+    }
+    # non-truncation problems must still fail
+    with pytest.raises(ValueError):
+        extract_json_object('{"a": }')
+    with pytest.raises(ValueError):
+        extract_json_object('{"a": "unterminated')
+    with pytest.raises(ValueError):
+        extract_json_object('{"a": 1]}')
+
+
 def test_validate_caps_qa(page):
     obj = {"chunks": [{
         "heading_path": [], "text": MARKDOWN[:100],

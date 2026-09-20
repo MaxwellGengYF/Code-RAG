@@ -61,11 +61,49 @@ class PageGenStats:
 # --------------------------------------------------------------------------------------
 
 
+def _close_truncated_containers(s: str) -> str | None:
+    """Repair *s* when it is truncated only in its trailing container closers.
+
+    Local models (observed with Qwen3.5-9B non-thinking) sometimes emit their
+    EOS token right after the last chunk object, dropping the final ``]}`` —
+    the JSON is complete in content but unbalanced. A string-aware stack scan
+    appends exactly the missing closers. Returns None when the text has any
+    other problem (mismatched closer, ends inside a string, already balanced):
+    those are not truncations and must keep failing.
+    """
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    for ch in s:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in "}]":
+            if not stack or stack.pop() != ch:
+                return None  # mismatched closer — not a pure truncation
+    if in_str or not stack:
+        return None
+    return s + "".join(reversed(stack))
+
+
 def extract_json_object(text: str) -> dict:
     """Return the first balanced {...} object in *text* as a parsed dict.
 
-    Tolerates markdown fences and leading/trailing commentary. Raises
-    ValueError when no parseable object exists.
+    Tolerates markdown fences and leading/trailing commentary, and output
+    truncated only in its trailing container closers (``]}`` cut early).
+    Raises ValueError when no parseable object exists.
     """
     cleaned = text.strip()
     # strip a whole-output ```json ... ``` wrapper if present (anchored, so inner
@@ -79,9 +117,19 @@ def extract_json_object(text: str) -> dict:
         raise ValueError("no JSON object found in model output")
     # decode incrementally to find the end of the first balanced object
     decoder = json.JSONDecoder()
+    candidate = cleaned[start:]
     try:
-        obj, _end = decoder.raw_decode(cleaned[start:])
+        obj, _end = decoder.raw_decode(candidate)
     except json.JSONDecodeError as exc:
+        repaired = _close_truncated_containers(candidate)
+        if repaired is not None:
+            try:
+                obj, _end = decoder.raw_decode(repaired)
+            except json.JSONDecodeError:
+                pass  # not repairable this way — report the original error
+            else:
+                if isinstance(obj, dict):
+                    return obj
         raise ValueError(f"invalid JSON: {exc}") from exc
     if not isinstance(obj, dict):
         raise ValueError("top-level JSON value is not an object")
