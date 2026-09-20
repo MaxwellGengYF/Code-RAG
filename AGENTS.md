@@ -5,7 +5,8 @@ Unity 6.x era):
 
 - `compile` — LLM-generated corpus (semantic chunks + aux fields per page) →
   BM25 + dense indexes. md5-incremental, checkpointed, resumable.
-- `search` — BM25 (word tokenizer + path terms) ∪ BGE-M3 dense, fused by RRF.
+- `search` — BM25 (word tokenizer + path terms) by default; BGE-M3 dense and
+  RRF-fused hybrid selectable via `--mode`.
 
 ## Project structure
 
@@ -61,7 +62,7 @@ uv run python rag.py compile --provider D:/qwen_flash.json --dry-run
 ```
 
 The full build is driven by `.kimix_cache/run_full_compile.sh`, an auto-resume
-loop around `compile --steps corpus` (see the runbook at the bottom).
+loop around `compile --steps corpus`.
 
 Search:
 
@@ -157,15 +158,24 @@ RAG harness is `eval_rag.py` (ablation flags, gate check). Results table:
 `eval_results.md`; raw rows per run go to `eval_results_latest.md`, which
 `emit()` writes so it can never clobber the curated findings.
 
-Adoption gate: the RAG engine must meet or beat **MRR 0.875 / hit@1 0.833 /
-hit@10 0.917** (base-24, final-k=10) on the full corpus, or show a documented
-hit@10 win without MRR loss.
+Adoption gate (base-24, final-k=10, on the full corpus): MRR ≥ 0.875 /
+hit@1 ≥ 0.833 / hit@10 ≥ 0.917, or a documented hit@10 win without MRR loss.
 
-**Current best (bm25, aux OFF, path_boost 3) at 62% corpus coverage: MRR 0.881 /
-hit@1 0.833 / hit@10 0.958** — but `eval_rag.py` prints `GATE: DEFERRED` until
-corpus coverage reaches 95%, because subset scores are optimistic (fewer
-distractors) and must not be quoted as final. Re-measure after the full build,
-with dense vectors built so hybrid can be judged.
+**FINAL (2026-09-20, full corpus 43,938/43,938 pages, 83,098 chunks): bm25
+MRR 0.880 / hit@1 0.833 / hit@5 0.958 / hit@10 0.958 — GATE PASS** (gate:
+0.875 / 0.833 / 0.917). `mode` in rag_config.json is `"bm25"` and has been
+since that measurement. Full table, per-query forensics, and the typo-rescue
+analysis: `eval_results.md` → "Full-corpus final (2026-09-20)".
+
+**hybrid FAILS the gate at full scale** (MRR 0.800 / hit@1 0.708; hit@10 only
+ties bm25 at 0.958 — no win; dense alone 0.624). Cause: BGE-M3 dense drift
+demotes rank-1 BM25 hits inside near-duplicate sibling families
+(MaterialPropertyBlock.SetX, Rigidbody2D crowding); the RRF margins are
+~0.0002–0.001, and the ablation loop (rrf_k 20/60/120, path_boost
+0/1/3/5, aux on/off) found no config that rescues it. Residual value of
+dense/hybrid: typo tolerance — at full scale bm25 rescues 0/6 typo queries
+while hybrid/dense rescue 3/6 — so `--mode hybrid` is a targeted escape hatch,
+not a default.
 
 Do **not** trust numbers measured on a small subset: BM25-only scored 0.917 on a
 3k-page probe and 0.826 on 26k pages. That gap is also what flipped the aux
@@ -174,13 +184,15 @@ default (see above).
 Honesty note carried in `eval_results.md`: only `base-24` is an independent
 gold set. `ext-16` / `probe` were harvested from corpus `qa` fields, and `qa.q`
 is itself indexed in the BM25 aux text, so they measure a string the build was
-handed. Use them for trends, not accuracy.
+handed. Use them for trends, not accuracy. n=24 is small; treat
+second-decimal differences as noise.
 
 Run the evals:
-
 ```
-uv run python eval_rag.py --gold-set all --mode hybrid
+uv run python eval_rag.py --gold-set base --mode bm25   # the gate (now the default mode)
+uv run python eval_rag.py --gold-set base --mode hybrid # reference: documents the MRR loss at scale
 uv run python eval_rag.py --sweep-aux / --sweep-path-boost 0,1,3,5 / --sweep-rrf-k 20,60,120
+```
 ```
 
 ## Provider configs
@@ -276,69 +288,29 @@ Troubleshooting
   regenerates exactly one page.
 - Deleting corpus: `rm -rf corpus index` is safe; everything regenerates.
 
-## Runbook: completing a full build (state 2026-09-19)
+## Final engine numbers (full corpus, 2026-09-20)
 
-The full-corpus compile runs via `.kimix_cache/run_full_compile.sh` (auto-resume
-loop, `--no-thinking --workers 8`, ~0.6 pages/s). It is safe to interrupt: the
-loop or a manual rerun resumes from the md5 manifest, skipping finished pages.
-Watch progress with `uv run python rag.py status`.
+The full build is complete: 43,938/43,938 pages generated, 83,098 chunks;
+BM25 word tokenizer + path_boost 3, aux OFF; BGE-M3 fp16 on CUDA; RRF k=60;
+rerank off; fuzziness 0; final-k=10. Base-24 (the independent gate set):
 
-When `tail .kimix_cache/full_compile.log` shows `COMPILE COMPLETE`:
+| config | MRR | hit@1 | hit@5 | hit@10 |
+| --- | --- | --- | --- | --- |
+| old baseline (historical record) | 0.875 | 0.833 | — | 0.917 |
+| old baseline (re-measured 2026-09-20) | 0.833 | 0.750 | — | 0.917 |
+| **new engine, bm25 (default)** | **0.880** | **0.833** | **0.958** | **0.958** |
+| new engine, hybrid | 0.800 | 0.708 | 0.958 | 0.958 |
+| new engine, dense | 0.624 | 0.542 | 0.750 | 0.875 |
 
-```
-# 0. repair the manifest if status reported phantom entries (do this ONLY when
-#    no compile is running — it rewrites corpus/manifest.json)
-uv run python rag.py status            # look for the phantom WARNING line
-uv run python rag.py audit-corpus
-
-# 1. build both index layers. IMPORTANT: only run this AFTER the corpus build has
-#    stopped. Dense BGE-M3 encode saturates the CPU; running it concurrently with
-#    the corpus build measured 7x slower (57 min vs ~8 min for 10.6k chunks).
-#    Full corpus ~90k chunks: ~1.1 h alone, ~8 h if concurrent. BM25 alone is ~10 s.
-#    The dense embed is resumable (vectors.f32.progress) if interrupted.
-uv run python rag.py compile --steps index --force
-
-# 2. regenerate the extended gold set from the finished corpus, then evaluate
-uv run python eval_rag.py --generate-gold
-uv run python eval_rag.py --gold-set base --mode hybrid   # the gate
-uv run python eval_rag.py --gold-set base --mode bm25
-uv run python eval_rag.py --gold-set base --sweep-aux
-uv run python eval_smoke.py                               # integration smoke
-
-# 3. gate: the new engine becomes the default only if eval_results.md shows
-#    MRR >= 0.875 AND hit@10 >= 0.917 on the INDEPENDENT base-24 set, or a
-#    documented hit@10 win without MRR loss. bm25-only ALREADY clears it at 62%
-#    coverage (0.881 / 0.833 / 0.958); re-confirm hybrid on the full corpus.
-#    eval_rag.py prints GATE: DEFERRED below 95% coverage by design.
-#    Do NOT gate on ext/probe sets — they are contaminated (see eval_results.md).
-
-# 4. once coverage >= 95%, hybrid_retrieve.py switches to the RAG engine by
-#    itself; `rag.py status` prints which engine would serve a query and why.
-uv run python rag.py search --query "MaterialPropertyBlock" --k 5 --text
-uv run python rag.py search --mentions MaterialPropertyBlock | head
-```
-
-Then fill "New engine numbers" below with the full-corpus rows and delete this
-runbook section.
-
-### New engine numbers (PARTIAL corpus — replace after the full build)
-
-Measured with ~27k of 43,938 pages generated (62%), so treat as provisional. Note
-the aux default changed during measurement, which is why two bm25 rows differ:
-
-| config | gold set | corpus | MRR | hit@1 | hit@10 |
-| --- | --- | --- | --- | --- | --- |
-| old baseline (historical record) | base-24 | full | 0.875 | 0.833 | 0.917 |
-| old baseline (re-measured today) | base-24 | full | 0.833 | 0.750 | 0.917 |
-| new engine, bm25 aux ON (former default) | base-24 | 27k | 0.826 | 0.750 | 0.917 |
-| **new engine, bm25 aux OFF (current default)** | base-24 | 27k | **0.881** | **0.833** | **0.958** |
-
-Full details, the aux reversal analysis, the hash-regression post-mortem, and the
-contamination caveats: `eval_results.md`.
+Full details, the hybrid-failure forensics, the typo-rescue analysis, and the
+contamination caveats: `eval_results.md` → "Full-corpus final (2026-09-20)".
 
 ## Testing
 
-`uv run python -m pytest tests/` — 186 tests, all network-free (httpx
-MockTransport for the LLM wire format, scripted fake clients for corpus
-generation, tmpdir mirrors for the file manager, interrupt/resume and
-provider-death/failover simulation for the compile pipeline).
+`uv run --extra dev python -m pytest tests/ -q` — **190 tests, all pass**.
+pytest is a dev extra, so plain `uv run python -m pytest` fails; always use
+`--extra dev`. Tests are network-free by design (httpx MockTransport for the
+LLM wire format, scripted fake clients for corpus generation, tmpdir mirrors
+for the file manager, interrupt/resume and provider-death/failover simulation
+for the compile pipeline) and need no corpus/index artefacts — a fresh clone
+runs green before anything is built.
