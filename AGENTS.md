@@ -7,8 +7,40 @@ Unity 6.x era):
   BM25 + dense indexes. md5-incremental, checkpointed, resumable.
 - `search` — BM25 (word tokenizer + path terms) ∪ BGE-M3 dense, fused by RRF.
 
-Operational manual below; the legacy BM25-only retriever (`hybrid_retrieve.py`,
-chunks.pkl/index_word.pkl) is still available and documented at the end.
+## Project structure
+
+- `Manual/`, `ScriptReference/` — the offline Unity 6.x docs mirror (~44k HTML
+  pages); the RAG corpus source. Read-only input.
+- `rag.py` — CLI entry point: `compile` / `search` / `repl` / `status` /
+  `audit-corpus`.
+- `rag/` — the RAG package:
+  - `compile.py` — pipeline orchestration (deps → corpus → index).
+  - `cli/` — command implementations (compile / search / status / repl).
+  - `corpus/` — page→markdown extraction, LLM chunk generation, prompts +
+    msgspec schema (`extract.py`, `generate.py`, `prompts.py`, `schema.py`).
+  - `index/` — BM25 + BGE-M3 vector indexes, RRF fusion, index build
+    (`bm25_index.py`, `vector_index.py`, `fuse.py`, `build.py`).
+  - `search/` — hybrid query engine + cross-encoder reranker (`engine.py`,
+    `rerank.py`; `engine_select.py` is the RAG/legacy auto-switch used only by
+    the legacy `hybrid_retrieve.py`).
+  - `llm/` — vendored tool-free LLM provider clients (anthropic / kimi /
+    openai_legacy / openai_responses; retry + circuit breaking in `base.py`).
+  - `store/` — corpus store + md5 file manager behind the incremental build
+    (`corpus_store.py`, `fileman.py`).
+- `rag_config.json` — active config (paths, embed model, `rrf_k`, mode,
+  `rerank`); `rag_probe_config.json` / `rag_probe_rerank.json` are small-corpus
+  probe variants.
+- `corpus/`, `index/` — generated artefacts (gitignored; layout in the table
+  below). `corpus_probe/`, `index_probe/` — probe-corpus variants.
+- `tests/` — pytest suite, network-free.
+- `eval_*.py`, `eval_gold*.json`, `eval_results*.md` — retrieval-quality
+  harnesses, gold sets, measured results.
+- `.kimix_cache/` — build cache; `run_full_compile.sh` is the auto-resume loop
+  for the full-corpus compile.
+- Legacy BM25-only retriever (non-RAG, kept only for baseline reproduction):
+  `hybrid_retrieve.py`, `retrieval.py`, `unity_tokenizer.py`, `doc_clean.py`,
+  `dumpdoc.py`, `build_word_index.py`, `chunks.pkl`, `index_word.pkl`,
+  `retriever_config.json`.
 
 ## Daily use
 
@@ -44,9 +76,8 @@ uv run python rag.py status                                    # freshness + cou
 `--explain` shows which query terms the index knows (with document frequencies)
 and, per hit, the BM25 score/rank, dense score/rank, and RRF contributions.
 
-Defaults come from `rag_config.json` (new keys: `corpus_dir`, `index_dir`,
-`embed_model`, `rrf_k`, `mode`, `dense_k`, `rerank`). `retriever_config.json`
-carries the same new keys plus the legacy ones.
+Defaults come from `rag_config.json`: `corpus_dir`, `index_dir`, `embed_model`,
+`rrf_k`, `mode`, `dense_k`, `rerank`.
 
 ## How compile works (and why it is safe to interrupt)
 
@@ -121,42 +152,33 @@ The index build refuses to mix generations: when the corpus gen_key changes,
 
 ## Measured retrieval quality
 
-The 24-query gold set and the old engine's numbers are in `eval_lib.py` /
-`eval_retrieval.py`; the new engine's harness is `eval_rag.py` (same gold set +
-an extended LLM-assisted set in `eval_gold_extended.json`, ablation flags,
-gate check). Results table: `eval_results.md`.
+The 24-query gold set lives in `eval_lib.py` / `eval_gold_extended.json`; the
+RAG harness is `eval_rag.py` (ablation flags, gate check). Results table:
+`eval_results.md`; raw rows per run go to `eval_results_latest.md`, which
+`emit()` writes so it can never clobber the curated findings.
 
-Old engine, word tokenizer, fuzziness 0 (the baseline the new engine must meet
-or beat): **MRR 0.875 / hit@1 0.833 / hit@10 0.917** (24 queries, final-k=10).
-
-New engine numbers: see `eval_results.md` (raw rows per run go to
-`eval_results_latest.md`, which `emit()` writes so it can never clobber the
-curated findings).
+Adoption gate: the RAG engine must meet or beat **MRR 0.875 / hit@1 0.833 /
+hit@10 0.917** (base-24, final-k=10) on the full corpus, or show a documented
+hit@10 win without MRR loss.
 
 **Current best (bm25, aux OFF, path_boost 3) at 62% corpus coverage: MRR 0.881 /
-hit@1 0.833 / hit@10 0.958**, which already meets or beats the old baseline on all
-three — while 38% of the mirror is not yet indexed, so it had fewer gold pages
-available than the baseline did. `eval_rag.py` prints `GATE: DEFERRED` until corpus
-coverage reaches 95%, because subset scores are optimistic (fewer distractors) and
-must not be quoted as final. Re-measure after the full build, with dense vectors
-built so hybrid can be judged.
+hit@1 0.833 / hit@10 0.958** — but `eval_rag.py` prints `GATE: DEFERRED` until
+corpus coverage reaches 95%, because subset scores are optimistic (fewer
+distractors) and must not be quoted as final. Re-measure after the full build,
+with dense vectors built so hybrid can be judged.
 
 Do **not** trust numbers measured on a small subset: BM25-only scored 0.917 on a
 3k-page probe and 0.826 on 26k pages. That gap is also what flipped the aux
 default (see above).
 
-Two honesty notes carried in `eval_results.md`:
-* Only `base-24` is an independent gold set. `ext-16` / `probe` were harvested
-  from corpus `qa` fields, and `qa.q` is itself indexed in the BM25 aux text, so
-  they measure a string the build was handed. Use them for trends, not accuracy.
-* `hybrid_retrieve.py` auto-selects the legacy engine until the RAG index covers
-  ≥95% of the mirror, so a partial build never silently narrows retrieval.
-  Override with `--rag` / `--legacy`; `rag.py status` reports the choice.
+Honesty note carried in `eval_results.md`: only `base-24` is an independent
+gold set. `ext-16` / `probe` were harvested from corpus `qa` fields, and `qa.q`
+is itself indexed in the BM25 aux text, so they measure a string the build was
+handed. Use them for trends, not accuracy.
 
 Run the evals:
 
 ```
-uv run python eval_retrieval.py          # old engine sweep (needs legacy artefacts)
 uv run python eval_rag.py --gold-set all --mode hybrid
 uv run python eval_rag.py --sweep-aux / --sweep-path-boost 0,1,3,5 / --sweep-rrf-k 20,60,120
 ```
@@ -188,14 +210,45 @@ Hard-won gateway facts (measured 2026-09):
   Passing them as "3 providers" buys zero redundancy — when kimi's 5-hour window
   ran out, all three died together and ~14k pages degraded to aux-less fallback
   before this was caught. List **one config per distinct pool**.
-- **Rolling quota windows kill whole fleets at once.** When every circuit is open
-  the run now **pauses** (up to `provider_wait_budget_s`, default 90 min) waiting
+- Rolling quota windows kill whole fleets at once. When every circuit is open
+  the run now pauses (up to provider_wait_budget_s, default 90 min) waiting
   for the window to reset instead of grinding the work list into heuristic
   chunks. If the budget expires it aborts, leaves those pages untouched, and
-  exits **3** so an auto-resume wrapper retries rather than reporting success.
-  Check `rag.py status` → `needs_regen` for pages that did degrade.
+  exits 3 so an auto-resume wrapper retries rather than reporting success.
+  Check rag.py status → needs_regen for pages that did degrade.
 
-## Troubleshooting
+Local inference (llama.cpp Qwen3.5-9B)
+
+A local provider (`"type": "llama"`) serves corpus builds without any
+gateway. `llama_cpp/` ships prebuilt CUDA binaries (gitignored, multi-100MB)
+plus a ready config: `llama_cpp/provider-qwen35-local.json`. Managed mode:
+`rag/llm/llama.py` spawns `llama-server.exe` with the GGUF from `models/`
+(also gitignored), waits for `/health`, reuses the one warm server for every
+page, and kills it on shutdown — atexit + finalizer, so a crashed run leaves
+no GPU-resident orphan. Measured on this machine (RTX 4080 SUPER, `-ngl 99`,
+ctx 8192): model load ≈5 s, ≈100–105 tok/s generation, <1 s warm turnaround.
+Config keys + rebuild-from-source: `llama_cpp/USAGE.md`.
+
+- Smoke: `uv run python .kimix_cache/_provider_smoke.py` — real server +
+  real model through the provider; expect a coherent ~25-word reply and no
+  `llama-server.exe` left in tasklist afterwards.
+- `enable_thinking=false` (via `extra_body.chat_template_kwargs`): Qwen3.5 is
+  a hybrid thinking model; skipping the thinking phase is ~10x faster and
+  yields clean prose immediately. `--reasoning-format none` does NOT work for
+  this model — its reasoning is emitted inside regular content, not as a
+  separate segment.
+- Known quirk: non-thinking Qwen3.5 sometimes emits EOS right after the last
+  chunk object, dropping the JSON's trailing `]}`. `extract_json_object`
+  repairs exactly that (missing container closers only).
+- Fleet-switch safety: compile accepts a page only when its recorded
+  `page_gen_key` matches a `--provider` on the command line or a model in
+  `rag_config.json → accept_legacy_models`. Before pointing the build at the
+  local model, add the outgoing fleet there first (currently includes
+  `qwen3.8-flash` / `deepseek-v4.1-flash`) or ~40k pages look stale and a
+  mass regeneration starts. Always `--dry-run` first and check
+  `to process:` equals the expected small count.
+
+Troubleshooting
 
 - `search` says artefacts not found → run `compile` (corpus step, then index).
 - Index "refusing to build / gen_key changed" → corpus was regenerated after
@@ -285,23 +338,7 @@ contamination caveats: `eval_results.md`.
 
 ## Testing
 
-`uv run python -m pytest tests/` — 91 tests, all network-free (httpx
+`uv run python -m pytest tests/` — 186 tests, all network-free (httpx
 MockTransport for the LLM wire format, scripted fake clients for corpus
 generation, tmpdir mirrors for the file manager, interrupt/resume and
 provider-death/failover simulation for the compile pipeline).
-
-## Legacy retriever (still present, auto-selected only while the RAG index is partial)
-
-The eval gate has PASSED, so the RAG engine is the intended default. But
-`hybrid_retrieve.py` still picks the engine per invocation via
-`rag/search/engine_select.py`: it uses the RAG engine only when `index/` is built
-**and** covers ≥95% of the mirrored HTML pages, and otherwise falls back to the
-legacy artefacts (which span the whole mirror) while printing why. `--rag` and
-`--legacy` force either side. Once the full build finishes and the index is
-rebuilt, the switch is automatic and permanent — no config edit needed.
-
-The legacy engine (chunks.pkl + index_word.pkl, linear fusion, ollama/st/hash
-embedders) is preserved behind `--legacy` and still powers `eval_retrieval.py`,
-so the recorded baseline stays reproducible. Files: `hybrid_retrieve.py`,
-`retrieval.py` (BM25 lib), `unity_tokenizer.py`, `doc_clean.py`, `dumpdoc.py`,
-`build_word_index.py`, `eval_lib.py`.
