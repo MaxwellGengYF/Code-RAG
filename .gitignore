@@ -7,7 +7,7 @@
 /index/
 /corpus_probe/
 /index_probe/
-/failures.jsonl
+/corpus/failures.jsonl
 /eval_gold_probe.json
 /eval_results_latest.md
 /rag_probe_config.json
