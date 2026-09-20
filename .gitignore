@@ -29,3 +29,7 @@ __pycache__/
 
 # Tooling temp
 .kimix_cache/
+# Local llama.cpp inference: GGUF weights + prebuilt binaries (multi-100MB).
+# USAGE.md and provider-qwen35-local.json in llama_cpp/ stay tracked.
+/models/
+llama_cpp/*.exe

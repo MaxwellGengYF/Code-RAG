@@ -32,6 +32,7 @@ _FACTORIES = {}
 def _register() -> None:
     from .anthropic import AnthropicClient
     from .kimi import KimiClient
+    from .llama import LlamaClient
     from .openai_legacy import OpenAILegacyClient
     from .openai_responses import OpenAIResponsesClient
 
@@ -40,6 +41,7 @@ def _register() -> None:
         "openai_responses": OpenAIResponsesClient,
         "anthropic": AnthropicClient,
         "kimi": KimiClient,
+        "llama": LlamaClient,
     })
 
 

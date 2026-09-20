@@ -37,12 +37,19 @@ _TYPE_ALIASES = {
     "claude": "anthropic",
     "kimi": "kimi",
     "moonshot": "kimi",
+    "llama": "llama",
+    "llama_cpp": "llama",
+    "llama.cpp": "llama",
+    "llama-server": "llama",
 }
 
 _KNOWN_KEYS = {
     "model", "max_context_size", "capabilities", "url", "base_url", "type",
     "api_key", "api_key_env", "max_tokens", "thinking_effort", "env",
     "services", "name", "description", "timeout",
+    # llama.cpp (local server) provider extras, consumed via ProviderConfig.raw
+    "server_bin", "server_cmd", "model_path", "host", "port", "ngl", "ctx_size",
+    "extra_args", "extra_body", "start_timeout",
 }
 
 

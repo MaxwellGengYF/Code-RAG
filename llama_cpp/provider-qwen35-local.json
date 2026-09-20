@@ -1,0 +1,12 @@
+{
+  "model": "Qwen3.5-9B-Q4_K_M.gguf",
+  "type": "llama",
+  "server_bin": "D:/unity_manual/llama_cpp/llama-server.exe",
+  "model_path": "D:/unity_manual/models/Qwen3.5-9B/Qwen3.5-9B-Q4_K_M.gguf",
+  "ngl": 99,
+  "ctx_size": 8192,
+  "max_tokens": 8192,
+  "extra_body": { "chat_template_kwargs": { "enable_thinking": false } },
+  "start_timeout": 600,
+  "description": "Local Qwen3.5-9B Q4_K_M via llama.cpp (CUDA, full GPU offload)"
+}
