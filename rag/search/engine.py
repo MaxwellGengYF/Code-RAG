@@ -233,14 +233,20 @@ class SearchEngine:
                 # determines the displayed order for reranked hits.
                 hit["rerank_score"] = round(rerank_scores[doc_id], 6)
             if explain:
+                # A fused hit need not appear in both rankings (dense can
+                # promote a doc outside BM25's top-k and vice versa); the
+                # fusion gives an unranked list zero contribution, and the
+                # explain breakdown must do the same instead of KeyError.
+                bm25_contrib = (round(1.0 / (rrf_k + bm25_rank[doc_id]), 6)
+                                if doc_id in bm25_rank else 0.0)
+                dense_contrib = (round(1.0 / (rrf_k + dense_rank[doc_id]), 6)
+                                 if doc_id in dense_rank else 0.0)
                 hit["explain_scores"] = {
                     "bm25": round(bm25_scores.get(doc_id, 0.0), 4),
                     "dense": round(dense_scores.get(doc_id, 0.0), 4),
                     "bm25_rank": bm25_rank.get(doc_id),
                     "dense_rank": dense_rank.get(doc_id),
-                    "rrf": (round(1.0 / (rrf_k + bm25_rank[doc_id]), 6)
-                            + (round(1.0 / (rrf_k + dense_rank[doc_id]), 6)
-                               if doc_id in dense_rank else 0.0)) if mode == "hybrid" else None,
+                    "rrf": (bm25_contrib + dense_contrib) if mode == "hybrid" else None,
                 }
             hits.append(hit)
 

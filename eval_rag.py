@@ -395,14 +395,14 @@ def emit(results: list[dict], args) -> int:
         "",
         f"Run: `eval_rag.py {' '.join(a for a in sys.argv[1:])}`",
         "",
-        "| config | gold | MRR | hit@1 | hit@10 |",
-        "| --- | --- | --- | --- | --- |",
-        "| old baseline (historical record) | base-24 | 0.875 | 0.833 | 0.917 |",
-        "| old baseline (re-measured today) | base-24 | 0.833 | 0.750 | 0.917 |",
+        "| config | gold | MRR | hit@1 | hit@5 | hit@10 |",
+        "| --- | --- | --- | --- | --- | --- |",
+        "| old baseline (historical record) | base-24 | 0.875 | 0.833 | — | 0.917 |",
+        "| old baseline (re-measured today) | base-24 | 0.833 | 0.750 | — | 0.917 |",
     ]
     for r in results:
         lines.append(f"| {r['config']} | {r['gold']} | {r['MRR']} | {r['hit@1']} | "
-                     f"{r['hit@10']} |")
+                     f"{r['hit@5']} | {r['hit@10']} |")
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
     print(f"[eval] wrote {path.name} (curated findings live in eval_results.md)")
