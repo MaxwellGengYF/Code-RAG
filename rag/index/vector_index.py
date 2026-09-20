@@ -21,16 +21,40 @@ BGE_QUERY_INSTRUCTION = (
 
 _MODEL = None
 _MODEL_NAME: str | None = None
+_MODEL_DEVICE: str | None = None
+
+
+def select_embed_device() -> str:
+    """cuda when a GPU is usable, else cpu. The model dtype follows the device:
+    fp16 halves GPU memory and roughly doubles throughput (BGE-M3 on a 4080
+    embeds the full corpus in minutes, not hours); fp32 stays the CPU default."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def embed_device() -> str:
+    """Device the loaded model runs on ("" before the first load)."""
+    return _MODEL_DEVICE or ""
 
 
 def ensure_embed_model(model: str = "BAAI/bge-m3"):
     """Download/load the embed model (used by the deps step; raises on failure)."""
-    global _MODEL, _MODEL_NAME
+    global _MODEL, _MODEL_NAME, _MODEL_DEVICE
+    import torch
     from sentence_transformers import SentenceTransformer
 
     if _MODEL is None or _MODEL_NAME != model:
-        _MODEL = SentenceTransformer(model, device="cpu")
+        device = select_embed_device()
+        dtype = torch.float16 if device == "cuda" else torch.float32
+        _MODEL = SentenceTransformer(model, device=device,
+                                     model_kwargs={"dtype": dtype})
         _MODEL_NAME = model
+        _MODEL_DEVICE = device
     return _MODEL
 
 
