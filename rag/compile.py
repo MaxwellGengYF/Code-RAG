@@ -4,6 +4,11 @@ Each stage is idempotent and independently skippable via ``--steps``:
   deps    -- verify pip requirements + install/embed the dense model (BGE-M3)
   corpus  -- LLM corpus generation (md5-incremental; the expensive step)
   index   -- flatten corpus -> BM25 + dense indexes (delegates to rag.index.build)
+
+Exit codes: 0 ok, 1 dependency problem, 3 every provider down past the wait
+budget (quota exhausted), 130 the user pressed Ctrl-C — see
+:func:`rag.cli.compile_cmd.interrupt_message`. An interrupt stops the pipeline
+BEFORE the index step and reports how many pages landed.
 """
 from __future__ import annotations
 
@@ -14,11 +19,13 @@ from pathlib import Path
 
 from rag.cli.compile_cmd import (
     ALL_DOWN_WAIT_BUDGET,
+    INTERRUPT_EXIT_CODE,
     CompileReport,
     ProviderShard,
     estimate_tokens,
     finalize,
     gen_key_for_model,
+    interrupt_message,
     valid_gen_keys,
     plan_work,
     print_report,
@@ -350,10 +357,27 @@ def run_compile(
                 "your config (see config.example.json) and pass it with --config "
                 "(default: ./config.json)")
         print("[compile] step: corpus", file=sys.stderr)
-        corpus_report = asyncio.run(run_corpus_step(
-            cfg, rc.providers, workers=workers, max_files=max_files, force=force,
-            regen=regen, only=only, dry_run=dry_run, no_thinking=no_thinking,
-            price_in=price_in, price_out=price_out, base_dir=rc.base_dir))
+        try:
+            corpus_report = asyncio.run(run_corpus_step(
+                cfg, rc.providers, workers=workers, max_files=max_files, force=force,
+                regen=regen, only=only, dry_run=dry_run, no_thinking=no_thinking,
+                price_in=price_in, price_out=price_out, base_dir=rc.base_dir))
+        except KeyboardInterrupt:
+            # A Ctrl-C that unwound an in-flight call instead of taking the
+            # graceful first-interrupt path. asyncio re-raises KeyboardInterrupt
+            # straight out of the event loop, so the partial report is gone; say
+            # what is guaranteed (per-page checkpoints) and exit 130 — in
+            # particular do NOT fall through to the index step, where a Ctrl-C
+            # would otherwise kick off a multi-minute dense build the user just
+            # asked to stop.
+            print(interrupt_message(hard=True), file=sys.stderr)
+            return INTERRUPT_EXIT_CODE
+        if corpus_report.interrupted:
+            # Graceful Ctrl-C: the in-flight pages were finished and checkpointed,
+            # and run_corpus_step already printed the report (whose last line is the
+            # interrupt summary). Stop here with 130 — the remaining work waits for
+            # the next run.
+            return INTERRUPT_EXIT_CODE
         if corpus_report.aborted_all_providers_down:
             # Non-zero exit: the run stopped because every provider's quota was
             # exhausted, so pages remain ungenerated. Exiting 0 here would make an

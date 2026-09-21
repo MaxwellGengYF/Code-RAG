@@ -106,7 +106,17 @@ time and rerun the same command; it continues where it left off. The compile
 unit is ONE PAGE: one page = one LLM session = one corpus file = one progress
 line = one incremental manifest checkpoint, so an interrupt costs at most the
 pages the workers had in flight (no 25/50-page batch is ever discarded after
-being paid for). First full build of the 44k-page corpus takes ~1 day with a
+being paid for). Ctrl-C is handled, not left to crash: the FIRST Ctrl-C prints a
+notice and stops the workers from taking new pages while the pages already in
+flight finish and are checkpointed (so it costs ZERO pages), then the report says
+how far the run got and the process exits **130** — no asyncio traceback, and the
+index step is skipped. A SECOND Ctrl-C aborts immediately (in-flight pages are
+abandoned; everything finished is still on disk), which also exits 130 with a
+friendly line. Since asyncio re-raises `KeyboardInterrupt` straight out of the
+event loop, only the graceful first interrupt can be caught inside the run; the
+hard path is reported by the CLI's own handler (`rag/cli/compile_cmd.py`
+`install_interrupt_stop` / `interrupt_message`, `rag/compile.py`, `rag/__main__.py`).
+First full build of the 44k-page corpus takes ~1 day with a
 gateway fleet, longer on the local 9B; every later run is minutes. A full
 unattended build is driven by `.kimix_cache/run_full_compile.sh`, an auto-resume
 loop around `compile --steps
@@ -355,11 +365,17 @@ Troubleshooting
   `compile --steps index --force` (resumable, so this continues rather than
   restarting).
 - Interrupted compile → just rerun the same command; the manifest diff resumes.
+  Ctrl-C is a supported exit: one friendly `[interrupt]` notice + a report line
+  ("stopped by Ctrl-C after N of M pages …") + exit status **130**, never a
+  traceback. At most the pages in flight are lost — the first Ctrl-C waits for
+  them and checkpoints them; a second Ctrl-C (or a kill) abandons just those.
 - **Does the auto-resume loop ever spin forever on a page that keeps failing?** No.
   Per-page fallbacks (bad JSON that survives one repair retry, an empty page) still
   exit **0**, so the loop terminates and the page stays flagged `needs_regen` for
-  the *next* manual run. Only the all-providers-down abort exits **3**, which is the
-  case where retrying genuinely helps (quota window resets). That split is
+  the *next* manual run. Only the all-providers-down abort exits **3** (and a user
+  Ctrl-C exits **130**), which are the
+  cases where retrying genuinely helps (quota window resets; an unfinished build).
+  That split is
   deliberate: a permanently unchunkable page must not wedge the whole build.
   Check `python -m rag status` → `needs_regen` for the backlog, and
   `eval_corpus_quality.py` to confirm the first-try rate is healthy.
@@ -418,7 +434,9 @@ generation of the SDKs.
 Tests are network-free by design (httpx MockTransport for the
 LLM wire format, scripted fake clients for corpus generation, tmpdir mirrors
 for the file manager, interrupt/resume and provider-death/failover simulation
-for the compile pipeline) and need no corpus/index artefacts — a fresh clone
+for the compile pipeline — `tests/test_interrupt.py` covers Ctrl-C: the handler
+itself, the graceful drain, the hard abort, the exit codes and the messages) and
+need no corpus/index artefacts — a fresh clone
 runs green before anything is built.
 `tests/test_optional_local_extra.py` pins the extras contract itself:
 torch/sentence-transformers/ollama stay out of the default dependencies, and

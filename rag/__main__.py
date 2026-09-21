@@ -14,10 +14,26 @@ The config JSON is BOTH the provider config and the corpus config: provider
 keys (model/type/url/api_key/...), input/output locations (dirs, corpus_dir,
 index_dir) and engine tuning live in one file. With no --config, ./config.json
 in the current working directory is used when present.
+
+Ctrl-C is a supported way to end any command: the process quits with the
+conventional SIGINT status (130) and one friendly line on stderr instead of an
+asyncio traceback. Compile is resumable, so the same command picks up where the
+interrupt stopped it.
 """
 from __future__ import annotations
 
 import argparse
+import sys
+
+#: POSIX convention: 128 + SIGINT (2). A Ctrl-C must not look like success, or an
+#: auto-resume wrapper would print COMPILE COMPLETE and never rerun.
+INTERRUPT_EXIT_CODE = 130
+INTERRUPT_MESSAGE = (
+    "\n[interrupt] Stopped by Ctrl-C — quitting (exit 130).\n"
+    "[interrupt] No half-written page is kept: compile checkpoints the manifest "
+    "after every finished page, so rerunning the same command resumes where it "
+    "stopped (search / status / repl read state from disk and are unaffected)."
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,6 +129,17 @@ def main(argv: list[str] | None = None) -> int:
                          help="Config JSON (default: ./config.json when present)")
 
     args = parser.parse_args(argv)
+    try:
+        return _dispatch(args)
+    except KeyboardInterrupt:
+        # Ctrl-C is a normal way to end a long run (an LLM corpus build takes
+        # hours). It is NOT an error: no traceback, one friendly line, and the
+        # SIGINT exit status so a wrapper can tell it apart from success.
+        print(INTERRUPT_MESSAGE, file=sys.stderr)
+        return INTERRUPT_EXIT_CODE
+
+
+def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "compile":
         from rag.compile import run_compile
         return run_compile(
@@ -148,4 +175,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        # Ctrl-C outside main()'s own guard — during argument parsing, an import
+        # or a config load. Same friendly exit instead of a traceback.
+        print(INTERRUPT_MESSAGE, file=sys.stderr)
+        raise SystemExit(INTERRUPT_EXIT_CODE)

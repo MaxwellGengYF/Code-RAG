@@ -10,6 +10,11 @@ falls back to heuristic chunking (see rag.corpus.generate) and is logged.
 Multi-provider sharding: pages are assigned to providers deterministically
 (md5(rel) % n_providers), which doubles throughput when two gateways are
 available and keeps reruns stable (a page always maps to the same provider).
+
+Ctrl-C quits cleanly instead of dumping an asyncio traceback: the first interrupt
+drains the pages in flight (each one is checkpointed), the run reports how far it
+got, and the CLI exits 130 (:data:`INTERRUPT_EXIT_CODE`); a second interrupt
+aborts the in-flight calls immediately.
 """
 from __future__ import annotations
 
@@ -17,6 +22,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import signal
 import sys
 import time
 from dataclasses import dataclass, field
@@ -98,11 +105,96 @@ class CompileReport:
     pages_claimed: int = 0
     #: set when the run stopped early because every provider circuit was open
     aborted_all_providers_down: bool = False
+    #: set when the run stopped because the user pressed Ctrl-C (see
+    #: :func:`install_interrupt_stop`): pages already finished are on disk, the
+    #: rest were left untouched for a later resume.
+    interrupted: bool = False
 
     def to_dict(self) -> dict:
         out = dict(self.__dict__)
         out["needs_regen"] = sorted(out.get("needs_regen", ()))
         return out
+#: Exit status of a run the user stopped with Ctrl-C (POSIX convention: 128+2).
+INTERRUPT_EXIT_CODE = 130
+#: Written with os.write from the signal handler — terse, and safe to emit from
+#: inside a handler (no buffered-stream lock to deadlock on).
+INTERRUPT_NOTICE = (
+    "\n  [interrupt] Ctrl-C — stopping: the pages in flight are still finished, "
+    "saved and checkpointed.\n"
+    "  [interrupt] press Ctrl-C again to abandon them and quit immediately.\n"
+)
+
+
+def install_interrupt_stop(aborted: dict, interrupted: dict) -> object | None:
+    """Make the FIRST Ctrl-C stop the corpus run cleanly instead of unwinding it.
+
+    ``aborted["v"]`` makes the workers stop taking new pages; the pages already in
+    flight are still finished, written and checkpointed, so a graceful interrupt
+    costs ZERO pages (the manifest flush is per page). ``interrupted["v"]`` records
+    why the run ended, so the report and the CLI can say so.
+
+    A SECOND Ctrl-C falls through to the usual behaviour (``KeyboardInterrupt``)
+    for a user who will not wait for the in-flight LLM calls.
+
+    Returns the handler to hand back to :func:`restore_interrupt_stop`, or ``None``
+    when SIGINT cannot be hooked here (not the main thread, or a platform without
+    SIGINT) — in which case Ctrl-C keeps its default meaning, and asyncio's own
+    SIGINT path (cancel the main task) applies.
+    """
+    if not hasattr(signal, "SIGINT"):
+        return None
+
+    def on_sigint(signum, frame):
+        # Runs in the main thread's signal context while the loop is parked in a
+        # task step or in select(); keep it to flag-setting + one raw write.
+        if interrupted["v"]:
+            raise KeyboardInterrupt  # second Ctrl-C: abort now
+        interrupted["v"] = True
+        aborted["v"] = True
+        try:
+            os.write(2, INTERRUPT_NOTICE.encode("utf-8"))
+        except OSError:
+            pass
+
+    try:
+        return signal.signal(signal.SIGINT, on_sigint)
+    except (ValueError, OSError):
+        return None
+
+
+def restore_interrupt_stop(previous: object | None) -> None:
+    """Put the previous SIGINT handler back (no-op when none was installed)."""
+    if previous is None:
+        return
+    try:
+        signal.signal(signal.SIGINT, previous)
+    except (ValueError, OSError, TypeError):
+        pass
+
+
+def interrupt_message(report: CompileReport | None = None, *,
+                      hard: bool = False) -> str:
+    """One friendly line for a run the user stopped with Ctrl-C.
+
+    ``hard`` marks the abort that did NOT wait for the in-flight pages (a second
+    Ctrl-C, or a cancellation): asyncio re-raises ``KeyboardInterrupt`` straight
+    out of the event loop (see ``asyncio.tasks``), so on that path the partial
+    report is gone and the caller passes ``None``. Either way every FINISHED page
+    is on disk — that is the part the user needs to trust.
+    """
+    where = ("Rerun the same command to resume — every finished page is "
+             "checkpointed and no half-written page is ever claimed.")
+    if report is None or not report.pages_planned:
+        # Nothing to quote: this is the hard path, where asyncio re-raised the
+        # KeyboardInterrupt past the code that owns the report.
+        return (f"[interrupt] stopped by Ctrl-C (the pages in flight were "
+                f"abandoned). {where}")
+    how = ("the pages in flight were abandoned" if hard else
+           "every in-flight page was finished and saved")
+    left = max(0, report.pages_planned - report.pages_done)
+    return (f"[interrupt] stopped by Ctrl-C after {report.pages_done:,} of "
+            f"{report.pages_planned:,} pages ({how}); {left:,} pages still "
+            f"pending. {where}")
 
 
 # --------------------------------------------------------------------------------------
@@ -504,6 +596,12 @@ async def run_corpus_compile(
     ``checkpoint_every``/``progress_every`` are 1; raise them per config to batch
     the manifest writes on very large builds, or set either to 0 to disable that
     mechanism (a disabled per-page flush still flushes once at the end).
+
+    Ctrl-C is not an error: the first interrupt stops the workers from taking new
+    pages, lets the pages in flight finish and be checkpointed, and returns a
+    report with ``interrupted`` set. A second one unwinds the run immediately;
+    asyncio re-raises it out of the event loop (it is not catchable inside the
+    coroutine), so the CLI's own KeyboardInterrupt handler reports it.
     """
     store = CorpusStore(fm.corpus_dir)
     report = CompileReport(pages_total=len(scanned), pages_planned=len(work))
@@ -516,6 +614,9 @@ async def run_corpus_compile(
     done_counter = 0
     lock = asyncio.Lock()
     aborted = {"v": False}
+    #: set by the Ctrl-C handler (see install_interrupt_stop): "stop taking new
+    #: pages", as opposed to ``aborted`` which the workers raise themselves.
+    interrupted = {"v": False}
     #: in-memory manifest view for the per-page checkpoint merge + how many
     #: checkpoints it is ahead of disk (see checkpoint()).
     manifest_cache: dict | None = None
@@ -593,7 +694,8 @@ async def run_corpus_compile(
                 # ~37k aux-less pages and then report success, so WAIT for a
                 # provider to come back instead. Bounded by wait_budget_s.
                 waited = 0.0
-                while not candidates and waited < wait_budget_s:
+                while (not candidates and waited < wait_budget_s
+                       and not interrupted["v"]):
                     nap = min(max(pool.next_probe_in(), 15.0), 120.0)
                     if progress and int(waited) % 300 < int(nap):
                         print(f"  [paused] all provider circuits open "
@@ -604,6 +706,11 @@ async def run_corpus_compile(
                     waited += nap
                     candidates = pool.order(preferred)
                 if not candidates:
+                    if interrupted["v"]:
+                        # Ctrl-C while paused waiting for quota: drop this page and
+                        # let the worker pool unwind (pages already finished are on
+                        # disk; the run does NOT report "quota exhausted").
+                        return False
                     if progress:
                         print(f"  [abort] provider wait budget exhausted "
                               f"({wait_budget_s:.0f}s); stopping the run with "
@@ -712,13 +819,30 @@ async def run_corpus_compile(
                     report.failures.append({"source": rel,
                                             "errors": [f"hard error: {exc}"]})
 
-    await asyncio.gather(*(worker() for _ in range(n_workers)))
-    # Final flush. With the per-page default this is a no-op in content terms
-    # (every finished page was already checkpointed) and exists for the batched
-    # configurations and for pages recorded after the last modulo boundary.
-    await asyncio.to_thread(checkpoint)
+    # Ctrl-C is handled HERE rather than left to asyncio.run: the FIRST interrupt
+    # makes the workers stop picking up new pages, so the run reaches its normal
+    # end below with every in-flight page finished and checkpointed (zero pages
+    # lost). A SECOND one reaches the loop as an unwinding KeyboardInterrupt,
+    # which asyncio deliberately re-raises straight out of the event loop
+    # (``asyncio.tasks``: ``except (KeyboardInterrupt, SystemExit): raise``) — so
+    # it CANNOT be caught here; rag.compile's own handler turns it into the
+    # friendly exit. The ``finally`` below still flushes on that path: the loop
+    # tears the tasks down through Runner.close() and this coroutine's cleanup
+    # runs there.
+    prev_sigint = install_interrupt_stop(aborted, interrupted)
+    try:
+        await asyncio.gather(*(worker() for _ in range(n_workers)))
+    finally:
+        restore_interrupt_stop(prev_sigint)
+        # Final flush. With the per-page default this is a no-op in content terms
+        # (every finished page was already checkpointed) and exists for the batched
+        # configurations, for pages recorded after the last modulo boundary, and
+        # for an abort — a ``checkpoint_every`` > 1 configuration would otherwise
+        # lose its last batch.
+        await asyncio.to_thread(checkpoint)
     report.wall_s = time.time() - t0
     report.needs_regen = set(needs_regen)
+    report.interrupted = interrupted["v"]
     if progress:
         print(f"[corpus] providers: {pool.summary()}", file=sys.stderr)
         if needs_regen:
@@ -834,6 +958,8 @@ def print_report(report: CompileReport, out=sys.stdout) -> None:
               f"(quota exhausted). {report.pages_planned - report.pages_done} pages "
               f"were left untouched rather than degraded to heuristic chunks — "
               f"rerun when the quota window resets.", file=out)
+    if report.interrupted:
+        print(interrupt_message(report), file=out)
     if report.failures:
         print(f"pages with errors/fallback: {len(report.failures)} (see "
               f"corpus/failures.jsonl)", file=out)
