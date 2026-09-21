@@ -132,14 +132,23 @@ uv run python -m rag search --mentions MaterialPropertyBlock        # literal te
 uv run python -m rag search --query "..." --explain                 # per-hit BM25/dense scores + ranks + RRF breakdown, term df table
 uv run python -m rag search --query "..." --out hits.json           # JSON output for scripts
 ```
+Search
 
-Defaults come from `config.json` (or the `--config` you passed): `corpus_dir`, `index_dir`, `embed_model`,
-`rrf_k`, `mode` (bm25 — see the gate numbers below), `dense_k`, `rerank` (off). `--mode dense` / `--mode hybrid` must embed the
-query, so they need the `local` extra; without it the engine warns once and
-serves BM25.
+[code block: 7 lines]
 
-## How compile works (and why it is safe to interrupt)
+Defaults come from config.json (or the --config you passed): corpus_dir, index_dir, embed_model,
+rrf_k, mode (hybrid), dense_k, rerank (off). Default stdout is markdown
+(agent/LLM-friendly; raw JSON via --json, compact text via --text, --out
+always raw JSON). Hybrid/dense must embed the query, so they need the local
+extra; without it the engine warns once and serves BM25.
 
+Server mode (amortizes index + BGE-M3 load, ~100 ms/query warm):
+  uv run python -m rag.server            # loads engine + embed model, serves 127.0.0.1:8642
+  # port: --port > RAG_SERVER_PORT > config server_port > 8642
+  # API: GET /health, POST /search, /mentions, /read (JSON)
+`rag search`/`rag repl` try the server first; if it is unreachable one
+warning line is logged and the command falls back to loading the engine
+locally. Set RAG_NO_SERVER=1 to force the local path.
 1. **Scan + md5 diff** against `corpus/manifest.json` → added / changed /
    removed / unchanged. Only added+changed pages hit the LLM.
 2. **Per-page gen_key** = sha1(prompt_version | model | extractor_version |

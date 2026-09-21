@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 from rag.config import load_settings
+from rag.search.format import mentions_to_markdown, results_to_markdown
 
 
 def _read_queries(queries: list[str] | None, query_file: str | None) -> list[str]:
@@ -22,6 +24,74 @@ def _read_queries(queries: list[str] | None, query_file: str | None) -> list[str
     return out
 
 
+def _server_payload(cfg, *, qs, mentions, mentions_limit, mentions_context,
+                    k, mode, explain, no_rerank, snippet_width) -> dict | None:
+    """One attempt at the rag.server HTTP path; None when it is unavailable.
+
+    Raises RuntimeError on genuine server errors (HTTP 4xx/5xx other than 503).
+    """
+    from rag import server as srv
+    t0 = time.time()
+    if mentions:
+        return srv.server_request(cfg, "/mentions",
+                                  {"term": mentions, "limit": mentions_limit,
+                                   "context": mentions_context})
+    results: list[dict] = []
+    merged: dict = {}
+    for q in qs:
+        resp = srv.server_request(cfg, "/search",
+                                  {"query": q, "k": k, "mode": mode,
+                                   "explain": explain, "no_rerank": no_rerank,
+                                   "snippet_width": snippet_width})
+        merged.update(resp.pop("_meta", None) or {})
+        results.append(resp)
+    return {
+        "_meta": {
+            "engine": "rag.server",
+            "mode": mode,
+            "elapsed_s": round(time.time() - t0, 3),
+            "chunks": merged.get("chunks"),
+            "dense": merged.get("dense"),
+        },
+        "results": results,
+    }
+
+
+def _emit(payload: dict, *, term: str | None, out: str | None,
+          text: bool, as_json: bool) -> None:
+    """Shared output sink. --out always gets raw JSON; stdout is raw JSON
+    (--json), compact text (--text), or markdown (default). *term* set means
+    a mentions payload ({term: rows}), otherwise a search payload."""
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    if out:
+        Path(out).write_text(body, encoding="utf-8")
+        print(f"wrote {out}", file=sys.stderr)
+    if text:
+        if term is not None:
+            rows = payload[term]
+            print(f"# {term}: {len(rows)} files")
+            for r in rows:
+                line = f"  {r['count']:>4}  {r['source']}"
+                if r.get("context"):
+                    line += f"\n        …{r['context']}…"
+                print(line)
+        else:
+            for r in payload["results"]:
+                print(f"\n### {r['query']}")
+                if r.get("explain"):
+                    known = [t["term"] for t in r["explain"] if t["in_index"]]
+                    print(f"  terms in index: {len(known)}/{len(r['explain'])} {known}")
+                for h in r["hits"]:
+                    print(f"  {h['fused_score']:<9.4f} {h['title']}  ({h['source']})")
+                    print(f"            {h['text'][:160]}")
+    elif as_json:
+        print(body)
+    elif term is not None:
+        print(mentions_to_markdown(term, payload[term]))
+    else:
+        print(results_to_markdown(payload))
+
+
 def run_search(
     *,
     queries: list[str] | None = None,
@@ -35,6 +105,7 @@ def run_search(
     no_rerank: bool = False,
     text: bool = False,
     legacy: bool = False,
+    as_json: bool = False,
     out: str | None = None,
     snippet_width: int = 500,
     config_path: str | None = None,
@@ -66,6 +137,30 @@ def run_search(
             argv.append("--text")
         return hybrid_retrieve.main(argv)
 
+    qs = _read_queries(queries, query_file)
+
+    # Server-first: try the HTTP server once before paying the local engine-load
+    # cost; set RAG_NO_SERVER=1 to force the local path.
+    payload: dict | None = None
+    if (mentions or qs) and not os.environ.get("RAG_NO_SERVER"):
+        from rag import server as srv
+        try:
+            payload = _server_payload(cfg, qs=qs, mentions=mentions,
+                                      mentions_limit=mentions_limit,
+                                      mentions_context=mentions_context,
+                                      k=k, mode=mode, explain=explain,
+                                      no_rerank=no_rerank,
+                                      snippet_width=snippet_width)
+        except srv.ServerUnavailable:
+            print("[search] server unavailable; local fallback", file=sys.stderr)
+            payload = None
+    if payload is not None:
+        if mentions and not payload.get(mentions):
+            print(f"[mentions] 0 files contain {mentions!r} "
+                  "(literal, case-insensitive)", file=sys.stderr)
+        _emit(payload, term=mentions, out=out, text=text, as_json=as_json)
+        return 0
+
     from rag.search.engine import SearchEngine
     engine = SearchEngine(cfg)
     try:
@@ -75,40 +170,19 @@ def run_search(
         # next command instead of a traceback — this is the expected state after
         # `git clone`, not an internal error.
         print(str(exc), file=sys.stderr)
-        print("\nnothing has been built in this checkout yet. To build:", file=sys.stderr)
-        print("  1. python -m rag compile --config <provider.json> "
-              "# LLM corpus (slow, resumable)", file=sys.stderr)
-        print("  2. python -m rag compile --steps index # BM25 + dense indexes",
-              file=sys.stderr)
-        print("     (dense needs the optional local extra: "
-              "uv sync --extra local; add --skip-dense for BM25 only)",
-              file=sys.stderr)
-        print("see AGENTS.md for the full workflow.", file=sys.stderr)
+        print("build: python -m rag compile --steps index", file=sys.stderr)
         return 1
 
     if mentions:
         res = engine.mentions(mentions, limit=mentions_limit,
                               context=mentions_context)
         if not res:
-            print(f"[mentions] 0 files contain {mentions!r} (literal, case-insensitive)",
-                  file=sys.stderr)
-        out_payload = {mentions: res}
-        body = json.dumps(out_payload, ensure_ascii=False, indent=2)
-        if out:
-            Path(out).write_text(body, encoding="utf-8")
-            print(f"wrote {out}", file=sys.stderr)
-        if text:
-            print(f"# {mentions}: {len(res)} files")
-            for r in res:
-                line = f"  {r['count']:>4}  {r['source']}"
-                if r.get("context"):
-                    line += f"\n        …{r['context']}…"
-                print(line)
-        else:
-            print(body)
+            print(f"[mentions] 0 files contain {mentions!r} "
+                  "(literal, case-insensitive)", file=sys.stderr)
+        _emit({mentions: res}, term=mentions, out=out, text=text,
+              as_json=as_json)
         return 0
 
-    qs = _read_queries(queries, query_file)
     if not qs:
         print("nothing to search: pass --query or --query-file", file=sys.stderr)
         return 1
@@ -127,19 +201,5 @@ def run_search(
         },
         "results": results,
     }
-    body = json.dumps(payload, ensure_ascii=False, indent=2)
-    if out:
-        Path(out).write_text(body, encoding="utf-8")
-        print(f"wrote {out}", file=sys.stderr)
-    if text:
-        for r in results:
-            print(f"\n### {r['query']}")
-            if r.get("explain"):
-                known = [t["term"] for t in r["explain"] if t["in_index"]]
-                print(f"  terms in index: {len(known)}/{len(r['explain'])} {known}")
-            for h in r["hits"]:
-                print(f"  {h['fused_score']:<9.4f} {h['title']}  ({h['source']})")
-                print(f"            {h['text'][:160]}")
-    else:
-        print(body)
+    _emit(payload, term=None, out=out, text=text, as_json=as_json)
     return 0
