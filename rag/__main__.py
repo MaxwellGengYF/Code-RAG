@@ -62,9 +62,11 @@ def main(argv: list[str] | None = None) -> int:
     p_compile.add_argument("--price-out", type=float, default=None,
                            help="Output price per 1M tokens (for cost estimate)")
     p_compile.add_argument("--install-embed-model", action="store_true",
-                           help="Download/cache the dense embed model (BGE-M3) and "
-                                "exit; needs no provider. Same as --steps deps but "
-                                "skips the pip-import checks")
+        help="Download/cache the dense embed model (BGE-M3) and "
+                                  "exit; needs no provider. Same as --steps deps but "
+                                  "skips the pip-import checks. Needs the optional "
+                                  "local extra: uv run --extra local ... "
+                                  "--install-embed-model")
     p_compile.add_argument("--skip-dense", action="store_true",
                            help="With --steps index: build BM25 only (minutes "
                                 "instead of hours); dense stays absent so hybrid "

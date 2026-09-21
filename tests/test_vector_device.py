@@ -13,9 +13,11 @@ import types
 
 import numpy as np
 import pytest
-import torch
 
-import rag.index.vector_index as vi
+# torch (with sentence-transformers) is the optional `local` extra, so a plain
+# `--extra dev` run must skip these tests rather than fail collection.
+torch = pytest.importorskip("torch")
+import rag.index.vector_index as vi  # noqa: E402
 
 
 class FakeST:

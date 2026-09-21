@@ -178,11 +178,8 @@ dependencies = [
     { name = "lxml" },
     { name = "msgspec" },
     { name = "numpy" },
-    { name = "ollama" },
     { name = "openai" },
     { name = "regex" },
-    { name = "sentence-transformers" },
-    { name = "torch" },
     { name = "tqdm" },
     { name = "xxhash" },
 ]
@@ -191,6 +188,11 @@ dependencies = [
 dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
+]
+local = [
+    { name = "ollama" },
+    { name = "sentence-transformers" },
+    { name = "torch" },
 ]
 
 [package.metadata]
@@ -202,17 +204,17 @@ requires-dist = [
     { name = "lxml", specifier = ">=5.0.0" },
     { name = "msgspec", specifier = ">=0.19.0" },
     { name = "numpy", specifier = ">=1.26.0" },
-    { name = "ollama", specifier = ">=0.4.0" },
+    { name = "ollama", marker = "extra == 'local'", specifier = ">=0.4.0" },
     { name = "openai", specifier = ">=1.60.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "regex", specifier = ">=2024.0.0" },
-    { name = "sentence-transformers", specifier = ">=3.0.0" },
-    { name = "torch", specifier = ">=2.13.0", index = "https://download.pytorch.org/whl/cu126" },
+    { name = "sentence-transformers", marker = "extra == 'local'", specifier = ">=3.0.0" },
+    { name = "torch", marker = "extra == 'local'", specifier = ">=2.13.0", index = "https://download.pytorch.org/whl/cu126" },
     { name = "tqdm", specifier = ">=4.66.0" },
     { name = "xxhash", specifier = ">=3.4.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["local", "dev"]
 
 [[package]]
 name = "docstring-parser"

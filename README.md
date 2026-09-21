@@ -43,6 +43,12 @@ provider keys, then:
     uv run python -m rag status     # coverage, pending pages, est. cost, engine
     uv run python -m rag.eval.eval_rag --gold-set base --mode bm25   # the quality gate
 
+`uv sync` installs the default set: corpus generation over remote providers
+plus the BM25 engine. Dense/hybrid search, the cross-encoder reranker and the
+Ollama embedder are local inference and live in the opt-in `local` extra
+(multi-GB torch wheels), so a plain `uv sync` / `uv run` never installs them:
+use `uv sync --extra local`, or prefix a command with `uv run --extra local`.
+
 With no --config, ./config.json in the current working directory is used.
 Repeat --config to shard pages across several providers (one config per
 DISTINCT quota pool; settings merge with the first file winning). Relative
@@ -75,8 +81,12 @@ Two flags matter for a first full build over ~44k pages:
   pool's quota runs out the run pauses and resumes later rather than degrading
   pages.
 
-The build is checkpointed and resumable: interrupt it at any point and rerun the
-same command to continue. search --mentions TERM enumerates literal
+The build is checkpointed and resumable per PAGE: the compile unit is one page,
+so one page = one LLM session = one corpus file = one progress line = one
+incremental manifest flush. Interrupt it at any point and rerun the same command
+to continue — a kill costs at most the pages the workers had in flight, never a
+25/50-page batch of already-paid-for LLM work. search --mentions TERM enumerates
+literal
 occurrences, --explain shows per-term document frequencies and the fusion
 breakdown, and repl keeps a persistent JSONL session so the index loads once
 for many queries.

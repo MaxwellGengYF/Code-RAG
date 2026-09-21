@@ -19,6 +19,23 @@ BGE_QUERY_INSTRUCTION = (
     "Represent this sentence for searching relevant passages: "
 )
 
+# torch + sentence-transformers are the opt-in `local` extra (multi-GB CUDA
+# wheels), so a plain `uv sync` does not install them and the dense path must
+# say how to get them instead of leaking a bare ModuleNotFoundError.
+LOCAL_EXTRA_HINT = (
+    "dense embeddings need the optional local-inference stack (torch + "
+    "sentence-transformers), which a plain `uv sync` does not install: run "
+    "`uv sync --extra local`, or prefix the command with `uv run --extra local`"
+)
+
+
+class LocalStackMissing(ImportError, RuntimeError):
+    """The opt-in `local` extra (torch/sentence-transformers) is not installed.
+
+    Subclasses both ImportError (it IS a failed import) and RuntimeError so
+    callers that guard one or the other still catch it.
+    """
+
 _MODEL = None
 _MODEL_NAME: str | None = None
 _MODEL_DEVICE: str | None = None
@@ -45,8 +62,11 @@ def embed_device() -> str:
 def ensure_embed_model(model: str = "BAAI/bge-m3"):
     """Download/load the embed model (used by the deps step; raises on failure)."""
     global _MODEL, _MODEL_NAME, _MODEL_DEVICE
-    import torch
-    from sentence_transformers import SentenceTransformer
+    try:
+        import torch
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise LocalStackMissing(f"{exc} — {LOCAL_EXTRA_HINT}") from exc
 
     if _MODEL is None or _MODEL_NAME != model:
         device = select_embed_device()

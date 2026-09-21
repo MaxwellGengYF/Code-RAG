@@ -417,7 +417,8 @@ async def test_dry_run_samples_large_work_lists(tmp_path, monkeypatch):
 
 
 async def _run_corpus_step(root, tmp_path, monkeypatch, *, dry_run: bool,
-                           client=None):
+                           client=None, workers: int = 2,
+                           cfg_extra: dict | None = None):
     """Drive run_corpus_step against a tmp mirror with a fake provider."""
     from rag.compile import run_corpus_step
 
@@ -433,11 +434,12 @@ async def _run_corpus_step(root, tmp_path, monkeypatch, *, dry_run: bool,
     cfg = {"corpus_dir": "corpus", "_base_dir": str(root),
            "dirs": [str(root / "ScriptReference")],
            "max_input_chars": 24000, "max_chunk_chars": 1200}
+    cfg.update(cfg_extra or {})
     import rag.compile as rc
     if client is None:
         client = FakeClient()
     monkeypatch.setattr(rc, "create_llm", lambda *a, **k: client)
-    return await run_corpus_step(cfg, [prov], workers=2, max_files=None,
+    return await run_corpus_step(cfg, [prov], workers=workers, max_files=None,
                                  force=False, regen=False, only=None,
                                  dry_run=dry_run, no_thinking=True,
                                  price_in=None, price_out=None)
@@ -582,3 +584,75 @@ def test_clean_refuses_to_wipe_without_provider(tmp_path):
                     clean=True)
 
     assert sentinel.exists(), "the wipe must not run when the build cannot proceed"
+
+
+# --------------------------------------------------------------------------------------
+# the compile unit is ONE PAGE: per-page progress + per-page incremental checkpoint
+# --------------------------------------------------------------------------------------
+
+
+async def test_progress_advances_once_per_page(tmp_path, monkeypatch, capsys):
+    """The progress unit is a page, not a 50-page stride.
+
+    The old `pages_done % 50` print made any work list under 50 pages report
+    NOTHING until the very end. One page = one line now, and the line carries the
+    page's session count (1 = one clean LLM session).
+    """
+    root = make_site(tmp_path / "site", 3)
+    report = await _run_corpus_step(root, tmp_path, monkeypatch, dry_run=False)
+    assert report.pages_done == 3
+
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if "pages/min" in ln]
+    assert len(lines) == 3, f"expected one progress line per page, got {lines}"
+    assert "[1/3" in lines[0] and "[2/3" in lines[1] and "[3/3" in lines[2]
+    assert all("sess=" in ln for ln in lines), lines
+
+    # progress_every=0 disables the per-page line (the final report still prints)
+    root2 = make_site(tmp_path / "site2", 3)
+    await _run_corpus_step(root2, tmp_path, monkeypatch, dry_run=False,
+                           cfg_extra={"progress_every": 0})
+    assert [ln for ln in capsys.readouterr().err.splitlines()
+            if "pages/min" in ln] == []
+
+
+async def test_manifest_checkpointed_after_every_page(tmp_path, monkeypatch):
+    """A kill loses at most the in-flight pages.
+
+    Each page's corpus AND its manifest entry are on disk before the next page's
+    LLM session starts: the claim count observed by a client at the start of
+    generation n is exactly n-1 pages. With the old 25-page checkpoint stride this
+    was [0, 0, 0] for a 3-page run — a killed run threw away every page it had
+    already paid for.
+    """
+    root = make_site(tmp_path / "site", 3)
+    manifest_path = root / "corpus" / "manifest.json"
+    claimed: list[int] = []
+
+    class ObservingClient(FakeClient):
+        async def generate(self, system_prompt: str, user_prompt: str):
+            claimed.append(
+                len(json.loads(manifest_path.read_text(encoding="utf-8"))["files"])
+                if manifest_path.exists() else 0)
+            return await super().generate(system_prompt, user_prompt)
+
+    await _run_corpus_step(root, tmp_path, monkeypatch, dry_run=False,
+                           client=ObservingClient(), workers=1)
+    assert claimed == [0, 1, 2], claimed
+
+    # The batched mode is still reachable for very large builds, and then the
+    # manifest is only written at the requested stride (here: at the end).
+    root2 = make_site(tmp_path / "site2", 3)
+    manifest2 = root2 / "corpus" / "manifest.json"
+    claimed.clear()
+
+    class ObservingClient2(FakeClient):
+        async def generate(self, system_prompt: str, user_prompt: str):
+            claimed.append(
+                len(json.loads(manifest2.read_text(encoding="utf-8"))["files"])
+                if manifest2.exists() else 0)
+            return await super().generate(system_prompt, user_prompt)
+
+    await _run_corpus_step(root2, tmp_path, monkeypatch, dry_run=False,
+                           client=ObservingClient2(), workers=1,
+                           cfg_extra={"checkpoint_every": 25, "progress_every": 0})
+    assert claimed == [0, 0, 0], claimed

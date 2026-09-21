@@ -1,6 +1,14 @@
-"""Tool-free wire-format tests: httpx MockTransport captures the actual request.
+"""Tool-free wire-format tests: an SDK-matched MockTransport captures the request.
 
 Asserts every provider sends exactly system+user roles and NO ``tools`` field.
+
+The transport module is DISCOVERED from the installed SDK (see
+:func:`sdk_http`): the openai/anthropic clients type-check the ``http_client``
+they are given, so a MockTransport must be built from the very module the SDK
+passes to its own AsyncClient — ``httpx2`` for the repo's pinned SDKs, ``httpx``
+for the older ones. Hardcoding either one makes this file fail on whichever
+interpreter carries the other SDK (a stray ``uv run pytest`` that resolves the
+system pytest is the observed case).
 """
 from __future__ import annotations
 
@@ -13,14 +21,51 @@ from rag.llm import create_llm
 from rag.llm.config import ProviderConfig
 
 
-def make_transport(capture: dict) -> httpx.MockTransport:
-    def handler(request: httpx.Request) -> httpx.Response:
+def sdk_http():
+    """The httpx-compatible module the INSTALLED openai/anthropic SDK is built on.
+
+    anthropic >= 1.0 and openai >= 3.0 are built on ``httpx2`` (a fork with its
+    own ``Response`` / ``MockTransport`` types); earlier releases use ``httpx``.
+    Both vendored clients re-export the module they imported, so read it off the
+    SDK instead of guessing: a transport from the wrong module is not merely
+    ignored, the SDK raises on the client type.
+    """
+    for sdk in ("anthropic", "openai"):
+        base_client = __import__(f"{sdk}._base_client", fromlist=["_base_client"])
+        for name in ("httpx2", "httpx"):
+            mod = getattr(base_client, name, None)
+            if mod is not None and hasattr(mod, "MockTransport"):
+                return mod
+    return httpx  # pragma: no cover - both SDKs always ship their http module
+
+
+#: the module both SDK-backed transports below must come from
+HTTP = sdk_http()
+
+
+def test_sdk_http_is_the_module_the_sdk_imported():
+    """Pin the discovery: the MockTransport module must be the SDK's own.
+
+    Guards against someone hardcoding `httpx` (or `httpx2`) again — the failure
+    mode is a `No module named 'httpx2'` / client-type error on whichever
+    interpreter carries the other generation of the SDKs.
+    """
+    import anthropic._base_client as base_client
+    candidates = {getattr(base_client, n) for n in ("httpx", "httpx2")
+                  if hasattr(base_client, n)}
+    assert candidates, "the anthropic SDK must expose the http module it imported"
+    assert HTTP in candidates, f"{HTTP.__name__} is not the module the SDK uses"
+    assert hasattr(HTTP, "MockTransport") and hasattr(HTTP, "AsyncClient")
+
+
+def make_transport(capture: dict) -> "HTTP.MockTransport":
+    def handler(request) -> "HTTP.Response":
         capture["body"] = json.loads(request.content)
         capture["url"] = str(request.url)
         capture["headers"] = dict(request.headers)
         # Minimal chat.completions-shaped response; anthropic path overrode via
         # separate transport below.
-        return httpx.Response(
+        return HTTP.Response(
             200,
             json={
                 "id": "chatcmpl-test",
@@ -37,15 +82,14 @@ def make_transport(capture: dict) -> httpx.MockTransport:
             },
         )
 
-    return httpx.MockTransport(handler)
+    return HTTP.MockTransport(handler)
 
 
 def anthropic_handler(capture: dict):
     def handler(request):
         capture["body"] = json.loads(request.content)
         capture["url"] = str(request.url)
-        import httpx2
-        return httpx2.Response(
+        return HTTP.Response(
             200,
             json={
                 "id": "msg_test",
@@ -64,7 +108,7 @@ def anthropic_handler(capture: dict):
 async def check_chat_payload(capture: dict, cfg_dict: dict):
     capture.clear()
     cfg = ProviderConfig.from_dict(cfg_dict)
-    client = create_llm(cfg, http_client=httpx.AsyncClient(
+    client = create_llm(cfg, http_client=HTTP.AsyncClient(
         transport=make_transport(capture)))
     result = await client.generate("You are a corpus builder.", "PAGE MARKDOWN HERE")
     assert result.text == "hello world response"
@@ -126,10 +170,11 @@ async def test_anthropic_toolfree():
         "model": "qwen3.8-flash", "type": "anthropic", "api_key": "sk-test",
         "thinking_effort": "low", "capabilities": ["thinking"], "max_tokens": 131072,
     })
-    # the installed anthropic SDK is built on httpx2 and rejects plain httpx clients
-    import httpx2
-    client = create_llm(cfg, http_client=httpx2.AsyncClient(
-        transport=httpx2.MockTransport(anthropic_handler(capture))))
+    # the SDK type-checks the http_client: it must come from the module the
+    # installed anthropic release itself imported (httpx2 for 1.x, httpx for 0.x)
+    client = create_llm(cfg, http_client=HTTP.AsyncClient(
+        transport=HTTP.MockTransport(anthropic_handler(capture))))
+
     result = await client.generate("You are a corpus builder.", "PAGE MARKDOWN HERE")
     assert result.text == "hello world response"
     assert result.input_tokens == 10 and result.output_tokens == 5

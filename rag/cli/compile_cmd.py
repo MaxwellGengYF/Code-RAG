@@ -38,7 +38,27 @@ from rag.store import CorpusStore, FileManager, ManifestDiff
 
 log = logging.getLogger(__name__)
 
-CHECKPOINT_EVERY = 25
+#: The compile UNIT is ONE PAGE — always. One page is one LLM session (the
+#: tool-free clients keep no history, see rag/llm/base.py), so the unit of work,
+#: the unit of accounting and the unit of LLM state all coincide: nothing is
+#: shared across pages, and a killed run can lose at most the pages its workers
+#: had in flight. Both granularities below therefore default to 1:
+#:   * CHECKPOINT_EVERY — the incremental manifest flush: after EVERY finished
+#:     page, so resume never rewinds past a page whose LLM tokens were already
+#:     paid for (the old value, 25, could throw away a whole batch);
+#:   * PROGRESS_EVERY — the progress line: after EVERY finished page, so the bar
+#:     also moves on work lists smaller than the old 50-page print stride.
+#: Both stay overridable per config ("checkpoint_every" / "progress_every") for
+#: builds that would rather trade resume granularity for fewer manifest writes;
+#: >1 batches, 0 disables that mechanism (the final report always prints).
+CHECKPOINT_EVERY = 1
+PROGRESS_EVERY = 1
+#: Per-page checkpointing rewrites the manifest once per page; re-parsing the
+#: whole manifest each time would be the dominant cost on a 44k-page build
+#: (~10 MB x 44k), so the merge works off an in-memory view that is re-read from
+#: disk every N checkpoints. That keeps a concurrent run's entries visible while
+#: making the steady-state flush a dict merge + one atomic write.
+MANIFEST_RELOAD_EVERY = 100
 #: Token-estimator constants, CALIBRATED against real gateway usage counters
 #: (measured on a 24-page sample: estimate was +217% off before this).
 #:
@@ -419,6 +439,42 @@ def report_cost(est_in: int, est_out: int, price_in: float | None,
 
 
 # --------------------------------------------------------------------------------------
+# per-page progress (the compile unit is one page)
+# --------------------------------------------------------------------------------------
+
+
+def fmt_duration(seconds: float) -> str:
+    """Compact duration: ``42s`` / ``5m03s`` / ``2h14m``."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def progress_line(done: int, total: int, elapsed_s: float, chunks: int,
+                  source: str, *, sessions: int = 1, fallback: int = 0) -> str:
+    """One line per FINISHED PAGE.
+
+    The compile unit is a single page, so this fires once per page (no modulo
+    stride): the percentage a caller watches is the real per-page completion,
+    and a work list smaller than the old 50-page print stride still shows
+    progress. ``sessions`` is that page's LLM call count (1 = one clean session,
+    >1 = self-repair sessions), which is why the line doubles as the "one page,
+    one session" audit trail. Rate + ETA make a 44k-page run observable without
+    waiting for a milestone.
+    """
+    pct = (100.0 * done / total) if total else 100.0
+    rate = (done / elapsed_s) if elapsed_s > 0 else 0.0
+    eta = ((total - done) / rate) if rate > 0 and total > done else 0.0
+    fb = f" fallback={fallback}" if fallback else ""
+    return (f"  [{done}/{total} {pct:5.1f}%] {rate:.2f} pages/min "
+            f"eta {fmt_duration(eta)} | chunks={chunks} sess={sessions}{fb} | "
+            f"{source}")
+
+
+# --------------------------------------------------------------------------------------
 # the compile run
 # --------------------------------------------------------------------------------------
 
@@ -433,10 +489,22 @@ async def run_corpus_compile(
     workers_per_provider: int = 4,
     failures_path: Path | None = None,
     progress: bool = True,
+    checkpoint_every: int = CHECKPOINT_EVERY,
+    progress_every: int = PROGRESS_EVERY,
     circuit_threshold: int = CIRCUIT_THRESHOLD,
     circuit_cooldown: float = CIRCUIT_COOLDOWN,
     wait_budget_s: float = ALL_DOWN_WAIT_BUDGET,
 ) -> CompileReport:
+    """Generate the corpus for *work*.
+
+    THE UNIT IS ONE PAGE, end to end: one queue item, one ``generate_page_corpus``
+    call chain (one LLM session, plus its own self-repair sessions), one corpus
+    file, one manifest checkpoint, one progress line. No page ever shares LLM
+    state, bookkeeping or a checkpoint window with another (default
+    ``checkpoint_every``/``progress_every`` are 1; raise them per config to batch
+    the manifest writes on very large builds, or set either to 0 to disable that
+    mechanism (a disabled per-page flush still flushes once at the end).
+    """
     store = CorpusStore(fm.corpus_dir)
     report = CompileReport(pages_total=len(scanned), pages_planned=len(work))
     t0 = time.time()
@@ -448,6 +516,10 @@ async def run_corpus_compile(
     done_counter = 0
     lock = asyncio.Lock()
     aborted = {"v": False}
+    #: in-memory manifest view for the per-page checkpoint merge + how many
+    #: checkpoints it is ahead of disk (see checkpoint()).
+    manifest_cache: dict | None = None
+    cache_age = 0
     max_chunk_chars = cfg.get("max_chunk_chars", 1200)
     max_input_chars = cfg.get("max_input_chars", 24_000)
 
@@ -464,19 +536,36 @@ async def run_corpus_compile(
         Only actually-processed pages are claimed, and entries from earlier
         partial runs survive — so an interrupted run resumes exactly where it
         stopped instead of silently marking unprocessed pages done.
+
+        Runs once per finished page (``checkpoint_every`` = 1), which is what
+        makes a kill cost at most the in-flight pages. To keep that affordable
+        the merge reads the manifest from disk only every
+        ``MANIFEST_RELOAD_EVERY`` flushes and otherwise works off the in-memory
+        view it wrote last; the reload keeps entries from a concurrent run
+        visible. Call it in a thread (``await asyncio.to_thread(checkpoint)``)
+        so the manifest write never blocks the workers' event loop.
         """
-        old = fm.load_manifest()
+        nonlocal manifest_cache, cache_age
+        if manifest_cache is None or cache_age >= MANIFEST_RELOAD_EVERY:
+            manifest_cache = fm.load_manifest()
+            cache_age = 0
+        old = manifest_cache
         # Carry the previous fallback set forward, add this run's fallbacks, then
         # drop every page this run regenerated successfully (it is in `processed`
         # but not in the local `needs_regen` set).
         still_flagged = (set(old.get("needs_regen", [])) | needs_regen) - (
             set(processed) - needs_regen)
+        files = {**old.get("files", {}), **{r: scanned[r] for r in processed}}
+        page_keys = {**old.get("page_gen_keys", {}), **processed}
         fm.save_manifest(
-            {**old.get("files", {}), **{r: scanned[r] for r in processed}},
+            files,
             set_gen_key(shards), dict(shards[0].gen_parts),
-            page_gen_keys={**old.get("page_gen_keys", {}), **processed},
+            page_gen_keys=page_keys,
             needs_regen=still_flagged,
         )
+        manifest_cache = {"files": files, "page_gen_keys": page_keys,
+                          "needs_regen": sorted(still_flagged)}
+        cache_age += 1
 
     async def one(rel: str) -> bool:
         """Generate one page. Returns False when it could not be served and the
@@ -576,11 +665,24 @@ async def run_corpus_compile(
                 await asyncio.to_thread(write_failure,
                                         {"source": rel, "errors": stats.errors})
             done_counter += 1
-            if done_counter % CHECKPOINT_EVERY == 0:
-                checkpoint()
-            if progress and report.pages_done % 50 == 0:
-                print(f"  [{report.pages_done}/{len(work)}] "
-                      f"{time.time() - t0:.0f}s", file=sys.stderr)
+            # Incremental flush: once per finished page by default, so the
+            # manifest on disk is never more than the in-flight pages behind the
+            # work the run has already paid for. Off-loop: the atomic rewrite
+            # must not stall the other workers' LLM requests.
+            if checkpoint_every > 0 and done_counter % checkpoint_every == 0:
+                await asyncio.to_thread(checkpoint)
+            # Progress: once per finished page by default (no stride), so the
+            # percentage is the true per-page completion. `stats.attempts` is
+            # this page's session count — 1 for a clean page. progress_every
+            # > 1 batches the line, 0 silences it (the final report still runs).
+            if progress and progress_every > 0 and (
+                    progress_every == 1
+                    or report.pages_done % progress_every == 0):
+                print(progress_line(report.pages_done, len(work),
+                                    time.time() - t0, report.chunks, rel,
+                                    sessions=stats.attempts,
+                                    fallback=report.fallback),
+                      file=sys.stderr)
         return True
 
     # Bounded worker pool: keeps memory flat on a 44k-page work list instead of
@@ -611,7 +713,10 @@ async def run_corpus_compile(
                                             "errors": [f"hard error: {exc}"]})
 
     await asyncio.gather(*(worker() for _ in range(n_workers)))
-    checkpoint()
+    # Final flush. With the per-page default this is a no-op in content terms
+    # (every finished page was already checkpointed) and exists for the batched
+    # configurations and for pages recorded after the last modulo boundary.
+    await asyncio.to_thread(checkpoint)
     report.wall_s = time.time() - t0
     report.needs_regen = set(needs_regen)
     if progress:

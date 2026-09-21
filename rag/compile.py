@@ -36,19 +36,61 @@ log = logging.getLogger(__name__)
 
 ALL_STEPS = ("deps", "corpus", "index")
 
+# Required for BM25 search + corpus generation: installed by a plain `uv sync`
+# (plus --extra dev for the test suite).
+CORE_IMPORTS = ("openai", "anthropic", "httpx", "msgspec", "numpy", "bs4",
+                "lxml", "json_repair")
+# The opt-in `local` extra: multi-GB CUDA torch wheels, so deliberately NOT a
+# default dependency. Only the dense index / dense+hybrid search / reranker need
+# it; a BM25-only checkout builds and searches fine without it.
+LOCAL_IMPORTS = ("torch", "sentence_transformers")
+LOCAL_EXTRA_HINT = ("run `uv sync --extra local` (or prefix the command with "
+                    "`uv run --extra local`)")
 
-def run_deps(cfg: dict) -> int:
-    """Verify imports and (if requested) pre-download the dense embed model."""
+
+def missing_imports(mods: tuple[str, ...]) -> list[str]:
     import importlib
-    for mod in ("openai", "anthropic", "httpx", "msgspec", "numpy",
-                "sentence_transformers", "bs4", "lxml", "json_repair"):
+    missing = []
+    for mod in mods:
         try:
             importlib.import_module(mod)
-            print(f"  [deps] ok: {mod}")
         except ImportError:
-            print(f"  [deps] MISSING: {mod} — run: uv sync --extra dev", file=sys.stderr)
-            return 1
+            missing.append(mod)
+    return missing
+
+
+def run_deps(cfg: dict) -> int:
+    """Verify imports and (if requested) pre-download the dense embed model.
+
+    Core requirements are fatal when absent; the local-inference stack lives in
+    the opt-in ``local`` extra, so its absence is reported as a warning and the
+    BM25-only workflow continues (``--steps index`` without ``--skip-dense``
+    then fails later with the same hint, because that build does need it).
+    """
+    missing = missing_imports(CORE_IMPORTS)
+    for mod in CORE_IMPORTS:
+        if mod in missing:
+            print(f"  [deps] MISSING: {mod} — run: uv sync",
+                  file=sys.stderr)
+        else:
+            print(f"  [deps] ok: {mod}")
+    if missing:
+        return 1
+
     embed_model = cfg.get("embed_model", "BAAI/bge-m3")
+    if embed_model in ("", "none") or cfg.get("skip_dense"):
+        print(f"  [deps] dense disabled (embed_model={embed_model!r}); "
+              f"nothing to pre-download")
+        return 0
+
+    missing_local = missing_imports(LOCAL_IMPORTS)
+    if missing_local:
+        print(f"  [deps] WARNING: {', '.join(missing_local)} not installed — "
+              f"dense/hybrid search and the dense index build need the optional "
+              f"local-inference stack; {LOCAL_EXTRA_HINT}. BM25 search and "
+              f"corpus generation work without it.", file=sys.stderr)
+        return 0
+
     try:
         from rag.index.vector_index import ensure_embed_model
         ensure_embed_model(embed_model)
@@ -202,6 +244,11 @@ async def run_corpus_step(
         shards, cfg, work=work, scanned=scanned, fm=fm,
         workers_per_provider=max(1, workers // len(shards)),
         wait_budget_s=float(cfg.get("provider_wait_budget_s", ALL_DOWN_WAIT_BUDGET)),
+        # The compile unit is ONE PAGE: progress and the incremental manifest
+        # checkpoint both advance per finished page. Set "checkpoint_every" /
+        # "progress_every" in the config to batch those writes on huge builds.
+        checkpoint_every=int(cfg.get("checkpoint_every", 1)),
+        progress_every=int(cfg.get("progress_every", 1)),
     )
     # run_corpus_compile already checkpointed the true per-page gen_keys to disk
     # (including pages served by a failover provider). Read them back rather than
@@ -279,7 +326,11 @@ def run_compile(
         from rag.index.vector_index import ensure_embed_model
         model = cfg.get("embed_model", "BAAI/bge-m3")
         print(f"[deps] installing embed model {model} ...", file=sys.stderr)
-        m = ensure_embed_model(model)
+        try:
+            m = ensure_embed_model(model)
+        except ImportError as exc:
+            print(f"[deps] {exc}", file=sys.stderr)
+            return 1
         dim = int(getattr(m, "get_embedding_dimension", None)()
                   if hasattr(m, "get_embedding_dimension")
                   else m.get_sentence_embedding_dimension())

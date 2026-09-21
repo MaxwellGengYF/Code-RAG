@@ -192,7 +192,17 @@ def build_indexes(cfg: dict, *, force: bool = False, skip_dense: bool = False,
         else:
             from rag.index.vector_index import (build_vectors_resumable,
                                                 ensure_embed_model, save_meta)
-            m = ensure_embed_model(embed_model)
+            try:
+                m = ensure_embed_model(embed_model)
+            except ImportError as exc:
+                # The dense stack is the opt-in `local` extra. Fail here, before
+                # the index manifest is written (chunks.msgpack + bm25_word.pkl
+                # are already on disk, and a rerun with --skip-dense finishes the
+                # BM25-only build).
+                print(f"[index] {exc}", file=sys.stderr)
+                print("[index] rerun with --skip-dense to build the BM25 index "
+                      "only", file=sys.stderr)
+                return 1
             dim = int(getattr(m, "get_embedding_dimension", None)()
                       if hasattr(m, "get_embedding_dimension")
                       else m.get_sentence_embedding_dimension())

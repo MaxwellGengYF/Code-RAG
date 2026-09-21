@@ -12,8 +12,14 @@ _MODEL_NAME: str | None = None
 def _get_model(model: str = "BAAI/bge-reranker-v2-m3"):
     global _MODEL, _MODEL_NAME
     if _MODEL is None or _MODEL_NAME != model:
-        from sentence_transformers import CrossEncoder
-
+        try:
+            from sentence_transformers import CrossEncoder
+        except ImportError as exc:
+            raise ImportError(
+                f"{exc} — the reranker needs the optional local-inference stack "
+                f"(sentence-transformers + torch): run `uv sync --extra local` "
+                f"(or `uv run --extra local ...`), or set \"rerank\": false"
+            ) from exc
         _MODEL = CrossEncoder(model, device="cpu")
         _MODEL_NAME = model
     return _MODEL

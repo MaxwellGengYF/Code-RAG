@@ -1,5 +1,13 @@
 """LLM corpus generation for one page: strict JSON -> json_repair salvage -> self-repair sessions.
 
+ONE PAGE = ONE SESSION. This module is called once per page (see
+``run_corpus_compile``), and every call it makes is a fresh single-turn session:
+the client protocol keeps no tools, no multi-turn history and no provider-side
+session state (rag/llm/base.py), so nothing — prompt context, repair chain,
+token accounting, or failure state — ever crosses a page boundary. The
+self-repair sessions below are contained in the same per-page unit: they fix
+THIS page's JSON and are discarded with it.
+
 Pipeline per page:
   1. LLM call (system + user prompt only — no tools).
   2. JSON extraction by an escalating recovery ladder: strict decode, then

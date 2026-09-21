@@ -34,6 +34,7 @@ class SearchEngine:
         self.embed_model = cfg.get("embed_model", "BAAI/bge-m3")
         self._loaded = False
         self._warned_dense = False
+        self._warned_dense_stack = False
 
     # ------------------------------------------------------------------ loading
 
@@ -138,10 +139,27 @@ class SearchEngine:
     def _dense_candidates(self, query: str, k: int) -> list[tuple[int, float]]:
         if self.vectors is None:
             return []
-        q = embed_query(query, model=self.embed_model)
+        try:
+            q = embed_query(query, model=self.embed_model)
+        except ImportError as exc:
+            # Vectors exist but the opt-in `local` extra (torch +
+            # sentence-transformers) is not installed. Degrade to BM25-only with
+            # the install hint instead of dying mid-query — same contract as
+            # _warn_dense_missing, just a different cause.
+            self._warn_dense_stack_missing(exc)
+            return []
         scores = self.vectors @ q
         top = heapq.nlargest(k, range(len(scores)), key=lambda i: (float(scores[i]), -i))
         return [(i, float(scores[i])) for i in top]
+
+    def _warn_dense_stack_missing(self, exc: BaseException) -> None:
+        """Warn ONCE that dense cannot run because the `local` extra is absent."""
+        if self._warned_dense_stack:
+            return
+        self._warned_dense_stack = True
+        print(f"[search] dense vectors are built but the embedder is not "
+              f"installed ({exc}); falling back to BM25-only. Install with: "
+              f"uv sync --extra local", file=sys.stderr)
 
     def _warn_dense_missing(self, mode: str) -> None:
         """Warn ONCE when a dense-requiring mode silently degrades to BM25-only.
@@ -198,11 +216,17 @@ class SearchEngine:
             # page that fusion ranked below k. Truncating to k first would make
             # the reranker a no-op reordering of results already shown.
             pool = max(k * 5, self.cfg.get("rerank_pool", 50))
-            deduped, rerank_scores = self._rerank(
-                query, deduped,
-                model=self.cfg.get("rerank_model", "BAAI/bge-reranker-v2-m3"),
-                top_n=pool)
-            reranked = True
+            try:
+                deduped, rerank_scores = self._rerank(
+                    query, deduped,
+                    model=self.cfg.get("rerank_model", "BAAI/bge-reranker-v2-m3"),
+                    top_n=pool)
+                reranked = True
+            except ImportError as exc:
+                # "rerank": true but the `local` extra is not installed: serve the
+                # fused order rather than failing the query.
+                print(f"[search] rerank requested but unavailable ({exc}); "
+                      f"returning the unreranked order", file=sys.stderr)
         fused = deduped[:k]
 
         bm25_scores = dict(bm25)

@@ -78,7 +78,10 @@ def run_search(
         print("\nnothing has been built in this checkout yet. To build:", file=sys.stderr)
         print("  1. python -m rag compile --config <provider.json> "
               "# LLM corpus (slow, resumable)", file=sys.stderr)
-        print("  2. python -m rag compile --steps index    # BM25 + dense indexes",
+        print("  2. python -m rag compile --steps index # BM25 + dense indexes",
+              file=sys.stderr)
+        print("     (dense needs the optional local extra: "
+              "uv sync --extra local; add --skip-dense for BM25 only)",
               file=sys.stderr)
         print("see AGENTS.md for the full workflow.", file=sys.stderr)
         return 1

@@ -6,7 +6,8 @@ documents — this checkout hosts the Unity 6.x offline-mirror deployment
 other document set: point `dirs` in the config at your HTML and go.
 
 - `compile` — LLM-generated corpus (semantic chunks + aux fields per page) →
-  BM25 + dense indexes. md5-incremental, checkpointed, resumable.
+  BM25 + dense indexes. md5-incremental, per-page checkpointed, resumable
+  (compile unit = one page = one LLM session).
 - `search` — BM25 (word tokenizer + path terms) by default; BGE-M3 dense and
   RRF-fused hybrid selectable via `--mode`.
 
@@ -53,6 +54,29 @@ other document set: point `dirs` in the config at your HTML and go.
   gitignored): `chunks.pkl`, `index_word.pkl`,
   `retriever_config.json`.
 
+## Install (dependency extras)
+
+`uv sync` installs the DEFAULT set only: HTML->markdown, the vendored LLM
+clients, the corpus store and the BM25 engine. Dense embeddings, the
+cross-encoder reranker and the Ollama embedder are LOCAL INFERENCE, so they live
+in the opt-in `local` extra (torch CUDA wheels + transformers, multi-GB) and are
+deliberately NOT default dependencies: a plain `uv sync` / `uv run` never pulls
+torch.
+
+```bash
+uv sync                    # default: corpus compile + BM25 search
+uv sync --extra local      # + torch / sentence-transformers / ollama (dense, rerank)
+uv sync --extra dev        # + pytest (test suite)
+uv run --extra local python -m rag compile --steps index   # dense index build
+```
+
+A missing extra is a supported state, never a traceback: `compile --steps deps`
+warns and continues (BM25 is untouched), `--steps index` without `--skip-dense`
+and `--install-embed-model` abort with the exact install command, and search in
+`--mode hybrid` / `--mode dense` degrades to BM25 with a once-per-run warning.
+Only the dense / hybrid / rerank paths need it; the corpus step and
+`--skip-dense` index builds do not.
+
 ## Usage
 
 ### Build (compile)
@@ -73,14 +97,19 @@ uv run python -m rag compile --config config.json --config llama_cpp/provider-qw
 uv run python -m rag compile --config config.json --config ... --only Manual/foo.html # regenerate exactly one page
 uv run python -m rag compile --steps index # rebuild search indexes from corpus (BM25 ~10 s; dense ~7 min on GPU, resumable)
 uv run python -m rag compile --steps index --skip-dense # BM25 only, minutes
+uv run --extra local python -m rag compile --steps index --force # dense build needs the `local` extra (torch)
 uv run python -m rag status # freshness, coverage, pending pages
 ```
 
 Compile is md5-incremental, checkpointed, and safe to interrupt — kill it any
-time and rerun the same command; it continues where it left off. First full
-build of the 44k-page corpus takes ~1 day with a gateway fleet, longer on the
-local 9B; every later run is minutes. A full unattended build is driven by
-`.kimix_cache/run_full_compile.sh`, an auto-resume loop around `compile --steps
+time and rerun the same command; it continues where it left off. The compile
+unit is ONE PAGE: one page = one LLM session = one corpus file = one progress
+line = one incremental manifest checkpoint, so an interrupt costs at most the
+pages the workers had in flight (no 25/50-page batch is ever discarded after
+being paid for). First full build of the 44k-page corpus takes ~1 day with a
+gateway fleet, longer on the local 9B; every later run is minutes. A full
+unattended build is driven by `.kimix_cache/run_full_compile.sh`, an auto-resume
+loop around `compile --steps
 corpus`.
 
 ### Search
@@ -95,7 +124,9 @@ uv run python -m rag search --query "..." --out hits.json           # JSON outpu
 ```
 
 Defaults come from `config.json` (or the `--config` you passed): `corpus_dir`, `index_dir`, `embed_model`,
-`rrf_k`, `mode` (bm25 — see the gate numbers below), `dense_k`, `rerank` (off).
+`rrf_k`, `mode` (bm25 — see the gate numbers below), `dense_k`, `rerank` (off). `--mode dense` / `--mode hybrid` must embed the
+query, so they need the `local` extra; without it the engine warns once and
+serves BM25.
 
 ## How compile works (and why it is safe to interrupt)
 
@@ -116,10 +147,21 @@ Defaults come from `config.json` (or the `--config` you passed): `corpus_dir`, `
    heuristic fallback now covers API failure only. Acceptance measured on 40
    sampled pages with the shipped config: 98% first-try valid, 100% usable,
    2.20 chunks/page, 0 verbatim violations (eval_corpus_quality.py).
-4. **Checkpointing**: every 25 pages the manifest is atomically rewritten,
-   merging prior entries. Kill the process any time; rerunning `compile`
-   continues exactly where it left off. `corpus/failures.jsonl` logs pages that
-   needed repair/fallback.
+4. The compile UNIT is one page — one page, one session. Each work item is a
+   single page, generated in its own LLM session (tool-free, no history: no
+   prompt context, repair chain or state crosses a page boundary), written to
+   its own corpus file, followed by its own progress line and its own
+   incremental checkpoint. After EVERY finished page the manifest is atomically
+   rewritten (merging prior entries), so a kill loses at most the pages the
+   workers had in flight — never a batch that was paid for but not recorded.
+   Both granularities are configurable ("checkpoint_every" / "progress_every",
+   default 1 = the per-page unit) purely to batch manifest writes on very large
+   builds; --max-files 5 / a 3-page mirror also prints 5 / 3 progress lines.
+   The checkpoint merge reads the manifest from disk every 100 flushes (and
+   otherwise works off its in-memory view) so per-page flushing does not
+   re-parse a ~10 MB manifest 44k times; the write happens off the event loop.
+   corpus/failures.jsonl logs pages that needed repair/fallback.
+
 5. **Multi-provider sharding**: with several `--config` flags (or a `"providers"` list inside one config), pages are
    assigned deterministically (`md5(rel) % n_providers`), each provider gets
    `workers/n` concurrency. Adding a provider later rekeys every page once
@@ -262,6 +304,9 @@ Hard-won gateway facts (measured 2026-09):
 
 Local inference (llama.cpp Qwen3.5-9B)
 
+This provider is plain HTTP (httpx) and needs NO PyPI extras. The `local`
+extra exists for torch-based dense embedding / reranking, not for llama.cpp.
+
 A local provider (`"type": "llama"`) serves corpus builds without any
 gateway. `llama_cpp/` ships prebuilt CUDA binaries (gitignored, multi-100MB)
 plus a ready config: `llama_cpp/provider-qwen35-local.json` (relative paths
@@ -351,10 +396,31 @@ contamination caveats: `eval_results.md` → "Full-corpus final (2026-09-20)".
 
 ## Testing
 
-`uv run --extra dev python -m pytest tests/ -q` — **217 tests, all pass**.
-pytest is a dev extra, so plain `uv run python -m pytest` fails; always use
-`--extra dev`. Tests are network-free by design (httpx MockTransport for the
+`uv run --extra dev python -m pytest tests/ -q` — **229 pass, 1 skipped**.
+The skip is `tests/test_vector_device.py`, which needs torch; with `--extra
+local` those 4 tests run too. (A checkout whose interpreter has every dependency
+collected 233 and passed all of them — the same suite, one more module.)
+Note that the optional-inference tests
+simulate the missing stack (None in `sys.modules`), so the suite is green in
+both environments: a plain BM25 checkout and a full GPU one.
+pytest is a dev extra, so plain `uv run python -m pytest` fails; always pass
+`--extra dev`. Run it as `uv run --extra dev python -m pytest`, NOT as bare
+`uv run pytest`: with the dev extra unsynced, `uv run pytest` silently resolves
+whatever `pytest` is on PATH (the system Python) and the suite then exercises the
+SYSTEM site-packages — a differently pinned openai / anthropic — instead of the
+locked ones. That is how `tests/test_llm_toolfree.py` failed with `No module
+named 'httpx2'`: anthropic ≥1.0 and openai ≥3.0 are built on `httpx2` (their own
+httpx fork, with its own `Response`/`MockTransport` types), anthropic 0.x on
+`httpx`, and the venv had 1.6.0 while the system interpreter had 0.87.0. The
+test file now asks the installed SDK which module it imported (`sdk_http()`) and
+builds its transport from that one, so the wire-format tests pass under either
+generation of the SDKs.
+Tests are network-free by design (httpx MockTransport for the
 LLM wire format, scripted fake clients for corpus generation, tmpdir mirrors
 for the file manager, interrupt/resume and provider-death/failover simulation
 for the compile pipeline) and need no corpus/index artefacts — a fresh clone
 runs green before anything is built.
+`tests/test_optional_local_extra.py` pins the extras contract itself:
+torch/sentence-transformers/ollama stay out of the default dependencies, and
+the dense/rerank paths must degrade (or fail) with the `uv sync --extra local`
+hint, never a bare ModuleNotFoundError.
