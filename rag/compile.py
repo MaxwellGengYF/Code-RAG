@@ -25,6 +25,7 @@ from rag.cli.compile_cmd import (
     report_cost,
     run_corpus_compile,
     set_gen_key,
+    wipe_generated_dirs,
 )
 from rag.config import RagConfig, config_dir, data_path, load_config
 from rag.corpus.prompts import system_prompt
@@ -234,9 +235,45 @@ def run_compile(
     price_out: float | None = None,
     skip_dense: bool = False,
     install_embed_model: bool = False,
+    clean: bool = False,
 ) -> int:
     rc: RagConfig = load_config(configs)
     cfg = rc.settings
+    if not steps:
+        steps = list(ALL_STEPS)
+    unknown = [s for s in steps if s not in ALL_STEPS]
+    if unknown:
+        raise SystemExit(f"unknown --steps {unknown}; expected any of {ALL_STEPS}")
+    if clean:
+        # Guards run BEFORE anything is deleted. --clean is the "rm -rf corpus
+        # index, then rebuild" operation: unlike --force (which requeues every
+        # page but keeps the old corpus files until they are overwritten), the
+        # generated artefacts are gone before the build starts, so nothing stale
+        # can survive. The wipe covers the indexes too: a fresh corpus under the
+        # same gen_key would otherwise hit the index step's "up to date" shortcut
+        # and silently keep serving the old chunks.
+        if dry_run:
+            raise SystemExit("--clean cannot be combined with --dry-run: "
+                             "a dry run must stay read-only")
+        if only:
+            raise SystemExit("--clean cannot be combined with --only")
+        if max_files is not None:
+            raise SystemExit("--clean cannot be combined with --max-files: "
+                             "a clean build must regenerate every page")
+        if "corpus" not in steps:
+            raise SystemExit("--clean needs --steps to include 'corpus' — "
+                             "otherwise nothing regenerates what it deletes")
+        if not rc.providers:
+            raise SystemExit(
+                "the corpus step needs an LLM provider: add model/type/api_key to "
+                "your config (see config.example.json) and pass it with --config "
+                "(default: ./config.json)")
+        wiped = wipe_generated_dirs(cfg, base_dir=rc.base_dir)
+        for d in wiped:
+            print(f"[clean] deleted {d}", file=sys.stderr)
+        if not wiped:
+            print("[clean] nothing to delete (no generated artefacts yet)",
+                  file=sys.stderr)
     if install_embed_model:
         # standalone model download; needs no provider and does not touch corpus
         from rag.index.vector_index import ensure_embed_model
@@ -248,11 +285,6 @@ def run_compile(
                   else m.get_sentence_embedding_dimension())
         print(f"[deps] embed model ready: {model} (dim={dim})")
         return 0
-    if not steps:
-        steps = list(ALL_STEPS)
-    unknown = [s for s in steps if s not in ALL_STEPS]
-    if unknown:
-        raise SystemExit(f"unknown --steps {unknown}; expected any of {ALL_STEPS}")
     workers = workers or cfg.get("compile_workers", 8)
 
     if "deps" in steps:

@@ -2,7 +2,7 @@
 
 Commands:
     python -m rag compile [--config cfg.json ...] [--steps corpus,index,deps]
-             [--workers 8] [--max-files N] [--force] [--regen]
+             [--workers 8] [--max-files N] [--force] [--regen] [--clean]
              [--only REL] [--dry-run]
     python -m rag search --query "..." [--k 10] [--mode hybrid|bm25|dense]
              [--query-file q.txt] [--mentions TERM] [--explain] [--no-rerank]
@@ -41,6 +41,15 @@ def main(argv: list[str] | None = None) -> int:
                            help="Regenerate ALL pages regardless of md5 state")
     p_compile.add_argument("--regen", action="store_true",
                            help="Ignore the manifest and regenerate everything")
+    p_compile.add_argument("--clean", action="store_true",
+                           help="Delete ALL generated artefacts first (corpus "
+                                "pages + manifest + indexes), then recompile "
+                                "every page from scratch. Unlike --force — "
+                                "which requeues all pages but keeps the old "
+                                "corpus until each page is overwritten — "
+                                "nothing generated survives. Refuses "
+                                "--dry-run/--only/--max-files; run only when "
+                                "no compile is active")
     p_compile.add_argument("--only", default=None,
                            help="Regenerate exactly one page (root-relative path)")
     p_compile.add_argument("--dry-run", action="store_true",
@@ -111,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
             regen=args.regen, only=args.only, dry_run=args.dry_run,
             no_thinking=args.no_thinking, price_in=args.price_in,
             price_out=args.price_out, skip_dense=args.skip_dense,
-            install_embed_model=args.install_embed_model,
+            install_embed_model=args.install_embed_model, clean=args.clean,
         )
     if args.command == "search":
         from rag.cli.search_cmd import run_search

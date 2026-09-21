@@ -31,6 +31,7 @@ from rag.corpus import (
     extract_page,
     generate_page_corpus,
 )
+from rag.config import data_path
 from rag.corpus.prompts import PROMPT_VERSION
 from rag.llm.base import LLMClient
 from rag.store import CorpusStore, FileManager, ManifestDiff
@@ -322,6 +323,53 @@ def plan_work(
             work.append(rel)
     work = sorted(set(work))
     return work[:max_files] if max_files else work
+
+
+# --------------------------------------------------------------------------------------
+# clean rebuild (--clean)
+# --------------------------------------------------------------------------------------
+
+
+def wipe_generated_dirs(cfg: dict, *, base_dir: Path) -> list[Path]:
+    """Delete ALL generated artefacts so the next build starts from nothing.
+
+    Removes the configured ``corpus_dir`` (per-page corpus files, manifest.json,
+    failures.jsonl) and ``index_dir`` (chunk table, BM25 + dense indexes, index
+    manifest). After the wipe every scanned page is "added" and every index is
+    rebuilt from scratch — that is exactly what ``compile --clean`` wants: no
+    stale generated content can survive a config/provider change.
+
+    SAFETY: a generated-dir setting of "." — or an absolute path pointing at
+    the config or working directory — would delete the document mirror or the
+    repo itself, so any dir that IS the base dir, the CWD, or the filesystem
+    root is refused rather than removed. Missing dirs are skipped (nothing to
+    delete).
+
+    Returns the directories actually removed (empty when nothing existed).
+    """
+    import shutil
+
+    cwd = Path.cwd().resolve()
+    base = Path(base_dir).resolve()
+    # Resolve and validate BOTH dirs before deleting ANY of them: a config with
+    # a safe corpus_dir but a malicious index_dir must not wipe the corpus first
+    # and only then refuse (the guards are only trustworthy when they all ran).
+    targets: list[Path] = []
+    for key, default in (("corpus_dir", "corpus"), ("index_dir", "index")):
+        d = data_path(cfg, key, default, base=base).resolve()
+        if d == base or d == cwd or d.parent == d:
+            raise SystemExit(
+                f"[clean] REFUSING to delete {d}: {key} must name a dedicated "
+                f"generated-artefact directory, not the config directory, the "
+                f"current working directory, or a filesystem root")
+        if d not in targets:
+            targets.append(d)
+    wiped: list[Path] = []
+    for d in targets:
+        if d.exists():
+            shutil.rmtree(d)
+            wiped.append(d)
+    return wiped
 
 
 # --------------------------------------------------------------------------------------

@@ -318,9 +318,19 @@ Troubleshooting
   deliberate: a permanently unchunkable page must not wedge the whole build.
   Check `python -m rag status` → `needs_regen` for the backlog, and
   `eval_corpus_quality.py` to confirm the first-try rate is healthy.
-- A page's corpus looks wrong → `python -m rag compile --config config.json --config ... --only Manual/foo.html`
+- A page's corpus looks wrong → python -m rag compile --config config.json --config ... --only Manual/foo.html
   regenerates exactly one page.
-- Deleting corpus: `rm -rf corpus index` is safe; everything regenerates.
+- Deleting corpus: rm -rf corpus index is safe; everything regenerates. The supported
+  way to do exactly that and then rebuild from nothing is
+  python -m rag compile --clean (deletes ALL generated artefacts — corpus pages,
+  manifest, failures.jsonl, and the indexes — then recompiles every page from
+  scratch). Unlike --force/--regen (requeue all pages but keep the old corpus
+  files until each page is overwritten), nothing generated survives --clean, so
+  no stale content can outlive a config or provider change. Refuses
+  --dry-run/--only/--max-files, requires a provider before deleting anything,
+  and refuses to wipe a directory that is the config dir, the CWD, or a
+  filesystem root (a corpus_dir of "." must not delete the document mirror).
+  Run it only when no compile is active.
 
 ## Final engine numbers (full corpus, 2026-09-20)
 

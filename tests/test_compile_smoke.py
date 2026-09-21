@@ -15,6 +15,7 @@ from rag.cli.compile_cmd import (
     set_gen_key,
     shard_index,
     valid_gen_keys,
+    wipe_generated_dirs,
 )
 from rag.store import CorpusStore, FileManager
 
@@ -487,3 +488,97 @@ async def test_dry_run_leaves_manifest_untouched(tmp_path, monkeypatch):
     after = fm.load_manifest()
     assert len(after["files"]) == claimed, "dry-run must not repair the manifest"
     assert (root / "corpus" / "manifest.json").stat().st_mtime_ns == mtime_before
+
+
+# --------------------------------------------------------------------------------------
+# --clean: delete all generated artefacts, then recompile everything
+# --------------------------------------------------------------------------------------
+
+
+async def test_clean_wipes_everything_and_rebuilds(env):
+    """--clean semantics: corpus + indexes are GONE before the rebuild starts,
+    the input mirror is untouched, and the post-wipe compile plans ALL pages
+    again (the empty manifest makes every page 'added')."""
+    root, corpus_dir, fm, cfg = env
+    await compile_all(fm, cfg, 40)
+    index_dir = root / "index"
+    index_dir.mkdir()
+    (index_dir / "bm25_word.pkl").write_bytes(b"stale")
+    assert (corpus_dir / "manifest.json").exists()
+
+    wiped = wipe_generated_dirs(
+        {"corpus_dir": str(corpus_dir), "index_dir": str(index_dir)},
+        base_dir=root)
+
+    assert set(wiped) == {corpus_dir, index_dir}
+    assert not corpus_dir.exists() and not index_dir.exists()
+    # the input document mirror survives
+    assert (root / "ScriptReference" / "Page0.html").exists()
+    # and the rebuild regenerates every page from scratch
+    report, _ = await compile_all(fm, cfg, 40)
+    assert report.pages_done == 40
+
+
+async def test_clean_wipe_refuses_unsafe_dirs(env):
+    """corpus_dir='.' or a filesystem root would delete the mirror/repo, not
+    generated artefacts — refuse and delete nothing."""
+    root, corpus_dir, fm, cfg = env
+    await compile_all(fm, cfg, 40)
+    assert (corpus_dir / "manifest.json").exists()
+
+    for bad in ({"corpus_dir": "."}, {"corpus_dir": "/"},
+                {"index_dir": "."}):
+        with pytest.raises(SystemExit):
+            wipe_generated_dirs(bad, base_dir=root)
+
+    assert (corpus_dir / "manifest.json").exists()
+    assert (root / "ScriptReference" / "Page0.html").exists()
+
+
+def test_clean_flag_guards(tmp_path):
+    """run_compile must reject unusable --clean combinations BEFORE deleting
+    anything (dry-run is read-only; --only/--max-files would wipe the corpus
+    and then regenerate a subset)."""
+    from rag.compile import run_compile
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({
+        "dirs": ["docs"], "corpus_dir": "corpus", "index_dir": "index",
+        "model": "fake", "type": "openai_legacy",
+    }), encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "a.html").write_text("<html><body>a</body></html>",
+                                              encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        run_compile(configs=[str(cfg_path)], steps=["corpus", "index"],
+                    dry_run=True, clean=True)
+    with pytest.raises(SystemExit):
+        run_compile(configs=[str(cfg_path)], steps=["corpus"],
+                    only="docs/a.html", clean=True)
+    with pytest.raises(SystemExit):
+        run_compile(configs=[str(cfg_path)], steps=["corpus"],
+                    max_files=1, clean=True)
+    with pytest.raises(SystemExit):
+        # steps without 'corpus' would wipe and never regenerate
+        run_compile(configs=[str(cfg_path)], steps=["index"], clean=True)
+
+
+def test_clean_refuses_to_wipe_without_provider(tmp_path):
+    """The provider check runs BEFORE the wipe: a build that cannot proceed
+    must not destroy the existing corpus."""
+    from rag.compile import run_compile
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "a.html").write_text("<html><body>a</body></html>",
+                                              encoding="utf-8")
+    (tmp_path / "corpus").mkdir()
+    sentinel = tmp_path / "corpus" / "sentinel.txt"
+    sentinel.write_text("keep me", encoding="utf-8")
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"dirs": ["docs"], "corpus_dir": "corpus"}),
+                        encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        run_compile(configs=[str(cfg_path)], steps=["corpus", "index"],
+                    clean=True)
+
+    assert sentinel.exists(), "the wipe must not run when the build cannot proceed"
