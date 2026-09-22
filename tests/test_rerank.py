@@ -195,10 +195,64 @@ def test_run_search_forwards_mentions_flags(monkeypatch, capsys):
 
     monkeypatch.setattr("rag.search.engine.SearchEngine", lambda cfg: FakeEngine())
     sc.run_search(mentions="Foo", mentions_limit=7, mentions_context=120,
-                  text=False, legacy=False)
+                  text=False, legacy=False, as_json=True)
     assert seen == {"term": "Foo", "limit": 7, "context": 120}
     body = capsys.readouterr().out
     assert '"context"' in body, "context must appear in JSON output"
+
+
+def test_run_search_mentions_default_markdown(monkeypatch, capsys):
+    """The default stdout format is now markdown (--json keeps the old raw JSON)."""
+    import rag.cli.search_cmd as sc
+    import rag.server as srv
+
+    class FakeEngine:
+        cfg = {}
+        n_chunks = 1
+        has_dense = False
+        def load(self):
+            pass
+        def mentions(self, term, *, limit=60, context=0):
+            return [{"source": "ScriptReference/A.html", "count": 3,
+                     "context": "some surrounding text"}]
+
+    def _down(*_a, **_kw):
+        raise srv.ServerUnavailable("no server in tests")
+
+    monkeypatch.setattr("rag.search.engine.SearchEngine", lambda cfg: FakeEngine())
+    monkeypatch.setattr("rag.server.server_request", _down)
+    sc.run_search(mentions="Foo", legacy=False)
+    out = capsys.readouterr().out
+    assert "### mentions: Foo (1 files)" in out
+    assert "- `ScriptReference/A.html` ×3" in out
+
+
+def test_run_search_default_mode_hybrid(monkeypatch, capsys):
+    """No 'mode' in the config -> the engine must be called with 'hybrid'."""
+    import rag.cli.search_cmd as sc
+    import rag.server as srv
+    captured = {}
+
+    class FakeEngine:
+        cfg = {}
+        n_chunks = 1
+        has_dense = False
+        def load(self):
+            pass
+        def search(self, query, *, k=8, mode="hybrid", per_file=1,
+                   explain=False, no_rerank=False, snippet_width=500):
+            captured.update(query=query, k=k, mode=mode)
+            return {"query": query, "hits": []}
+
+    def _down(*_a, **_kw):
+        raise srv.ServerUnavailable("no server in tests")
+
+    monkeypatch.setattr("rag.search.engine.SearchEngine", lambda cfg: FakeEngine())
+    monkeypatch.setattr("rag.cli.search_cmd.load_settings", lambda *a, **k: {})
+    monkeypatch.setattr("rag.server.server_request", _down)
+    assert sc.run_search(queries=["x"], k=3) == 0
+    assert captured["mode"] == "hybrid"
+    assert captured["k"] == 3
 
 
 def test_run_search_legacy_forwards_mentions_flags(monkeypatch):

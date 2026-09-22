@@ -117,11 +117,10 @@ class SearchEngine:
         want_pb = int(self.cfg.get("path_boost", 3))
         got_aux, got_pb = built.get("aux"), built.get("path_boost")
         if got_aux != want_aux or got_pb != want_pb:
-            print(f"[search] WARNING: index was built with bm25 aux={got_aux} "
-                  f"path_boost={got_pb} but config asks for aux={want_aux} "
-                  f"path_boost={want_pb} — results reflect the OLD settings. "
-                  f"Rebuild with: python -m rag compile --steps index "
-                  f"--force", file=sys.stderr)
+            print(f"[search] WARNING: index built with aux={got_aux} "
+                  f"path_boost={got_pb} (config: aux={want_aux} "
+                  f"path_boost={want_pb}); rebuild: python -m rag compile "
+                  f"--steps index --force", file=sys.stderr)
 
     @property
     def has_dense(self) -> bool:
@@ -157,9 +156,8 @@ class SearchEngine:
         if self._warned_dense_stack:
             return
         self._warned_dense_stack = True
-        print(f"[search] dense vectors are built but the embedder is not "
-              f"installed ({exc}); falling back to BM25-only. Install with: "
-              f"uv sync --extra local", file=sys.stderr)
+        print(f"[search] dense unavailable (missing local extra); BM25-only. "
+              f"fix: uv sync --extra local", file=sys.stderr)
 
     def _warn_dense_missing(self, mode: str) -> None:
         """Warn ONCE when a dense-requiring mode silently degrades to BM25-only.
@@ -172,10 +170,8 @@ class SearchEngine:
         if mode not in ("hybrid", "dense") or self.has_dense or self._warned_dense:
             return
         self._warned_dense = True
-        print(f"[search] mode={mode} requested but no dense vectors are built — "
-              f"falling back to BM25-only, which returns 0 hits for typo and "
-              f"paraphrase queries. Build them with: python -m rag compile "
-              f"--steps index", file=sys.stderr)
+        print(f"[search] no dense vectors; BM25-only. build: python -m rag "
+              f"compile --steps index", file=sys.stderr)
 
     def search(
         self,
@@ -225,8 +221,8 @@ class SearchEngine:
             except ImportError as exc:
                 # "rerank": true but the `local` extra is not installed: serve the
                 # fused order rather than failing the query.
-                print(f"[search] rerank requested but unavailable ({exc}); "
-                      f"returning the unreranked order", file=sys.stderr)
+                print(f"[search] rerank unavailable ({exc}); unreranked "
+                      f"order", file=sys.stderr)
         fused = deduped[:k]
 
         bm25_scores = dict(bm25)

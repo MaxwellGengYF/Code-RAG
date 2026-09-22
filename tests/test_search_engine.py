@@ -282,7 +282,7 @@ def test_param_drift_warns(tiny_index, capsys):
     drifted["path_boost"] = 5
     SearchEngine(drifted).load()
     err = capsys.readouterr().err
-    assert "WARNING: index was built with bm25 aux=False path_boost=3" in err
+    assert "WARNING: index built with aux=False path_boost=3" in err
     assert "--steps index --force" in err  # names the fix
 
 

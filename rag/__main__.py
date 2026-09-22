@@ -106,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
                           help="Max chars of each hit snippet")
     p_search.add_argument("--no-rerank", action="store_true")
     p_search.add_argument("--text", action="store_true", help="Compact human output")
+    p_search.add_argument("--json", action="store_true",
+                          help="Raw JSON output (default: markdown)")
     p_search.add_argument("--legacy", action="store_true",
                           help="Use the legacy engine (rag.legacy.hybrid_retrieve)")
     p_search.add_argument("--config", default=None, metavar="CFG.json",
@@ -159,7 +161,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             mentions_limit=args.mentions_limit,
             mentions_context=args.mentions_context, explain=args.explain,
             no_rerank=args.no_rerank, text=args.text, legacy=args.legacy,
-            out=args.out, snippet_width=args.snippet_width,
+            as_json=args.json, out=args.out, snippet_width=args.snippet_width,
             config_path=args.config,
         )
     if args.command == "repl":

@@ -12,7 +12,7 @@
   "dense_k": 200,
   "final_k": 8,
   "rrf_k": 60,
-  "mode": "bm25",
+  "mode": "hybrid",
   "rerank": false,
   "rerank_model": "BAAI/bge-reranker-v2-m3",
   "embed_model": "BAAI/bge-m3",
