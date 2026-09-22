@@ -10,17 +10,32 @@ Stdlib only (http.server + urllib). Endpoints:
 
 The socket binds FIRST and /health answers 503 {"starting": true} during
 warmup, so clients can poll for readiness while the index loads.
+
+Port discovery: after a successful bind the server writes its ACTUAL port
+(``httpd.server_address[1]`` — which may be an ephemeral one when the
+requested port was busy) to a small JSON file in the system temp dir,
+``$TMP/rag_server_<hash>.json`` (hash of the config dir, so checkouts do not
+collide). Clients (``rag search`` / ``rag repl`` -> :func:`server_request`)
+pick the port up from that file via :func:`resolve_port`, so the agent-side
+command line needs no port argument at all. The file is removed on server
+shutdown; clients probe the recorded port and ignore stale files.
 """
 from __future__ import annotations
 
 import argparse
+import atexit
+import hashlib
 import json
 import os
+import socket
 import sys
+import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 DEFAULT_PORT = 8642
 
@@ -32,12 +47,16 @@ class ServerUnavailable(Exception):
 # ---------------------------------------------------------------------- config
 
 def resolve_port(cfg=None, override=None) -> int:
-    """--port flag > env RAG_SERVER_PORT > config server_port > default 8642."""
+    """--port flag > env RAG_SERVER_PORT > temp port file (live server) >
+    config server_port > default 8642."""
     if override is not None:
         return int(override)
     env = os.environ.get("RAG_SERVER_PORT")
     if env:
         return int(env)
+    live = read_port_file(cfg)
+    if live:
+        return live
     if cfg is not None:
         try:
             port = cfg.get("server_port")
@@ -46,6 +65,61 @@ def resolve_port(cfg=None, override=None) -> int:
         if port:
             return int(port)
     return DEFAULT_PORT
+
+
+# ------------------------------------------------------------------ port file
+
+def port_file_path(cfg=None) -> Path:
+    """The temp-file announcement path for this config's server. Keyed by the
+    config dir (falling back to the rag package root) so parallel checkouts
+    each get their own file."""
+    from rag.config import config_dir
+    base = str(config_dir(cfg or {}).resolve())
+    digest = hashlib.md5(base.encode("utf-8")).hexdigest()[:8]
+    return Path(tempfile.gettempdir()) / f"rag_server_{digest}.json"
+
+
+def write_port_file(cfg, port: int, path: Path | None = None) -> Path:
+    """Server side: announce the live port after a successful bind. Written
+    atomically (tmp + os.replace); safe for a racing reader."""
+    from rag.config import config_dir
+    path = path or port_file_path(cfg)
+    body = json.dumps({"port": int(port), "pid": os.getpid(),
+                       "config": str(config_dir(cfg or {})),
+                       "written": round(time.time(), 3)})
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(body, encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def remove_port_file(cfg=None, path: Path | None = None) -> None:
+    """Server side: retract the announcement on shutdown (idempotent)."""
+    try:
+        (path or port_file_path(cfg)).unlink()
+    except OSError:
+        pass
+
+
+def read_port_file(cfg=None, path: Path | None = None,
+                   timeout: float = 0.25) -> int | None:
+    """Client side: the port a live server announced for this config, or None.
+
+    Returns None when the file is missing/malformed or records a port nothing
+    is listening on (a stale file from a dead server — best-effort deleted).
+    The TCP probe keeps dead announcements from hijacking the static
+    server_port / default fallback forever."""
+    path = path or port_file_path(cfg)
+    try:
+        port = int(json.loads(path.read_text(encoding="utf-8"))["port"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return port
+    except OSError:
+        remove_port_file(path=path)
+        return None
 
 
 # ------------------------------------------------------------------ http server
@@ -177,8 +251,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=None, metavar="CFG.json",
                         help="Config JSON (default: ./config.json when present)")
     parser.add_argument("--port", type=int, default=None,
-                        help=f"Listen port (default: {DEFAULT_PORT}; env "
-                             "RAG_SERVER_PORT; config server_port)")
+                        help=f"Listen port (default: {DEFAULT_PORT}, or an "
+                             "ephemeral port when that one is busy; env "
+                             "RAG_SERVER_PORT; config server_port). The actual "
+                             "port is announced via the temp port file, so "
+                             "clients need no port argument.")
     args = parser.parse_args(argv)
 
     from rag.config import config_dir, load_settings
@@ -190,14 +267,27 @@ def main(argv: list[str] | None = None) -> int:
     try:
         httpd, state = create_server(cfg, engine, base, port)
     except OSError as exc:
-        print(f"[server] cannot bind 127.0.0.1:{port}: {exc}", file=sys.stderr)
-        return 1
-    print(f"[server] listening 127.0.0.1:{port}; loading...", file=sys.stderr)
+        if port == 0:
+            print(f"[server] cannot bind 127.0.0.1: {exc}", file=sys.stderr)
+            return 1
+        print(f"[server] 127.0.0.1:{port} unavailable ({exc}); trying an "
+              "ephemeral port", file=sys.stderr)
+        try:
+            httpd, state = create_server(cfg, engine, base, 0)
+        except OSError as exc2:
+            print(f"[server] cannot bind 127.0.0.1: {exc2}", file=sys.stderr)
+            return 1
+    port = httpd.server_address[1]
+    port_file = write_port_file(cfg, port)
+    atexit.register(remove_port_file, cfg)
+    print(f"[server] listening 127.0.0.1:{port} (port file: {port_file}); "
+          "loading...", file=sys.stderr)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         engine.load()
     except FileNotFoundError as exc:
         print(f"[server] {str(exc).replace(chr(10), ' ')}", file=sys.stderr)
+        remove_port_file(cfg)
         httpd.shutdown()
         httpd.server_close()
         return 1
@@ -213,12 +303,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[server] ready chunks={engine.n_chunks} dense={engine.has_dense} "
           f"embed={state.embed_ready} model={engine.embed_model}", file=sys.stderr)
     try:
-        while True:
-            threading.Event().wait(3600)
-    except KeyboardInterrupt:
-        pass
-    httpd.shutdown()
-    httpd.server_close()
+        try:
+            while True:
+                threading.Event().wait(3600)
+        except KeyboardInterrupt:
+            pass
+    finally:
+        remove_port_file(cfg)
+        httpd.shutdown()
+        httpd.server_close()
     return 0
 
 

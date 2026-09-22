@@ -3,6 +3,8 @@ network; the socket never leaves 127.0.0.1)."""
 from __future__ import annotations
 
 import json
+import socket
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -13,6 +15,14 @@ import pytest
 
 from rag.corpus.schema import make_chunk_uid
 from rag.index.build import ChunkRow
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_tempdir(monkeypatch, tmp_path):
+    """Port-file discovery must be hermetic: point the system temp dir at a
+    per-test tmp dir so a real running rag.server can never leak into
+    resolve_port / read_port_file assertions."""
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
 
 
 def _make_rows():
@@ -44,14 +54,9 @@ def _make_rows():
     return rows
 
 
-@pytest.fixture()
-def tiny_server(tmp_path):
-    """Real BM25 index + running server on an ephemeral loopback port.
-
-    Yields (cfg, rows, port, state); caller sets state.ready."""
+def _build_tiny_index(tmp_path) -> Path:
+    """A tiny real BM25 index + config file under tmp_path; returns cfg path."""
     from rag.index.bm25_index import build_bm25
-    from rag.search.engine import SearchEngine
-    from rag import server as srv
 
     rows = _make_rows()
     cfg = {"index_dir": str(tmp_path / "index"), "min_should_match": 0.6,
@@ -71,6 +76,23 @@ def tiny_server(tmp_path):
         "<html><body><div id='content-wrap'><p>"
         "Rigidbody velocity documentation" + (" word" * 100) +
         "</p></div></body></html>", encoding="utf-8")
+
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    return cfg_path
+
+
+@pytest.fixture()
+def tiny_server(tmp_path):
+    """Real BM25 index + running server on an ephemeral loopback port.
+
+    Yields (cfg, rows, port, state); caller sets state.ready."""
+    from rag.search.engine import SearchEngine
+    from rag import server as srv
+
+    rows = _make_rows()
+    cfg = json.loads(_build_tiny_index(tmp_path).read_text(encoding="utf-8"))
+    cfg["_base_dir"] = str(tmp_path)
 
     engine = SearchEngine(cfg)
     engine.load()
@@ -198,6 +220,62 @@ def test_resolve_port_order(monkeypatch):
     assert srv.resolve_port(None, override=0) == 0
 
 
+# ---------------------------------------------------------------- port file
+
+def _listening_socket() -> socket.socket:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(4)
+    return s
+
+
+def test_port_file_write_read_roundtrip():
+    from rag import server as srv
+    cfg = {"server_port": 9100}
+    listener = _listening_socket()
+    try:
+        port = listener.getsockname()[1]
+        path = srv.write_port_file(cfg, port)
+        assert path.exists()
+        assert json.loads(path.read_text(encoding="utf-8"))["port"] == port
+        assert srv.read_port_file(cfg) == port
+        srv.remove_port_file(cfg)
+        assert not path.exists()
+        srv.remove_port_file(cfg)  # idempotent
+    finally:
+        listener.close()
+
+
+def test_port_file_missing_malformed_and_stale():
+    from rag import server as srv
+    cfg = {"server_port": 9100}
+    path = srv.port_file_path(cfg)
+    assert srv.read_port_file(cfg) is None            # missing
+    path.write_text("{not json", encoding="utf-8")
+    assert srv.read_port_file(cfg) is None            # malformed
+    path.write_text(json.dumps({"port": 1}), encoding="utf-8")
+    assert srv.read_port_file(cfg) is None            # nothing listens there
+    assert not path.exists(), "stale file should be cleaned up"
+
+
+def test_resolve_port_discovers_live_server_file(monkeypatch):
+    """A live-announced port beats the static config, loses to env/override."""
+    from rag import server as srv
+    cfg = {"server_port": 9100}
+    listener = _listening_socket()
+    try:
+        live = listener.getsockname()[1]
+        srv.write_port_file(cfg, live)
+        assert srv.resolve_port(cfg) == live
+        monkeypatch.setenv("RAG_SERVER_PORT", "9001")
+        assert srv.resolve_port(cfg) == 9001          # env beats the file
+        assert srv.resolve_port(cfg, override=9002) == 9002
+    finally:
+        listener.close()
+    monkeypatch.delenv("RAG_SERVER_PORT")
+    assert srv.resolve_port(cfg) == 9100            # stale file -> config wins
+
+
 def test_main_missing_index_returns_1(tmp_path, capsys):
     """engine.load() FileNotFoundError -> one stderr line, exit 1 (no traceback)."""
     from rag import server as srv
@@ -208,3 +286,46 @@ def test_main_missing_index_returns_1(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "index artefacts not found" in err
     assert "listening" in err  # socket bound before the load failed
+    assert not srv.port_file_path().exists(), "port file retracted on failure"
+
+
+def test_main_busy_port_falls_back_to_ephemeral(tmp_path, capsys):
+    """Requested port busy -> server binds an ephemeral port, announces it via
+    the temp file, and still retracts the file when the index is missing."""
+    from rag import server as srv
+    blocker = _listening_socket()
+    try:
+        busy = blocker.getsockname()[1]
+        cfg_path = tmp_path / "cfg.json"
+        cfg_path.write_text(json.dumps({"index_dir": str(tmp_path / "nope"),
+                                        "server_port": busy}),
+                            encoding="utf-8")
+        assert srv.main(["--config", str(cfg_path)]) == 1
+    finally:
+        blocker.close()
+    err = capsys.readouterr().err
+    assert "ephemeral" in err
+    assert "index artefacts not found" in err
+    assert not srv.port_file_path().exists()
+
+
+def test_main_full_run_writes_then_removes_port_file(tmp_path, monkeypatch):
+    """Happy path end to end: main() announces the real port while serving and
+    retracts the file on shutdown. The idle loop's second wait() raises a
+    synthetic Ctrl-C (only Event.wait in this process is main's idle loop)."""
+    from rag import server as srv
+    cfg_path = _build_tiny_index(tmp_path)
+
+    # Only main's idle loop waits with a 3600 s timeout (serve_forever's own
+    # waits use the poll interval), so keying on that value injects a
+    # synthetic Ctrl-C into exactly the right place.
+    real_wait = threading.Event.wait
+
+    def fake_wait(self, timeout=None):
+        if timeout == 3600:
+            raise KeyboardInterrupt
+        return real_wait(self, timeout)
+
+    monkeypatch.setattr(threading.Event, "wait", fake_wait)
+    assert srv.main(["--config", str(cfg_path), "--port", "0"]) == 0
+    assert not srv.port_file_path().exists(), "port file retracted on shutdown"
