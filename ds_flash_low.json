@@ -10,7 +10,7 @@
   "thinking_effort": "low",
   "timeout": 1000,
 
-  "dirs": ["Manual", "ScriptReference"],
+  "dirs": ["ScriptReference"],
   "corpus_dir": "corpus",
   "index_dir": "index",
 

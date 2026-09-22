@@ -20,7 +20,6 @@
   "max_input_chars": 24000,
   "max_chunk_chars": 1200,
   "compile_workers": 4,
-  "accept_legacy_models": ["MiniMax-M3", "kimi-for-coding-highspeed", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-flash", "qwen3.8-flash", "deepseek-v4.1-flash"],
   "llm_timeout": 180,
   "provider_wait_budget_s": 5400
 }

@@ -1,8 +1,9 @@
 """The ``compile`` command: LLM corpus generation with md5-incremental scheduling.
 
-Flow: scan → diff vs manifest → (per-page gen_key mismatch forces regen) → async
-LLM generation with per-provider worker semaphores → per-page corpus files
-(atomic) → checkpointed manifest flushes → failures.jsonl → final report.
+Flow: scan → md5 diff vs manifest (the ONLY requeue trigger, plus missing
+  corpus files) → async LLM generation with per-provider worker semaphores →
+  per-page corpus files (atomic) → checkpointed manifest flushes →
+  failures.jsonl → final report.
 
 Never aborts the run on per-page failures: a page that fails every LLM attempt
 falls back to heuristic chunking (see rag.corpus.generate) and is logged.
@@ -40,7 +41,7 @@ from rag.corpus import (
 )
 from rag.config import data_path
 from rag.corpus.prompts import PROMPT_VERSION
-from rag.llm.base import LLMClient
+from rag.llm.base import LLMClient, RetryAborted
 from rag.store import CorpusStore, FileManager, ManifestDiff
 
 log = logging.getLogger(__name__)
@@ -99,7 +100,9 @@ class CompileReport:
     dry_run: bool = False
     est_input_tokens: int = 0
     est_output_tokens: int = 0
-    #: pages whose corpus is a heuristic fallback and should be retried later
+    #: pages whose corpus is a heuristic fallback. Diagnostic only — NOT a
+    #: requeue trigger (only an md5 diff / missing corpus file requeues);
+    #: regenerate via --only/--regen or by deleting the corpus file.
     needs_regen: set[str] = field(default_factory=set)
     #: pages the final manifest claims as processed (set by finalize)
     pages_claimed: int = 0
@@ -203,13 +206,22 @@ def interrupt_message(report: CompileReport | None = None, *,
 
 
 def gen_key_for_model(model: str) -> tuple[str, dict]:
+    """(gen_key, gen_parts) for one provider model.
+
+    The key is MODEL-AGNOSTIC and, since planning no longer consults it (only
+    the md5 diff and the filesystem drive requeueing), purely diagnostic: it
+    marks which prompt/extractor/schema generation built the corpus, stable
+    across provider/model switches so the index staleness guard is not tripped
+    by a fleet change. *model* is recorded in the parts for information."""
     parts = {
         "prompt_version": PROMPT_VERSION,
         "model": model,
         "extractor_version": EXTRACTOR_VERSION,
         "schema_version": SCHEMA_VERSION,
     }
-    return FileManager.gen_key(**parts), parts
+    return FileManager.gen_key(PROMPT_VERSION, EXTRACTOR_VERSION,
+                               SCHEMA_VERSION), parts
+    return out, n
 
 
 def shard_index(rel: str, n_shards: int) -> int:
@@ -231,20 +243,13 @@ def make_expected_gen_key(shards: Sequence[ProviderShard]) -> Callable[[str], st
     return lambda rel: keys[shard_index(rel, len(keys))]
 
 
-def valid_gen_keys(shards: Sequence[ProviderShard]) -> set[str]:
-    """Every gen_key the current fleet can legitimately produce.
-
-    Used by :func:`plan_work` to decide whether a page's stored corpus is still
-    valid. Set membership (rather than an exact per-shard match) is what makes
-    cross-provider failover safe: a page served by a backup provider after its
-    primary died keeps a valid key and is not pointlessly regenerated.
-    """
-    return {s.gen_key for s in shards}
-
-
 def set_gen_key(shards: Sequence[ProviderShard]) -> str:
-    """Manifest-level marker for a multi-provider build (informational only;
-    per-page validity is tracked in ``page_gen_keys``)."""
+    """Manifest-level generation marker (informational only; per-page keys in
+    ``page_gen_keys`` are diagnostics too — nothing gates planning on them).
+
+    All shards produce the same model-agnostic key, so this is simply that
+    key; it feeds the index staleness guard, which must not be tripped by a
+    provider/model switch."""
     return "|".join(sorted({s.gen_key for s in shards}))
 
 
@@ -315,7 +320,8 @@ class ProviderPool:
         """Provider to use: *preferred* when healthy, else the next healthy one.
 
         Returns None when every provider is tripped (caller should then fall
-        back — and the page is left flagged needs_regen for a later run).
+        back — and the page is left flagged needs_regen (bookkeeping for status;
+        retry it with --only or --regen)).
         """
         now = time.time() if now is None else now
         if not self.is_open(preferred, now):
@@ -390,7 +396,6 @@ def plan_work(
     store: CorpusStore,
     diff: ManifestDiff,
     *,
-    valid_gen_keys: set[str] | None = None,
     force: bool = False,
     regen: bool = False,
     only: str | None = None,
@@ -398,18 +403,25 @@ def plan_work(
 ) -> list[str]:
     """Pages needing (re)generation, sorted for determinism.
 
-    A page is requeued when any of:
-      * it is new or its html changed (the md5 diff);
-      * its corpus file is missing (stat-only check);
-      * its recorded gen_key is not among *valid_gen_keys* — i.e. it was built
-        with a stale prompt/extractor/schema version, or by a provider no longer
-        in the fleet. Set membership (not an exact per-shard match) is what makes
-        cross-provider failover safe: a page served by a backup provider after
-        its primary died is NOT pointlessly regenerated.
-      * it is flagged ``needs_regen`` in the manifest (heuristic fallback).
+    A page is requeued when EITHER:
+      * it is new or its html changed (the md5 diff) — the ONLY content
+        trigger; or
+      * its corpus file is missing on disk (stat-only check) — a killed run
+        or a deleted file: the manifest may claim the page, the filesystem
+        is the truth.
 
-    Bumping PROMPT_VERSION / EXTRACTOR_VERSION / SCHEMA_VERSION, or changing the
-    provider fleet's models, changes every valid key → full regeneration.
+    Deliberately NOT requeue triggers, so a rerun always resumes where the
+    previous run stopped instead of starting over:
+      * the generation key — the model is not part of it, and prompt/
+        extractor/schema version bumps do not requeue old pages either
+        (gen_key is a diagnostic, not a gate);
+      * ``needs_regen`` fallback flags (heuristic-chunk pages stay indexed;
+        regenerate them with ``--only``, ``--regen``/``--force``, or by
+        deleting their corpus file);
+      * provider fleet changes (adding/removing/swapping providers or models).
+
+    Full rebuilds stay available explicitly: ``--force``/``--regen`` requeue
+    every scanned page.
     """
     if only:
         rel = only.replace("\\", "/").lstrip("./")
@@ -421,17 +433,13 @@ def plan_work(
     if force or regen:
         return candidates[:max_files] if max_files else candidates
 
-    manifest = fm.load_manifest()
-    page_gen_keys = manifest.get("page_gen_keys", {})
-    needs_regen = set(manifest.get("needs_regen", []))
-
+    # Unchanged pages join the work list only when their corpus file is
+    # missing (stat-only: fast over a 40k-page corpus). Corrupt-but-present
+    # files are left alone — the index build skips them with a warning; they
+    # can be recreated via --only/--regen.
     work = list(candidates)
     for rel in diff.unchanged:
-        if rel in needs_regen:
-            work.append(rel)
-        elif store.missing(rel):
-            work.append(rel)
-        elif valid_gen_keys is not None and page_gen_keys.get(rel) not in valid_gen_keys:
+        if store.missing(rel):
             work.append(rel)
     work = sorted(set(work))
     return work[:max_files] if max_files else work
@@ -586,6 +594,7 @@ async def run_corpus_compile(
     circuit_threshold: int = CIRCUIT_THRESHOLD,
     circuit_cooldown: float = CIRCUIT_COOLDOWN,
     wait_budget_s: float = ALL_DOWN_WAIT_BUDGET,
+    retry_delays: Sequence[float] | None = None,
 ) -> CompileReport:
     """Generate the corpus for *work*.
 
@@ -602,12 +611,20 @@ async def run_corpus_compile(
     report with ``interrupted`` set. A second one unwinds the run immediately;
     asyncio re-raises it out of the event loop (it is not catchable inside the
     coroutine), so the CLI's own KeyboardInterrupt handler reports it.
+
+    ``retry_delays`` is the transient-failure backoff schedule handed to every
+    LLM call (default :data:`rag.llm.base.RETRY_DELAYS`: 2s, 4s, 1min, 10min,
+    1h, 2h, 4h — tune per config with ``"retry_delays"``). The first Ctrl-C also
+    cuts a long backoff short: the page being retried is dropped unfinished
+    (nothing is written for it) rather than degraded, so the graceful-interrupt
+    contract — an interrupt costs zero pages — also holds during a 4-hour wait.
     """
     store = CorpusStore(fm.corpus_dir)
     report = CompileReport(pages_total=len(scanned), pages_planned=len(work))
     t0 = time.time()
     processed: dict[str, str] = {}   # rel -> gen_key actually used
-    needs_regen: set[str] = set()    # heuristic-fallback pages (retry next run)
+    needs_regen: set[str] = set() # heuristic-fallback pages (diagnostic flag;
+                                    # no longer auto-retried — see plan_work)
     pool = ProviderPool(shards, threshold=circuit_threshold,
                         cooldown=circuit_cooldown)
     sems = [asyncio.Semaphore(workers_per_provider) for _ in shards]
@@ -725,14 +742,24 @@ async def run_corpus_compile(
                     try:
                         corpus, stats = await generate_page_corpus(
                             shard.client, page, gen_key=shard.gen_key,
-                            html_md5=scanned[rel], max_chunk_chars=max_chunk_chars)
+                            html_md5=scanned[rel], max_chunk_chars=max_chunk_chars,
+                            retry_delays=retry_delays,
+                            should_abort=lambda: interrupted["v"])
+                    except RetryAborted:
+                        # Ctrl-C landed while this page waited out a rate-limit
+                        # backoff: drop the page UNFINISHED — nothing is written
+                        # for it — and unwind, so the run ends as the friendly
+                        # "stopped by Ctrl-C" report instead of degrading a page
+                        # the user just asked us to stop working on.
+                        return False
                     except CorpusGenerationError as exc:
-                        # The model's JSON survived json_repair AND every
-                        # self-repair session. The API itself is healthy (no
-                        # failover — a sibling provider would face the same
-                        # page), so degrade THIS page to heuristic chunks and
-                        # flag it for a later run; one pathological page must
-                        # never wedge a 44k-page build.
+                          # The model's JSON survived json_repair AND every
+                          # self-repair session. The API itself is healthy (no
+                          # failover — a sibling provider would face the same
+                          # page), so degrade THIS page to heuristic chunks and
+                          # flag it (status shows the backlog; --only/--regen
+                          # retries it later); one pathological page must
+                          # never wedge a 44k-page build.
                         corpus, stats = _unrepairable_output(
                             page, scanned[rel], shard.gen_key, exc)
                 if stats.api_failed:
@@ -747,8 +774,9 @@ async def run_corpus_compile(
 
         used_key = corpus.gen_key
 
-        # Heuristic-fallback pages (API death or unparseable output) are still
-        # written so search works, but flagged so a later run retries them.
+# Heuristic-fallback pages (API death or unparseable output) are still
+      # written so search works, but flagged as backlog (status shows them;
+      # regenerate with --only/--regen or by deleting the corpus file).
         # Pages with no extractable content are permanently empty — flagging
         # those would requeue them forever, so they are excluded.
         is_fallback = (page is not None and stats.fallback
@@ -846,16 +874,19 @@ async def run_corpus_compile(
     if progress:
         print(f"[corpus] providers: {pool.summary()}", file=sys.stderr)
         if needs_regen:
-            print(f"[corpus] {len(needs_regen)} pages fell back to heuristic "
-                  f"chunks and are flagged needs_regen — rerun compile to retry "
-                  f"them (they are still indexed meanwhile)", file=sys.stderr)
+              print(f"[corpus] {len(needs_regen)} pages fell back to heuristic "
+                    f"chunks and are flagged needs_regen (still indexed; "
+                    f"regenerate with --only/--regen or by deleting their "
+                    f"corpus file)", file=sys.stderr)
     return report
 
 
 def _all_providers_down(page, html_md5: str, gen_key: str):
     """Heuristic corpus for a page no provider could serve (all circuits open).
 
-    Flagged needs_regen so the next run retries it with real LLM chunks.
+    Flagged needs_regen so the backlog is visible in `rag status`; it is NOT
+    auto-retried (only an md5 diff or a missing corpus file requeues pages) —
+    regenerate with --only/--regen or by deleting the corpus file.
     """
     from rag.corpus.generate import PageGenStats, _fallback_corpus
 
@@ -951,8 +982,9 @@ def print_report(report: CompileReport, out=sys.stdout) -> None:
     print(f"pruned corpus files={report.pruned}", file=out)
     print(f"wall time: {report.wall_s:.0f}s", file=out)
     if report.needs_regen:
-        print(f"needs_regen: {len(report.needs_regen)} pages fell back to "
-              f"heuristic chunks — rerun compile to retry them", file=out)
+          print(f"needs_regen: {len(report.needs_regen)} pages fell back to "
+                f"heuristic chunks (still indexed; regenerate with "
+                f"--only/--regen or by deleting their corpus file)", file=out)
     if report.aborted_all_providers_down:
         print(f"ABORTED: every provider circuit stayed open past the wait budget "
               f"(quota exhausted). {report.pages_planned - report.pages_done} pages "

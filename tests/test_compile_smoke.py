@@ -14,8 +14,7 @@ from rag.cli.compile_cmd import (
     run_corpus_compile,
     set_gen_key,
     shard_index,
-    valid_gen_keys,
-    wipe_generated_dirs,
+        wipe_generated_dirs,
 )
 from rag.store import CorpusStore, FileManager
 
@@ -72,8 +71,7 @@ async def compile_all(fm, cfg, n_expected, shards=None):
     shards = shards or [make_shard()]
     scanned = fm.scan()
     diff = fm.diff(scanned)
-    keys = valid_gen_keys(shards)
-    work = plan_work(fm, CorpusStore(fm.corpus_dir), diff, valid_gen_keys=keys)
+    work = plan_work(fm, CorpusStore(fm.corpus_dir), diff)
     assert len(work) == n_expected
     report = await run_corpus_compile(
         shards, cfg, work=work, scanned=scanned, fm=fm,
@@ -95,8 +93,7 @@ async def test_compile_40_pages_then_noop(env):
     manifest = fm.load_manifest()
     assert len(manifest["files"]) == 40
     assert len(manifest["page_gen_keys"]) == 40
-    assert plan_work(fm, CorpusStore(corpus_dir), fm.diff(fm.scan()),
-                     valid_gen_keys=valid_gen_keys(shards)) == []
+    assert plan_work(fm, CorpusStore(corpus_dir), fm.diff(fm.scan())) == []
 
 
 async def test_touch_3_files_processes_3(env):
@@ -107,8 +104,7 @@ async def test_touch_3_files_processes_3(env):
         p = root / "ScriptReference" / f"Page{i}.html"
         p.write_text(p.read_text(encoding="utf-8").replace(
             "documentation body", "updated documentation body"), encoding="utf-8")
-    work = plan_work(fm, CorpusStore(corpus_dir), fm.diff(fm.scan()),
-                     valid_gen_keys=valid_gen_keys(shards))
+    work = plan_work(fm, CorpusStore(corpus_dir), fm.diff(fm.scan()))
     assert len(work) == 3, work
 
 
@@ -124,15 +120,37 @@ async def test_delete_prunes_corpus(env):
     assert not store.missing_or_corrupt("ScriptReference/Page8.html")
 
 
-async def test_gen_key_bump_forces_regen(env):
+async def test_model_switch_keeps_incremental(env, monkeypatch):
+    """ONLY the md5 diff / missing corpus files requeue pages.
+
+    A model switch must NOT requeue — that once restarted a 21k-page build
+    over a flash -> flashx rename. Neither must a prompt/extractor/schema
+    version bump: gen_key is a diagnostic, not a planning gate.
+    """
     root, corpus_dir, fm, cfg = env
     shards = [make_shard("model-a")]
     await compile_all(fm, cfg, 40, shards)
     fm2 = FileManager(root=root, dirs=["ScriptReference"], corpus_dir=corpus_dir)
-    bumped = [make_shard("model-b")]  # different model -> different gen_key
-    work = plan_work(fm2, CorpusStore(corpus_dir), fm2.diff(fm2.scan()),
-                     valid_gen_keys=valid_gen_keys(bumped))
-    assert len(work) == 40
+    # a different model: same model-agnostic key, and planning ignores keys anyway
+    assert make_shard("model-b").gen_key == shards[0].gen_key
+    work = plan_work(fm2, CorpusStore(corpus_dir), fm2.diff(fm2.scan()))
+    assert work == []
+    # even a prompt version bump requeues nothing
+    monkeypatch.setattr("rag.cli.compile_cmd.PROMPT_VERSION", "v-bumped")
+    bumped = [make_shard("model-b")]
+    assert bumped[0].gen_key != shards[0].gen_key  # the diagnostic key changes...
+    work = plan_work(fm2, CorpusStore(corpus_dir), fm2.diff(fm2.scan()))
+    assert work == []  # ...but planning still does not care
+
+
+async def test_missing_corpus_file_requeues_unchanged_page(env):
+    """The filesystem is the other truth: a deleted corpus file requeues an
+    otherwise-unchanged page (the manifest may claim it — the file is gone)."""
+    root, corpus_dir, fm, cfg = env
+    await compile_all(fm, cfg, 40)
+    (corpus_dir / "ScriptReference" / "Page5.html.rag.json").unlink()
+    work = plan_work(fm, CorpusStore(corpus_dir), fm.diff(fm.scan()))
+    assert work == ["ScriptReference/Page5.html"]
 
 
 async def test_two_provider_sharding(env):
@@ -141,24 +159,14 @@ async def test_two_provider_sharding(env):
     report, _ = await compile_all(fm, cfg, 40, shards)
     assert report.pages_done == 40
     assert shards[0].client.calls > 0 and shards[1].client.calls > 0
+    # the per-page key records which shard generated the page (diagnostic);
+    # both shards share the same model-agnostic key
+    assert shards[0].gen_key == shards[1].gen_key
     manifest = fm.load_manifest()
-    keys = manifest["page_gen_keys"]
-    n_a = sum(1 for v in keys.values() if v == shards[0].gen_key)
-    n_b = sum(1 for v in keys.values() if v == shards[1].gen_key)
-    assert n_a + n_b == 40 and 10 < n_a < 30, (n_a, n_b)
-    # rerunning with the same shards is a no-op even with a different shard
-    # ORDER: validity is set membership (failover-safe), not exact-shard match.
-    swapped = [make_shard("model-b"), make_shard("model-a")]
-    work = plan_work(fm, CorpusStore(corpus_dir), fm.diff(fm.scan()),
-                     valid_gen_keys=valid_gen_keys(swapped))
-    assert work == [], "shard order must not requeue pages"
-    # a fleet missing a model DOES requeue that model's pages
-    only_a = [make_shard("model-a")]
-    work = plan_work(fm, CorpusStore(corpus_dir), fm.diff(fm.scan()),
-                     valid_gen_keys=valid_gen_keys(only_a))
-    n_b = sum(1 for v in keys.values() if v == shards[1].gen_key)
-    assert len(work) == n_b, (len(work), n_b)
-
+    assert set(manifest["page_gen_keys"].values()) == {shards[0].gen_key}
+    # rerunning is a no-op whatever the shard ORDER or COMPOSITION: adding or
+    # dropping a provider/model never requeues finished pages.
+    assert plan_work(fm, CorpusStore(corpus_dir), fm.diff(fm.scan())) == []
 
 async def test_only_and_max_files(env):
     root, corpus_dir, fm, cfg = env
@@ -175,9 +183,8 @@ async def test_interrupted_run_resumes(env, monkeypatch):
     shards = [make_shard()]
     scanned = fm.scan()
     diff = fm.diff(scanned)
-    keys = valid_gen_keys(shards)
     store = CorpusStore(corpus_dir)
-    work = plan_work(fm, store, diff, valid_gen_keys=keys)
+    work = plan_work(fm, store, diff)
 
     class Boom(Exception):
         pass
@@ -219,8 +226,7 @@ async def test_interrupted_run_resumes(env, monkeypatch):
             workers_per_provider=4, progress=False)
     monkeypatch.undo()
 
-    remaining = plan_work(fm, store, fm.diff(fm.scan()),
-                          valid_gen_keys=keys)
+    remaining = plan_work(fm, store, fm.diff(fm.scan()))
     assert len(remaining) == 30, len(remaining)
     report = await run_corpus_compile(
         shards, cfg, work=remaining, scanned=scanned, fm=fm,
@@ -231,8 +237,7 @@ async def test_interrupted_run_resumes(env, monkeypatch):
              dict(shards[0].gen_parts), report)
     assert report.pages_done == 30
     assert len(list(store.iterate_all())) == 40
-    assert plan_work(fm, store, fm.diff(fm.scan()),
-                     valid_gen_keys=keys) == []
+    assert plan_work(fm, store, fm.diff(fm.scan())) == []
 
 
 def test_plan_work_rejects_missing_only(env):

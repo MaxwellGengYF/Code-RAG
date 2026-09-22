@@ -1,4 +1,4 @@
-"""Provider failover + circuit breaker + needs_regen requeue tests (network-free).
+"""Provider failover + circuit breaker + needs_regen bookkeeping tests (network-free).
 
 These cover the systemic failure found on the real 44k-page build: gateways die
 mid-run (kimi 5-hour quota → 403, revoked model access → 403), and without
@@ -19,10 +19,10 @@ from rag.cli.compile_cmd import (
     plan_work,
     run_corpus_compile,
     set_gen_key,
-    valid_gen_keys,
-)
+    )
 from rag.llm.base import APIStatusError, GenerationResult, RateLimitError
 from rag.store import CorpusStore, FileManager
+from rag.store.corpus_store import corpus_path
 
 
 # --------------------------------------------------------------------------------------
@@ -158,8 +158,7 @@ async def test_dead_provider_fails_over(env):
     shards = [dead, healthy]
     pool_threshold = 2
     scanned = fm.scan()
-    work = plan_work(fm, CorpusStore(corpus_dir), fm.diff(scanned),
-                     valid_gen_keys=valid_gen_keys(shards))
+    work = plan_work(fm, CorpusStore(corpus_dir), fm.diff(scanned))
     assert len(work) == 24
 
     report = await run_corpus_compile(
@@ -198,8 +197,7 @@ async def test_all_providers_dead_aborts_not_degrades(env):
     shards = [shard("dead-a", dead=True), shard("dead-b", dead=True)]
     scanned = fm.scan()
     store = CorpusStore(corpus_dir)
-    work = plan_work(fm, store, fm.diff(scanned),
-                     valid_gen_keys=valid_gen_keys(shards))
+    work = plan_work(fm, store, fm.diff(scanned))
 
     # cooldown longer than the wait budget so recovery never happens
     report = await run_corpus_compile(
@@ -226,8 +224,7 @@ async def test_all_providers_dead_flags_needs_regen(env):
     root, corpus_dir, fm, cfg = env
     shards = [shard("dead-a", dead=True), shard("dead-b", dead=True)]
     scanned = fm.scan()
-    work = plan_work(fm, CorpusStore(corpus_dir), fm.diff(scanned),
-                     valid_gen_keys=valid_gen_keys(shards))
+    work = plan_work(fm, CorpusStore(corpus_dir), fm.diff(scanned))
 
     # cooldown SHORTER than the wait budget: the pool re-probes, each probe fails,
     # and pages served during a probe window land on the fallback path
@@ -245,39 +242,38 @@ async def test_all_providers_dead_flags_needs_regen(env):
     assert set(manifest["needs_regen"]) == {rel for rel, _ in written}
 
 
-async def test_needs_regen_pages_requeue_and_heal(env):
-    """A later run with a healthy provider retries flagged pages and clears them."""
+async def test_needs_regen_pages_stay_queued_until_regenerated(env):
+    """Flagged pages are backlog diagnostics, not a requeue trigger.
+
+    A later healthy run does NOT pick them up via planning (only an md5 diff or
+    a missing corpus file requeues). The supported heal path is deleting their
+    corpus files — a filesystem trigger — which requeues exactly those pages.
+    """
     root, corpus_dir, fm, cfg = env
     dead = [shard("dead-a", dead=True)]
     scanned = fm.scan()
     store = CorpusStore(corpus_dir)
-
     # run 1: only a dead provider. cooldown=0 so probes keep happening and pages
     # land on the fallback path (flagged) rather than aborting immediately.
     await run_corpus_compile(dead, cfg,
-                             work=plan_work(fm, store, fm.diff(scanned),
-                                            valid_gen_keys=valid_gen_keys(dead)),
+                             work=plan_work(fm, store, fm.diff(scanned)),
                              scanned=scanned, fm=fm, workers_per_provider=2,
                              progress=False, circuit_threshold=1,
                              circuit_cooldown=0.0, wait_budget_s=0.0)
     flagged1 = fm.load_manifest()["needs_regen"]
     assert flagged1, "pages written while the provider was down must be flagged"
     assert len(flagged1) <= 24
-
-    # run 2: same dead shard alone -> whatever it writes stays flagged
-    report2 = await run_corpus_compile(
-        dead, cfg,
-        work=plan_work(fm, store, fm.diff(scanned),
-                       valid_gen_keys=valid_gen_keys(dead)),
-        scanned=scanned, fm=fm, workers_per_provider=2, progress=False,
-        circuit_threshold=1, circuit_cooldown=0.0, wait_budget_s=0.0)
-    assert report2.needs_regen == set() or report2.fallback > 0
-
-    # run 3: add a healthy provider -> flagged pages heal
+    # run 2 planning: flags requeue NOTHING — the build resumes at the md5 diff
+    # (empty here), not at the flagged backlog
+    assert plan_work(fm, store, fm.diff(scanned)) == []
+    # heal path: delete the flagged corpus files (a filesystem trigger)
+    for rel in flagged1:
+        corpus_path(corpus_dir, rel).unlink()
+    work3 = plan_work(fm, store, fm.diff(scanned))
+    assert sorted(work3) == sorted(flagged1), \
+        "only the deleted (flagged) corpus files requeue"
+    # run 3: healthy provider -> the requeued pages heal and the flag clears
     healthy = [shard("dead-a", dead=True), shard("live")]
-    work3 = plan_work(fm, store, fm.diff(scanned),
-                      valid_gen_keys=valid_gen_keys(healthy))
-    assert len(work3) == 24, "flagged pages must requeue"
     report3 = await run_corpus_compile(
         healthy, cfg, work=work3, scanned=scanned, fm=fm,
         workers_per_provider=2, progress=False, circuit_threshold=1,
@@ -286,6 +282,8 @@ async def test_needs_regen_pages_requeue_and_heal(env):
     assert report3.needs_regen == set()
     assert fm.load_manifest()["needs_regen"] == []
     for rel, data in store.iterate_all():
+        assert data.get("needs_regen", False) is False
+        assert data["chunks"][0]["summary"] == "s"
         assert data.get("needs_regen", False) is False
         assert data["chunks"][0]["summary"] == "s"
         assert data["chunks"][0]["summary"] == "s"
@@ -310,8 +308,7 @@ async def test_max_files_does_not_claim_unprocessed(env):
     assert len(manifest["files"]) == 6, "only processed pages may be claimed"
     assert len(manifest["page_gen_keys"]) == 6
     # the other 18 are still pending
-    remaining = plan_work(fm, store, fm.diff(fm.scan()),
-                          valid_gen_keys=valid_gen_keys(shards))
+    remaining = plan_work(fm, store, fm.diff(fm.scan()))
     assert len(remaining) == 18
 
 
@@ -333,24 +330,23 @@ def test_pool_all_open_and_probe_timing():
     assert pool2.next_probe_in(1000.0) == pytest.approx(60.0)
 
 
-def test_plan_work_valid_keys_set_membership(env):
-    """Validity is membership in the fleet's key set, not an exact shard match."""
+def test_plan_work_ignores_recorded_gen_keys(env):
+    """Page gen_keys are diagnostics: planning never consults them.
+
+    A page recorded under another model's key (as failover would), an old
+    scheme's key, or outright garbage stays done as long as its md5 is
+    unchanged and its corpus file exists.
+    """
     root, corpus_dir, fm, cfg = env
     a, b = shard("model-a"), shard("model-b")
     store = CorpusStore(corpus_dir)
-    # pretend every page was generated by b (as failover would record)
     scanned = fm.scan()
     for r in scanned:
         store.save(r, {"source": r, "chunks": []})
     fm.save_manifest(scanned, set_gen_key([a, b]), dict(a.gen_parts),
-                     page_gen_keys={r: b.gen_key for r in scanned},
+                     page_gen_keys={r: "foreign-or-legacy-key" for r in scanned},
                      needs_regen=[])
-    diff = fm.diff(scanned)
-    # fleet {a,b}: b's keys are valid -> nothing to do
-    assert plan_work(fm, store, diff, valid_gen_keys=valid_gen_keys([a, b])) == []
-    # fleet {a} only: b's keys are foreign -> everything requeues
-    assert len(plan_work(fm, store, diff,
-                         valid_gen_keys=valid_gen_keys([a]))) == len(scanned)
+    assert plan_work(fm, store, fm.diff(scanned)) == []
 
 
 def test_plan_work_rejects_missing_only(env):
@@ -361,7 +357,13 @@ def test_plan_work_rejects_missing_only(env):
                   only="Nope/Missing.html")
 
 
-def test_plan_work_requeues_needs_regen_flag(env):
+def test_plan_work_ignores_needs_regen_flag(env):
+    """needs_regen flags are backlog diagnostics, NOT a requeue trigger.
+
+    Only an md5 diff or a missing corpus file requeues pages; heuristic-
+    fallback pages stay indexed until regenerated via --only/--regen or by
+    deleting their corpus file.
+    """
     root, corpus_dir, fm, cfg = env
     a = shard("model-a")
     store = CorpusStore(corpus_dir)
@@ -370,12 +372,9 @@ def test_plan_work_requeues_needs_regen_flag(env):
     fm.save_manifest(scanned, set_gen_key([a]), dict(a.gen_parts),
                      page_gen_keys={r: a.gen_key for r in rels},
                      needs_regen=rels[:5])
-    # corpus files exist and keys are valid, but 5 are flagged
     for r in rels:
         store.save(r, {"source": r, "chunks": []})
-    diff = fm.diff(scanned)
-    work = plan_work(fm, store, diff, valid_gen_keys=valid_gen_keys([a]))
-    assert work == rels[:5]
+    assert plan_work(fm, store, fm.diff(scanned)) == []
 
 
 async def test_finalize_is_self_healing_for_phantom_entries(env):
@@ -415,8 +414,7 @@ async def test_finalize_is_self_healing_for_phantom_entries(env):
     assert len(m["files"]) == 5, f"phantom entries survived: {len(m['files'])}"
     assert len(m["page_gen_keys"]) == 5
     # the 19 phantom pages now correctly requeue as work
-    work = plan_work(fm, store, fm.diff(fm.scan()),
-                     valid_gen_keys=valid_gen_keys(shards))
+    work = plan_work(fm, store, fm.diff(fm.scan()))
     assert len(work) == 19, len(work)
 
 

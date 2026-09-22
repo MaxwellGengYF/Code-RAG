@@ -11,8 +11,11 @@ The same file carries three kinds of keys, all optional unless noted:
   ``corpus_dir``: generated corpus output (default ``"corpus"``),
   ``index_dir``: generated index output (default ``"index"``).
 * **engine tuning** — ``mode``, ``rrf_k``, ``bm25_k``, ``dense_k``, ``final_k``,
-  ``path_boost``, ``bm25_aux``, ``embed_model``, ``rerank``, ``compile_workers``,
-  ``accept_legacy_models``, ``llm_timeout``, ``provider_wait_budget_s``, ...
+    ``path_boost``, ``bm25_aux``, ``embed_model``, ``rerank``, ``compile_workers``,
+    ``llm_timeout``, ``provider_wait_budget_s``,
+  ``retry_delays`` (the transient-failure backoff schedule used by the compile
+  corpus step; default ``[2, 4, 60, 600, 3600, 7200, 14400]`` seconds, see
+  :data:`rag.llm.base.RETRY_DELAYS`), ...
 
 Extra provider shards for multi-provider sharding go in a top-level
 ``"providers"`` list of inline provider objects::

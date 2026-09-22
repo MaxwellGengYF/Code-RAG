@@ -142,19 +142,25 @@ serves BM25.
 
 1. **Scan + md5 diff** against `corpus/manifest.json` → added / changed /
    removed / unchanged. Only added+changed pages hit the LLM.
-2. **Per-page gen_key** = sha1(prompt_version | model | extractor_version |
-   schema_version). A bump of any component (or a page moving to a different
-   provider shard) requeues that page. Per-page keys live in
-   `manifest.page_gen_keys`.
+2. Per-page gen_key = sha1(prompt_version | extractor_version |
+   schema_version) — DIAGNOSTIC ONLY, never a requeue trigger. The model is
+   not a component, and even a version bump requeues nothing: the ONLY
+   things that break incremental are an md5 diff (added/changed) and a
+   missing corpus file. Measured reason: a pure model rename (flash ->
+   flashx) once requeued all ~21k finished pages and restarted the build.
+   Per-page keys live in manifest.page_gen_keys; regenerate deliberately
+   with --force/--regen/--only or by deleting a corpus file.
 3. Generation (tool-free, system+user prompt only): strict JSON →
    truncated-closer repair → json_repair salvage (hallucinated breakage:
    trailing commas, unterminated strings, stray closers) → msgspec validation
    (chunk text MUST be a verbatim excerpt of the page markdown, checked
    whitespace/punctuation/quote-insensitively) → up to 3 fresh self-repair
    sessions with the error list echoed back → CorpusGenerationError if still
-   unrepairable (caught per page by the compile loop → heuristic fallback,
-   fixed-size chunker with empty aux fields, flagged needs_regen). The
-   heuristic fallback now covers API failure only. Acceptance measured on 40
+     unrepairable (caught per page by the compile loop → heuristic fallback,
+     fixed-size chunker with empty aux fields, flagged needs_regen — a
+     backlog diagnostic only, NOT a requeue trigger: regenerate via
+     --only/--regen or by deleting the corpus file). The
+     heuristic fallback now covers API failure only. Acceptance measured on 40
    sampled pages with the shipped config: 98% first-try valid, 100% usable,
    2.20 chunks/page, 0 verbatim violations (eval_corpus_quality.py).
 4. The compile UNIT is one page — one page, one session. Each work item is a
@@ -172,10 +178,10 @@ serves BM25.
    re-parse a ~10 MB manifest 44k times; the write happens off the event loop.
    corpus/failures.jsonl logs pages that needed repair/fallback.
 
-5. **Multi-provider sharding**: with several `--config` flags (or a `"providers"` list inside one config), pages are
-   assigned deterministically (`md5(rel) % n_providers`), each provider gets
-   `workers/n` concurrency. Adding a provider later rekeys every page once
-   (expected-key mismatch), then settles.
+5. Multi-provider sharding: with several --config flags (or a "providers" list inside one config), pages are
+   assigned deterministically (md5(rel) % n_providers), each provider gets
+   workers/n concurrency. Adding/removing/swapping a provider later changes
+   NOTHING for finished pages — planning ignores providers and keys entirely.
 
 ## Index layout (all generated, all gitignored)
 
@@ -280,8 +286,8 @@ the fields below): `model`, `type`
 keys are ignored with a warning) PLUS the corpus settings in the same
 object: `dirs` (input dirs, relative to the config file — required for
 the corpus step), `corpus_dir` (default `corpus`), `index_dir`
-(default `index`) and the engine tuning (`mode`, `rrf_k`, `embed_model`,
-`compile_workers`, `accept_legacy_models`, …). Extra provider shards go
+  (default `index`) and the engine tuning (`mode`, `rrf_k`, `embed_model`,
+  `compile_workers`, …). Extra provider shards go
 in a top-level `"providers"` list. Relative `corpus_dir`/`index_dir`
 anchor at the config file's directory, so config + documents form a
 relocatable unit. `config.example.json` is the annotated template.
@@ -293,8 +299,22 @@ Hard-won gateway facts (measured 2026-09):
   tokens and ~100 s/page instead of ~300 tokens / ~15 s. The clients now send
   `thinking: {type: disabled}` explicitly when thinking is off.
 - **Per-provider concurrency > 4 triggers 429 throttling** on these gateways;
-  `workers 4` per provider is the sweet spot (429/5xx/timeouts retry with
-  exponential backoff, see `rag/llm/base.with_retry`).
+  workers 4 per provider is the sweet spot. Throttling and other transient API
+  failures (429 / 5xx / timeouts / connection resets) are NOT fatal: each LLM
+  call waits them out on a fixed schedule — **2 s → 4 s → 1 min → 10 min → 1 h →
+  2 h → 4 h** (`RETRY_DELAYS` in rag/llm/base.with_retry) — before the page is
+  demoted to the aux-less heuristic fallback. The short steps absorb ordinary
+  throttling; the long tail exists for an exhausted ROLLING QUOTA WINDOW (the
+  gateways reset on 5-hour windows), so a rate limit costs latency instead of
+  corpus quality. Waits ≥ 1 min print a `[retry] <model>: ... waiting 10min`
+  line, so a stalled run is visibly waiting, not hung. Override the schedule per
+  config with `"retry_delays": [2, 4, 60, 600, 3600, 7200, 14400]` (seconds; an
+  empty list is rejected, and the list length IS the retry count — `[2, 4, 60]`
+  retries three times and then degrades the page). A Ctrl-C during a long
+  backoff drops that page unfinished (nothing written) rather than degrading it —
+  the graceful-interrupt contract still costs zero pages. Note this covers
+  429/5xx/timeout/connection only: 403 quota/access errors are NOT retried here,
+  they trip the circuit breaker and fail over (see the bullet below).
 - Use `--dry-run` before any big run: page counts, token estimates
   (ratio 1.0 without thinking, 3.0 with), optional cost via
   `--price-in/--price-out` per 1M tokens.
@@ -341,13 +361,12 @@ Config keys + rebuild-from-source: `llama_cpp/USAGE.md`.
   repairs exactly that (missing container closers only); json_repair then
   salvages broader hallucinated breakage (trailing commas, unterminated
   strings) before a self-repair session is spent.
-- Fleet-switch safety: compile accepts a page only when its recorded
-  `page_gen_key` matches a `--config` on the command line or a model in
-  `config.json → accept_legacy_models`. Before pointing the build at the
-  local model, add the outgoing fleet there first (currently includes
-  `qwen3.8-flash` / `deepseek-v4.1-flash`) or ~40k pages look stale and a
-  mass regeneration starts. Always `--dry-run` first and check
-  `to process:` equals the expected small count.
+- Fleet-switch safety: there is none to manage — switching the provider
+  or the model (gateway fleet, local llama.cpp, a rename) does NOT requeue
+  a single finished page. Planning is md5-diff + missing-corpus-files only,
+  so a fleet switch mid-build just changes who generates the REMAINING
+  pages. Still --dry-run first and check `to process:` equals the expected
+  added/changed count.
 
 Troubleshooting
 
@@ -356,10 +375,13 @@ Troubleshooting
   the index; rerun `compile --steps index` (it rebuilds everything from the
   current corpus — BM25 ~10 s, dense ~7 min on GPU / a few hours on CPU, so
   stop any corpus build first to keep the CPU free).
-- Slow compile → check `corpus/failures.jsonl` for the error mix. `429
-  Throttling` means lower `--workers`; `403 ... usage limit` / `AccessDenied`
-  means a provider's quota window or subscription is exhausted (see the gateway
-  facts). The run pauses rather than degrading pages when every provider is down.
+- Slow compile → check corpus/failures.jsonl for the error mix. 429
+  Throttling means lower --workers — it is retried on the 2 s → 4 s → 1 min →
+  10 min → 1 h → 2 h → 4 h schedule, so a *stalled-looking* run is usually just
+  riding out a quota window (the `[retry] ... waiting 10min` lines say so);
+  403 ... usage limit / AccessDenied means a provider's quota window or
+  subscription is exhausted (see the gateway facts). The run pauses rather than
+  degrading pages when every provider is down.
 - Index/search reports a `vectors.f32` row-count or interrupted-embed mismatch →
   the dense build was killed or the corpus changed since; rebuild with
   `compile --steps index --force` (resumable, so this continues rather than
@@ -374,11 +396,12 @@ Troubleshooting
   exit **0**, so the loop terminates and the page stays flagged `needs_regen` for
   the *next* manual run. Only the all-providers-down abort exits **3** (and a user
   Ctrl-C exits **130**), which are the
-  cases where retrying genuinely helps (quota window resets; an unfinished build).
-  That split is
-  deliberate: a permanently unchunkable page must not wedge the whole build.
-  Check `python -m rag status` → `needs_regen` for the backlog, and
-  `eval_corpus_quality.py` to confirm the first-try rate is healthy.
+    cases where retrying genuinely helps (quota window resets; an unfinished build).
+    That split is
+    deliberate: a permanently unchunkable page must not wedge the whole build.
+    Check `python -m rag status` → `needs_regen` for the backlog (regenerate
+    those pages with --only or by deleting their corpus files), and
+    `eval_corpus_quality.py` to confirm the first-try rate is healthy.
 - A page's corpus looks wrong → python -m rag compile --config config.json --config ... --only Manual/foo.html
   regenerates exactly one page.
 - Deleting corpus: rm -rf corpus index is safe; everything regenerates. The supported
@@ -412,10 +435,11 @@ contamination caveats: `eval_results.md` → "Full-corpus final (2026-09-20)".
 
 ## Testing
 
-`uv run --extra dev python -m pytest tests/ -q` — **229 pass, 1 skipped**.
+`uv run --extra dev python -m pytest tests/ -q` — **253 pass, 1 skipped**
+(measured 2026-09-21, after tests/test_llm_retry.py was added).
 The skip is `tests/test_vector_device.py`, which needs torch; with `--extra
 local` those 4 tests run too. (A checkout whose interpreter has every dependency
-collected 233 and passed all of them — the same suite, one more module.)
+collected the same suite plus that module's tests, and passed all of them.)
 Note that the optional-inference tests
 simulate the missing stack (None in `sys.modules`), so the suite is green in
 both environments: a plain BM25 checkout and a full GPU one.

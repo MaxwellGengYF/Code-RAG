@@ -39,8 +39,7 @@ from rag.cli.compile_cmd import (
     restore_interrupt_stop,
     run_corpus_compile,
     set_gen_key,
-    valid_gen_keys,
-)
+    )
 from rag.llm.base import GenerationResult
 from rag.store import CorpusStore, FileManager
 
@@ -109,8 +108,7 @@ def start_run(fm, cfg, client, *, workers=1):
     shard = ProviderShard(client, client.model_name)
     scanned = fm.scan()
     diff = fm.diff(scanned)
-    work = plan_work(fm, CorpusStore(fm.corpus_dir), diff,
-                     valid_gen_keys=valid_gen_keys([shard]))
+    work = plan_work(fm, CorpusStore(fm.corpus_dir), diff)
     assert len(work) == N_PAGES
     task = asyncio.create_task(run_corpus_compile(
         [shard], cfg, work=work, scanned=scanned, fm=fm,
@@ -128,8 +126,7 @@ async def run_directly(fm, cfg, client, *, workers=1):
     shard = ProviderShard(client, client.model_name)
     scanned = fm.scan()
     diff = fm.diff(scanned)
-    work = plan_work(fm, CorpusStore(fm.corpus_dir), diff,
-                     valid_gen_keys=valid_gen_keys([shard]))
+    work = plan_work(fm, CorpusStore(fm.corpus_dir), diff)
     return await run_corpus_compile(
         [shard], cfg, work=work, scanned=scanned, fm=fm,
         workers_per_provider=workers, progress=False)

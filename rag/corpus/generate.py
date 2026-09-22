@@ -23,20 +23,34 @@ Pipeline per page:
      each echoing the error list back so the model fixes its own JSON.
   5. Still unrepairable after all sessions: raise :class:`CorpusGenerationError`
      (hard fail).
-  6. API failure (provider down even after transient retries): heuristic
-     fallback (a port of the original fixed-size ``chunk_text``) with empty
-     aux fields, flagged ``needs_regen`` by the compile loop.
+  6. API failure (provider down even after the transient-retry schedule):
+     heuristic fallback (a port of the original fixed-size ``chunk_text``) with
+     empty aux fields, flagged ``needs_regen`` by the compile loop. Retriable
+     failures (429 / 5xx / timeout / connection) wait out
+     :data:`rag.llm.base.RETRY_DELAYS` — 2s, 4s, 1min, 10min, 1h, 2h, 4h —
+     before the page is demoted, so a rate limit or an exhausted quota window
+     costs latency, not corpus quality. A Ctrl-C during one of those long waits
+     raises :class:`rag.llm.base.RetryAborted`, which is NOT an API failure:
+     the page is dropped unfinished (nothing written) by the compile loop.
 """
 from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import dataclass, field
+from typing import Callable, Sequence
 
 import json_repair
 import msgspec
 
-from rag.llm.base import LLMClient, with_retry
+from rag.llm.base import (
+    RETRY_DELAYS,
+    LLMClient,
+    RetryAborted,
+    fmt_delay,
+    with_retry,
+)
 from rag.corpus.extract import PageInput
 from rag.corpus import prompts
 from rag.corpus.schema import (
@@ -48,12 +62,17 @@ from rag.corpus.schema import (
     now_iso,
 )
 
-MAX_RETRIES = 4  # transient API retries per LLM call (429/5xx/timeout)
+MAX_RETRIES = len(RETRY_DELAYS)  # retries per LLM call, one per schedule entry:
+# HTTP 429 / 5xx / timeout / connection reset wait 2s, 4s, 1min, 10min, 1h, 2h,
+# 4h before the page is demoted to the heuristic fallback (rag.llm.base)
 MAX_QA_PER_CHUNK = 3
 MAX_CHUNKS_PER_PAGE = 40  # sanity cap against runaway generations
 #: fresh LLM sessions allowed for the model to fix its own broken JSON after
 #: the initial generation; exceeding this raises CorpusGenerationError
 MAX_JSON_REPAIR_SESSIONS = 3
+#: retry waits at or above this announce themselves on stderr (the run must never
+#: look hung just because the provider asked us to wait ten minutes)
+SLOW_RETRY_NOTICE_S = 60.0
 
 
 class CorpusGenerationError(Exception):
@@ -264,13 +283,20 @@ async def generate_page_corpus(
     html_md5: str,
     max_chunk_chars: int = 1200,
     retries: int = MAX_RETRIES,
+    retry_delays: Sequence[float] | None = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> tuple[PageCorpus, PageGenStats]:
     """Generate the corpus for one page.
 
     Returns a usable PageCorpus on success (first try or after self-repair
     sessions) and on API failure (heuristic fallback). Raises
     :class:`CorpusGenerationError` when the model's JSON stays broken after
-    ``MAX_JSON_REPAIR_SESSIONS`` self-repair sessions.
+    ``MAX_JSON_REPAIR_SESSIONS`` self-repair sessions, and propagates
+    :class:`RetryAborted` (an abort asked for during a long backoff wait — the
+    page is dropped, never degraded).
+
+    ``retries``/``retry_delays`` control the transient-failure schedule (default
+    :data:`RETRY_DELAYS`); ``should_abort`` is polled while waiting it out.
     """
     stats = PageGenStats(source=page.source)
     sys_prompt = prompts.system_prompt(max_chunk_chars)
@@ -278,10 +304,23 @@ async def generate_page_corpus(
         page.source, page.title, page.markdown, page.char_len,
         truncated=page.char_len > len(page.markdown))
 
+    def note_retry(exc: BaseException, n: int, delay: float) -> None:
+        """Record a retry on the page's stats, and announce long backoffs.
+
+        A one-minute-plus silence would look like a hung run, so from
+        ``SLOW_RETRY_NOTICE_S`` on the wait is printed. Short waits (2s/4s) stay
+        quiet — they are ordinary throttling and the page usually succeeds.
+        """
+        stats.errors.append(f"retry {n}: {exc}")
+        if delay >= SLOW_RETRY_NOTICE_S:
+            print(f"  [retry] {client.model_name}: {exc} — waiting "
+                  f"{fmt_delay(delay)} before retry {n}", file=sys.stderr)
+
     async def call(prompt_text: str):
         result = await with_retry(
-            lambda: client.generate(sys_prompt, prompt_text), retries=retries,
-            on_retry=lambda exc, n: stats.errors.append(f"retry {n}: {exc}"))
+            lambda: client.generate(sys_prompt, prompt_text),
+            delays=retry_delays, retries=retries, should_abort=should_abort,
+            on_retry=note_retry)
         stats.attempts += 1
         stats.input_tokens += result.input_tokens
         stats.output_tokens += result.output_tokens
@@ -301,6 +340,8 @@ async def generate_page_corpus(
         try:
             result = await call(user_prompt)
             break
+        except RetryAborted:
+            raise  # Ctrl-C during a backoff wait: drop the page, degrade nothing
         except Exception as exc:  # API failed even after transient retries
             stats.api_failed = True
             stats.errors.append(f"api error (shot {api_shot}): {exc}")
@@ -336,6 +377,8 @@ async def generate_page_corpus(
         try:
             result = await call(
                 prompts.build_repair_prompt(user_prompt, errors[:8]))
+        except RetryAborted:
+            raise  # Ctrl-C during a backoff wait: drop the page
         except Exception as exc:  # provider died mid-repair
             stats.api_failed = True
             stats.errors.append(f"api error (repair session {sessions_used}): {exc}")

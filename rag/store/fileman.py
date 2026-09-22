@@ -165,21 +165,32 @@ class FileManager:
     # generation key
     # ------------------------------------------------------------------
     @staticmethod
-    def gen_key(prompt_version: str, model: str, extractor_version: str, schema_version: str) -> str:
+    def gen_key(prompt_version: str, extractor_version: str, schema_version: str) -> str:
         """Fingerprint of the generation configuration: first 16 hex chars of the
-        sha1 of "prompt_version|model|extractor_version|schema_version"."""
-        raw = f"{prompt_version}|{model}|{extractor_version}|{schema_version}"
+        sha1 of "prompt_version|extractor_version|schema_version".
+
+        The LLM model is deliberately NOT a component. Corpus content is a
+        deterministic function of the page markdown (the build validates every
+        chunk as a verbatim excerpt), so switching models — a provider swap,
+        a fleet change, a rename like flash -> flashx — must keep the build
+        INCREMENTAL. Only a real configuration change (prompt / extractor /
+        schema version bump) requeues pages. (A model component in the key
+        once requeued all ~21k finished pages on a pure rename; measured
+        2026-09-22.)"""
+        raw = f"{prompt_version}|{extractor_version}|{schema_version}"
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
     def current_gen_key(self) -> str:
-        """gen_key recomputed from the parts stored in the manifest; "" when absent."""
+        """gen_key recomputed from the parts stored in the manifest; "" when absent.
+
+        The stored "model" part (if any — recorded for information only) is
+        ignored: the key is model-agnostic."""
         parts = self.load_manifest().get("gen_parts")
         if not isinstance(parts, dict):
             return ""
         try:
             return self.gen_key(
                 str(parts["prompt_version"]),
-                str(parts["model"]),
                 str(parts["extractor_version"]),
                 str(parts["schema_version"]),
             )
@@ -202,8 +213,9 @@ class FileManager:
         ``page_gen_keys`` records the gen_key each page was generated with (needed
         when one compile shards pages across several providers/models).
         ``needs_regen`` lists pages whose corpus is a heuristic fallback (the LLM
-        never produced a usable result, e.g. a dead provider): they stay indexed but
-        every later run retries them.
+never produced a usable result, e.g. a dead provider): they stay indexed;
+      the flag is a backlog diagnostic (regenerate with --only/--regen or by
+      deleting the corpus file).
         """
         self.corpus_dir.mkdir(parents=True, exist_ok=True)
         payload = {

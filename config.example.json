@@ -1,5 +1,5 @@
 {
-  "_comment": "One file = provider + corpus config. Copy to config.json next to your documents and adjust. Provider keys: model/type/url/api_key/max_tokens/capabilities/thinking_effort/env/timeout. Corpus keys: dirs (input dirs, relative to THIS file), corpus_dir, index_dir. Engine tuning: mode/rrf_k/bm25_k/dense_k/final_k/path_boost/bm25_aux/embed_model/rerank/compile_workers/accept_legacy_models/llm_timeout/provider_wait_budget_s. Compile unit: checkpoint_every/progress_every default to 1 page (one page = one LLM session; the manifest is flushed after every page). Extra provider shards for multi-provider sharding go in 'providers'. With no --config flag, ./config.json in the CWD is used.",
+  "_comment": "One file = provider + corpus config. Copy to config.json next to your documents and adjust. Provider keys: model/type/url/api_key/max_tokens/capabilities/thinking_effort/env/timeout. Corpus keys: dirs (input dirs, relative to THIS file), corpus_dir, index_dir. Engine tuning: mode/rrf_k/bm25_k/dense_k/final_k/path_boost/bm25_aux/embed_model/rerank/compile_workers/llm_timeout/provider_wait_budget_s/retry_delays. Compile unit: checkpoint_every/progress_every default to 1 page (one page = one LLM session; the manifest is flushed after every page). Extra provider shards for multi-provider sharding go in 'providers'. With no --config flag, ./config.json in the CWD is used.",
 
   "model": "your-model-name",
   "type": "openai_legacy",
@@ -20,6 +20,9 @@
   "_comment_compile_unit": "The compile unit is ONE PAGE: one LLM session per page, one progress line per page, and the incremental manifest flush per page (a kill loses at most the pages in flight). Raise these only to batch manifest writes on very large builds; 0 disables the progress line / the per-page flush.",
   "checkpoint_every": 1,
   "progress_every": 1,
+
+  "_comment_retry": "Transient provider failures (HTTP 429, 5xx, timeouts, connection resets) are waited out on this schedule before the page is demoted to the aux-less heuristic fallback. The default is 2s -> 4s -> 1min -> 10min -> 1h -> 2h -> 4h: the short steps absorb ordinary throttling, the long tail rides out an exhausted rolling quota window (these gateways reset on 5-hour windows). A Ctrl-C during one of those waits drops the page unfinished instead of degrading it.",
+  "retry_delays": [2, 4, 60, 600, 3600, 7200, 14400],
 
   "providers": []
 }

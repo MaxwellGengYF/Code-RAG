@@ -139,21 +139,22 @@ def run_status(*, config_path: str | None = None) -> int:
           f"({(n_corpus_files / len(scanned) if scanned else 0):.1%}) have a corpus file")
     n_flagged = len(manifest.get("needs_regen", []))
     if n_flagged:
-        print(f"needs_regen: {n_flagged} pages hold heuristic-fallback chunks and "
-              f"will be retried automatically")
+      print(f"needs_regen: {n_flagged} pages hold heuristic-fallback chunks "
+            f"(backlog only — regenerate with --only/--regen or by deleting "
+            f"their corpus file)")
     print(f"diff       : added={len(diff.added)} changed={len(diff.changed)} "
           f"removed={len(diff.removed)} unchanged={len(diff.unchanged)}")
     # Honest pending count: diff trusts the manifest, so phantom entries inflate
     # `unchanged`. Count pages that genuinely still need work, and keep their
     # paths so the cost estimate can sample from the real pending set.
-    flagged = set(manifest.get("needs_regen", []))
-    pending_rels = [rel for rel in diff.unchanged
-                    if store.missing(rel) or rel in flagged]
+    # flagged (needs_regen) pages are backlog diagnostics, not work: they keep
+    # their fallback corpus until regenerated deliberately.
+    pending_rels = [rel for rel in diff.unchanged if store.missing(rel)]
     pending_rels = sorted(set(pending_rels) | set(diff.added) | set(diff.changed))
     pending = len(pending_rels)
-    print(f"pending    : {pending} pages still need generation "
-          f"({len(diff.added) + len(diff.changed)} new/changed + "
-          f"{pending - len(diff.added) - len(diff.changed)} missing-or-flagged)")
+    print(f"pending : {pending} pages still need generation "
+        f"({len(diff.added) + len(diff.changed)} new/changed + "
+        f"{pending - len(diff.added) - len(diff.changed)} missing corpus file)")
     print(estimate_pending(pending, pending_rels, cfg))
     failures = corpus_dir / "failures.jsonl"
     if failures.exists():

@@ -24,8 +24,7 @@ from rag.cli.compile_cmd import (
     plan_work,
     run_corpus_compile,
     set_gen_key,
-    valid_gen_keys,
-)
+    )
 from rag.corpus import extract_page
 from rag.store import CorpusStore, FileManager
 
@@ -149,8 +148,7 @@ def pipeline(tmp_path, monkeypatch):
            "rrf_k": 60, "mode": "hybrid"}
 
     import asyncio
-    work = plan_work(fm, store, fm.diff(scanned),
-                     valid_gen_keys=valid_gen_keys(shards))
+    work = plan_work(fm, store, fm.diff(scanned))
     report = asyncio.run(run_corpus_compile(
         shards, cfg, work=work, scanned=scanned, fm=fm,
         workers_per_provider=2, progress=False))
@@ -306,8 +304,7 @@ def test_rerun_compile_is_a_noop(pipeline):
     """DoD#1: after a successful compile, a rerun must process zero pages."""
     fm, store = pipeline["fm"], pipeline["store"]
     shards = pipeline["shards"]
-    work = plan_work(fm, store, fm.diff(fm.scan()),
-                     valid_gen_keys=valid_gen_keys(shards))
+    work = plan_work(fm, store, fm.diff(fm.scan()))
     assert work == [], work
     assert pipeline["fake"].calls == len(PAGES), "no extra LLM calls expected"
 
@@ -320,8 +317,7 @@ def test_touching_one_html_requeues_only_that_page(pipeline):
     p = root / target
     p.write_text(p.read_text(encoding="utf-8").replace("ForceMode", "ForceMode2"),
                  encoding="utf-8")
-    work = plan_work(fm, store, fm.diff(fm.scan()),
-                     valid_gen_keys=valid_gen_keys(shards))
+    work = plan_work(fm, store, fm.diff(fm.scan()))
     assert work == [target], work
 
 

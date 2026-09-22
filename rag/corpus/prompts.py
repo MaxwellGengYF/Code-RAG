@@ -1,6 +1,8 @@
 """Versioned prompts for LLM corpus generation.
-``PROMPT_VERSION`` is part of the ``gen_key`` — bumping it (or the model, the
-extractor, or the schema) forces regeneration of every corpus file.
+``PROMPT_VERSION`` is recorded in the (diagnostic) ``gen_key``. It does NOT
+force regeneration: only an md5 diff or a missing corpus file requeues pages,
+so old corpus keeps the prompt generation it was built with. Bump it when the
+task semantics change; new/changed pages pick the new prompt up automatically.
 """
 from __future__ import annotations
 

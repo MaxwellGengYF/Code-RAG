@@ -1,8 +1,11 @@
 """Corpus schema: per-page JSON contract (msgspec structs) + index-text helpers.
-
-Versioning contract (SA-3 file manager): ``gen_key`` =
-sha1(PROMPT_VERSION | model | EXTRACTOR_VERSION | SCHEMA_VERSION). Bump
-SCHEMA_VERSION on any incompatible change to the structs below.
+Versioning contract (SA-3 file manager): the diagnostic ``gen_key`` =
+sha1(PROMPT_VERSION | EXTRACTOR_VERSION | SCHEMA_VERSION) — the model is
+deliberately not a component, and NOTHING requeues pages on a key change:
+only an md5 diff or a missing corpus file breaks incremental (see
+rag.cli.compile_cmd.plan_work). Bump SCHEMA_VERSION on any incompatible
+change to the structs below; genuinely undecodable files surface as corrupt
+at index time and can be regenerated with --only/--regen.
 """
 from __future__ import annotations
 
@@ -63,8 +66,9 @@ class PageCorpus(msgspec.Struct, kw_only=True):
     """Per-page corpus file — the unit of incremental regeneration.
 
     ``needs_regen`` marks heuristic-fallback pages (the LLM never produced a
-    usable corpus): they are still indexed so search works, but every later
-    compile run retries them. Additive field with a default, so files written
+usable corpus): they are still indexed so search works; the flag is a
+backlog diagnostic (regenerate with --only/--regen or by deleting the
+corpus file). Additive field with a default, so files written
     before it decode unchanged — SCHEMA_VERSION is deliberately NOT bumped.
     """
 

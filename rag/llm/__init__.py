@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .base import (
+    RETRY_DELAYS,
     APIConnectionError,
     APIStatusError,
     APITimeoutError,
@@ -15,15 +16,19 @@ from .base import (
     LLMClient,
     LLMError,
     RateLimitError,
+    RetryAborted,
+    fmt_delay,
     is_retriable,
+    retry_schedule,
     with_retry,
 )
 from .config import ProviderConfig
 
 __all__ = [
     "APIConnectionError", "APIStatusError", "APITimeoutError", "GenerationResult",
-    "LLMClient", "LLMError", "ProviderConfig", "RateLimitError",
-    "create_llm", "is_retriable", "with_retry",
+    "LLMClient", "LLMError", "ProviderConfig", "RETRY_DELAYS", "RateLimitError",
+    "RetryAborted", "create_llm", "fmt_delay", "is_retriable", "retry_schedule",
+    "with_retry",
 ]
 
 _FACTORIES = {}

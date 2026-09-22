@@ -1,0 +1,39 @@
+{
+  "_comment": "Provider + corpus config for THIS deployment (Unity 6.x offline docs, Manual/ + ScriptReference/). Provider block = C:/dev/ds_flash.json (venus proxy, deepseek-v4.1-flash-official) with thinking_effort lowered from 'high' to 'low'. Corpus/engine settings mirror config.json. Usage: uv run python -m rag compile --config ds_f lash_low.json [--steps corpus,index] [--dry-run]. ONE quota pool = (host, api_key): never pass this file twice (or alongside another venus config with the same key) as 'two providers'. Per-provider concurrency > 4 triggers 429.",
+
+  "model": "glm-5.3-flash",
+  "type": "openai_legacy",
+  "url": "https://open.bigmodel.cn/api/coding/paas/v4",
+  "api_key": "ad0b915ca0a140daa272bda28c4862f3.59MJqSkW5NcRG26B",
+  "max_context_size": 1000000,
+  "capabilities": ["thinking"],
+  "thinking_effort": "low",
+  "timeout": 1000,
+
+  "dirs": ["ScriptReference"],
+  "corpus_dir": "corpus",
+  "index_dir": "index",
+
+  "tokenizer": "word",
+  "path_boost": 3,
+  "bm25_aux": false,
+  "fuzziness": 0,
+  "min_should_match": 0.6,
+  "per_file": 1,
+  "bm25_k": 200,
+  "dense_k": 200,
+  "final_k": 8,
+  "rrf_k": 60,
+  "mode": "bm25",
+  "rerank": false,
+  "rerank_model": "BAAI/bge-reranker-v2-m3",
+  "embed_model": "BAAI/bge-m3",
+  "embed_device": "auto",
+  "max_input_chars": 24000,
+  "max_chunk_chars": 1200,
+  "compile_workers": 4,
+  "llm_timeout": 1000,
+  "provider_wait_budget_s": 5400,
+
+  "providers": []
+}

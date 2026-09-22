@@ -138,24 +138,27 @@ def test_diff_honours_explicit_scanned(site):
 # gen_key / current_gen_key
 # --------------------------------------------------------------------------------------
 def test_gen_key_is_16_hex_chars_and_stable():
-    k1 = FileManager.gen_key(**GEN_PARTS)
-    k2 = FileManager.gen_key(**GEN_PARTS)
+    k1 = FileManager.gen_key("p1", "e1", "s1")
+    k2 = FileManager.gen_key("p1", "e1", "s1")
     assert k1 == k2
     assert re.fullmatch(r"[0-9a-f]{16}", k1)
 
 
 def test_gen_key_changes_when_any_component_changes():
-    base = FileManager.gen_key(**GEN_PARTS)
-    for component in GEN_PARTS:
-        parts = dict(GEN_PARTS)
-        parts[component] += "-changed"
-        assert FileManager.gen_key(**parts) != base, component
+    """The key covers prompt/extractor/schema versions only — deliberately
+    NOT the model (a flash -> flashx rename once requeued a 21k-page build).
+    Version bumps change the key; the model never does."""
+    base = FileManager.gen_key("p1", "e1", "s1")
+    assert FileManager.gen_key("p1-changed", "e1", "s1") != base
+    assert FileManager.gen_key("p1", "e1-changed", "s1") != base
+    assert FileManager.gen_key("p1", "e1", "s1-changed") != base
 
 
 def test_current_gen_key_recomputed_from_manifest_parts(site):
     fm = _manager(site)
     assert fm.current_gen_key() == ""  # no manifest -> no key
-    key = FileManager.gen_key(**GEN_PARTS)
+    key = FileManager.gen_key("p1", "e1", "s1")
+    # GEN_PARTS still carries a "model" (informational): recomputation ignores it
     fm.save_manifest({}, gen_key=key, gen_parts=GEN_PARTS)
     assert fm.current_gen_key() == key
     # the stored key string itself is not trusted; parts are recomputed
@@ -185,7 +188,7 @@ def test_load_manifest_tolerates_corrupt_json(site):
 def test_save_manifest_round_trip(site):
     fm = _manager(site)
     files = fm.scan()
-    key = FileManager.gen_key(**GEN_PARTS)
+    key = FileManager.gen_key("p1", "e1", "s1")
     fm.save_manifest(files, gen_key=key, gen_parts=GEN_PARTS)
     m = fm.load_manifest()
     assert m["files"] == files
